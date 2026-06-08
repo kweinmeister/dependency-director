@@ -7,7 +7,7 @@
 > [!NOTE]
 > `dependency-director` is a proof of concept. It automatically executes code edits, runs local tests, pushes branches, and merges pull requests. Always start with `--dry-run`, use a scoped GitHub token, and monitor runs closely.
 
-An experimental autonomous dependency triage and patching agent built on the [**Google Antigravity SDK**](https://antigravity.google) and powered by Gemini models. It works with the GitHub [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server to monitor, validate, and resolve automated dependency update pull requests (such as those from automated dependency update tools like Renovate and Dependabot) across your repositories.
+An experimental autonomous dependency triage and patching agent built on the [**Google Antigravity SDK**](https://antigravity.google) and powered by Gemini models. It uses local GitHub API host tools to monitor, validate, and resolve automated dependency update pull requests (such as those from automated dependency update tools like Renovate and Dependabot) across your repositories.
 
 ---
 
@@ -123,7 +123,7 @@ The agent is configured via environment variables or a local `.env` file. A temp
 
 - Python **3.13+**
 - [uv](https://github.com/astral-sh/uv) package manager
-- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated to your account
+- A GitHub [Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) with `repo` scope
 
 ### Installation
 

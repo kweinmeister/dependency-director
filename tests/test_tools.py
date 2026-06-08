@@ -1,25 +1,24 @@
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx as httpx_mod
 import pytest
+from conftest import make_client_with_status
 
 from dependency_director.config import DEFAULT_BOTS, BotConfig
 from dependency_director.tools import (
+    GitHubAuthenticationError,
     GitHubClient,
+    GitHubNotFoundError,
     ToolFn,
     _check_bot_author,
-    create_tools,
+    _create_write_tools,
 )
 
 
 @pytest.fixture
-def mock_client() -> MagicMock:
-    return MagicMock(spec=GitHubClient)
-
-
-@pytest.fixture
 def tools(mock_client: MagicMock) -> tuple[ToolFn, ToolFn, ToolFn]:
-    return create_tools(
+    return _create_write_tools(
         client=mock_client,
         bots=DEFAULT_BOTS,
         dry_run=False,
@@ -29,7 +28,7 @@ def tools(mock_client: MagicMock) -> tuple[ToolFn, ToolFn, ToolFn]:
 
 @pytest.fixture
 def dry_run_tools(mock_client: MagicMock) -> tuple[ToolFn, ToolFn, ToolFn]:
-    return create_tools(
+    return _create_write_tools(
         client=mock_client,
         bots=DEFAULT_BOTS,
         dry_run=True,
@@ -191,7 +190,7 @@ async def test_rebase_api_error_on_comment(
 
 @pytest.mark.asyncio
 async def test_merge_renovate_success(mock_client: MagicMock) -> None:
-    merge, _, _ = create_tools(
+    merge, _, _ = _create_write_tools(
         client=mock_client,
         bots=DEFAULT_BOTS,
         dry_run=False,
@@ -205,8 +204,35 @@ async def test_merge_renovate_success(mock_client: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_merge_bot_pr_405_returns_actionable_message(
+    mock_client: MagicMock,
+) -> None:
+    merge, _, _ = _create_write_tools(
+        client=mock_client,
+        bots=DEFAULT_BOTS,
+        dry_run=False,
+        review_wait=0,
+    )
+    mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
+    mock_response = MagicMock()
+    mock_response.status_code = 405
+    mock_client.merge_pr = AsyncMock(
+        side_effect=httpx_mod.HTTPStatusError(
+            "405",
+            request=MagicMock(),
+            response=mock_response,
+        ),
+    )
+
+    result = await merge("owner", "repo", 99)
+    assert "405" in result
+    assert "get_pr_status" in result
+    assert "rebase_bot_pr" in result
+
+
+@pytest.mark.asyncio
 async def test_rebase_renovate_uses_correct_command(mock_client: MagicMock) -> None:
-    _, rebase, _ = create_tools(
+    _, rebase, _ = _create_write_tools(
         client=mock_client,
         bots=DEFAULT_BOTS,
         dry_run=False,
@@ -227,7 +253,7 @@ async def test_rebase_renovate_uses_correct_command(mock_client: MagicMock) -> N
 @pytest.mark.asyncio
 async def test_custom_bot_accepted(mock_client: MagicMock) -> None:
     custom = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
-    merge, _, _ = create_tools(
+    merge, _, _ = _create_write_tools(
         client=mock_client,
         bots=custom,
         dry_run=False,
@@ -243,7 +269,7 @@ async def test_custom_bot_accepted(mock_client: MagicMock) -> None:
 @pytest.mark.asyncio
 async def test_custom_bot_rejects_default(mock_client: MagicMock) -> None:
     custom = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
-    merge, _, _ = create_tools(
+    merge, _, _ = _create_write_tools(
         client=mock_client,
         bots=custom,
         dry_run=False,
@@ -276,25 +302,21 @@ def test_check_bot_author_invalid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_disabled(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=0,
-    )
+async def test_wait_for_reviews_disabled(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=0)
     result = await wait("owner", "repo", 42)
     assert "disabled" in result.lower()
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_finds_comments(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=5,
-    )
+async def test_wait_for_reviews_finds_comments(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=5)
     mock_client.get_pr_reviews = AsyncMock(
         side_effect=[
             [],
@@ -315,13 +337,11 @@ async def test_wait_for_reviews_finds_comments(mock_client: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_polls_until_timeout(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=1,
-    )
+async def test_wait_for_reviews_polls_until_timeout(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=1)
     mock_client.get_pr_reviews = AsyncMock(return_value=[])
 
     with patch(
@@ -335,13 +355,11 @@ async def test_wait_for_reviews_polls_until_timeout(mock_client: MagicMock) -> N
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_ignores_stale(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=5,
-    )
+async def test_wait_for_reviews_ignores_stale(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=5)
     stale = [{"user": {"login": "old"}, "body": "LGTM", "state": "APPROVED"}]
     new = [
         *stale,
@@ -356,13 +374,11 @@ async def test_wait_for_reviews_ignores_stale(mock_client: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_empty_body_not_ignored(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=1,
-    )
+async def test_wait_for_reviews_empty_body_not_ignored(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=1)
     mock_client.get_pr_reviews = AsyncMock(
         side_effect=[
             [],
@@ -380,13 +396,9 @@ async def test_wait_for_reviews_empty_body_not_ignored(mock_client: MagicMock) -
 @pytest.mark.asyncio
 async def test_wait_for_reviews_handles_dismissed_reviews(
     mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
 ) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=1,
-    )
+    wait = wait_tool(review_wait=1)
     mock_client.get_pr_reviews = AsyncMock(
         side_effect=[
             [
@@ -415,13 +427,11 @@ async def test_wait_for_reviews_handles_dismissed_reviews(
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_missing_user_key(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=1,
-    )
+async def test_wait_for_reviews_missing_user_key(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=1)
     mock_client.get_pr_reviews = AsyncMock(
         side_effect=[
             [],
@@ -436,25 +446,21 @@ async def test_wait_for_reviews_missing_user_key(mock_client: MagicMock) -> None
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_negative_timeout(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=-1,
-    )
+async def test_wait_for_reviews_negative_timeout(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=-1)
     result = await wait("owner", "repo", 42)
     assert "disabled" in result.lower()
 
 
 @pytest.mark.asyncio
-async def test_wait_for_reviews_api_error(mock_client: MagicMock) -> None:
-    _, _, wait = create_tools(
-        client=mock_client,
-        bots=DEFAULT_BOTS,
-        dry_run=False,
-        review_wait=1,
-    )
+async def test_wait_for_reviews_api_error(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    wait = wait_tool(review_wait=1)
     mock_client.get_pr_reviews = AsyncMock(side_effect=Exception("API down"))
 
     with pytest.raises(Exception, match="API down"):
@@ -600,4 +606,28 @@ async def test_github_client_parameter_validation_denied() -> None:
     # Test illegal characters in repo
     with pytest.raises(ValueError, match="Invalid repository name"):
         await c.get_pr_author("owner", "repo$", 42)
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_fail_fast_401() -> None:
+    c = make_client_with_status(
+        401,
+        "https://api.github.com/repos/owner/repo/pulls/1",
+    )
+    with pytest.raises(GitHubAuthenticationError) as exc_info:
+        await c.get_pr_author("owner", "repo", 1)
+    assert "GitHub API error 401" in str(exc_info.value)
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_get_file_contents_404_raises_not_found() -> None:
+    c = make_client_with_status(
+        404,
+        "https://api.github.com/repos/owner/repo/contents/path",
+    )
+    with pytest.raises(GitHubNotFoundError) as exc_info:
+        await c.get_file_contents("owner", "repo", "path")
+    assert "GitHub API error 404" in str(exc_info.value)
     await c.close()

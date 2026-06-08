@@ -7,7 +7,8 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Awaitable, Callable
+import tempfile
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,6 +18,19 @@ from dependency_director.config import SAFE_ENV_ALLOWLIST, BotConfig
 
 OWNER_RE = re.compile(r"^[a-zA-Z0-9-]{1,39}$")
 REPO_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
+_ENV_FLAGS_WITH_ARG = {"-u", "--unset", "-S", "--split-string"}
+
+
+class GitHubClientError(Exception):
+    """Base exception for GitHubClient errors."""
+
+
+class GitHubAuthenticationError(GitHubClientError):
+    """Exception raised for 401/403 errors."""
+
+
+class GitHubNotFoundError(GitHubClientError):
+    """Exception raised for 404 errors."""
 
 
 def _validate_repo_params(owner: str, repo: str) -> None:
@@ -39,15 +53,139 @@ class GitHubClient:
         }
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
-        self.client = httpx.AsyncClient()
+
+        async def check_api_errors(response: httpx.Response) -> None:
+            if response.status_code in (401, 403, 404):
+                # Don't fail-fast on the organization-fallback check in get_repositories
+                if (
+                    response.status_code == 404
+                    and "/users/" in str(response.url)
+                    and "/repos" in str(response.url)
+                ):
+                    return
+
+                msg = f"GitHub API error {response.status_code} on {response.url}"
+                if response.status_code == 401:
+                    msg += (
+                        " - Unauthorized. Please verify your DEPDIRECTOR_GITHUB_TOKEN."
+                    )
+                    raise GitHubAuthenticationError(msg)
+                if response.status_code == 403:
+                    msg += " - Forbidden/Rate Limited. Please verify your token scopes and rate limits."
+                    raise GitHubAuthenticationError(msg)
+                if response.status_code == 404:
+                    msg += " - Not Found. Please verify the owner/repository names exist and your token has access."
+                    raise GitHubNotFoundError(msg)
+
+        self.client = httpx.AsyncClient(event_hooks={"response": [check_api_errors]})
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        owner: str,
+        repo: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        json_data: Any = None,
+    ) -> httpx.Response:
+        _validate_repo_params(owner, repo)
+        url = f"https://api.github.com/repos/{owner}/{repo}/{path.lstrip('/')}"
+        req_headers = {**self.headers, **(headers or {})}
+
+        method_upper = method.upper()
+        kwargs: dict[str, Any] = {"headers": req_headers}
+        if method_upper == "GET":
+            if params is not None:
+                kwargs["params"] = params
+            response = await self.client.get(url, **kwargs)
+        elif method_upper == "PUT":
+            if json_data is not None:
+                kwargs["json"] = json_data
+            response = await self.client.put(url, **kwargs)
+        elif method_upper == "POST":
+            if json_data is not None:
+                kwargs["json"] = json_data
+            response = await self.client.post(url, **kwargs)
+        else:
+            if params is not None:
+                kwargs["params"] = params
+            if json_data is not None:
+                kwargs["json"] = json_data
+            response = await self.client.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response
+
+    async def _get(
+        self,
+        path: str,
+        owner: str,
+        repo: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        return await self._request(
+            "GET",
+            path,
+            owner,
+            repo,
+            params=params,
+            headers=headers,
+        )
+
+    async def _put(
+        self,
+        path: str,
+        owner: str,
+        repo: str,
+        json_data: Any = None,
+    ) -> httpx.Response:
+        return await self._request(
+            "PUT",
+            path,
+            owner,
+            repo,
+            json_data=json_data,
+        )
+
+    async def _post(
+        self,
+        path: str,
+        owner: str,
+        repo: str,
+        json_data: Any = None,
+    ) -> httpx.Response:
+        return await self._request(
+            "POST",
+            path,
+            owner,
+            repo,
+            json_data=json_data,
+        )
+
+    async def _list_paginated(
+        self,
+        path: str,
+        owner: str,
+        repo: str,
+        params: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[dict[str, Any]]:
+        page = 1
+        req_params = dict(params or {})
+        req_params["per_page"] = 100
+        while True:
+            req_params["page"] = page
+            response = await self._get(path, owner, repo, params=req_params)
+            data = response.json()
+            if not data:
+                break
+            for item in data:
+                yield item
+            page += 1
 
     async def get_pr_author(self, owner: str, repo: str, pr_number: int) -> str:
         """Get the GitHub username/login of a pull request author."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
-        data = response.json()
+        data = await self.get_pr_details(owner, repo, pr_number)
         user = data.get("user")
         if isinstance(user, dict):
             login = user.get("login")
@@ -57,14 +195,12 @@ class GitHubClient:
 
     async def merge_pr(self, owner: str, repo: str, pr_number: int) -> dict[str, Any]:
         """Merge a pull request using the squash-and-merge method."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge"
-        response = await self.client.put(
-            url,
-            json={"merge_method": "squash"},
-            headers=self.headers,
+        response = await self._put(
+            f"pulls/{pr_number}/merge",
+            owner,
+            repo,
+            json_data={"merge_method": "squash"},
         )
-        response.raise_for_status()
         return cast("dict[str, Any]", response.json())
 
     async def comment_on_pr(
@@ -75,14 +211,12 @@ class GitHubClient:
         body: str,
     ) -> dict[str, Any]:
         """Create a comment on the specified pull request/issue."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-        response = await self.client.post(
-            url,
-            json={"body": body},
-            headers=self.headers,
+        response = await self._post(
+            f"issues/{pr_number}/comments",
+            owner,
+            repo,
+            json_data={"body": body},
         )
-        response.raise_for_status()
         return cast("dict[str, Any]", response.json())
 
     async def get_pr_reviews(
@@ -92,10 +226,7 @@ class GitHubClient:
         pr_number: int,
     ) -> list[dict[str, Any]]:
         """Fetch all reviews and comments on a pull request."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(f"pulls/{pr_number}/reviews", owner, repo)
         return cast("list[dict[str, Any]]", response.json())
 
     async def get_pr_details(
@@ -105,10 +236,7 @@ class GitHubClient:
         pr_number: int,
     ) -> dict[str, Any]:
         """Fetch general details of a specific pull request."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(f"pulls/{pr_number}", owner, repo)
         return cast("dict[str, Any]", response.json())
 
     async def get_commit_check_runs(
@@ -118,10 +246,7 @@ class GitHubClient:
         ref: str,
     ) -> dict[str, Any]:
         """Fetch check runs for a commit reference."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(f"commits/{ref}/check-runs", owner, repo)
         return cast("dict[str, Any]", response.json())
 
     async def get_commit_status(
@@ -131,10 +256,7 @@ class GitHubClient:
         ref: str,
     ) -> dict[str, Any]:
         """Fetch combined legacy commit status for a commit reference."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/status"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(f"commits/{ref}/status", owner, repo)
         return cast("dict[str, Any]", response.json())
 
     async def get_workflow_runs_for_commit(
@@ -144,10 +266,12 @@ class GitHubClient:
         ref: str,
     ) -> dict[str, Any]:
         """Fetch workflow runs associated with a commit reference."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={ref}"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(
+            "actions/runs",
+            owner,
+            repo,
+            params={"head_sha": ref},
+        )
         return cast("dict[str, Any]", response.json())
 
     async def get_workflow_run_jobs(
@@ -157,19 +281,145 @@ class GitHubClient:
         run_id: int,
     ) -> dict[str, Any]:
         """Fetch jobs for a workflow run."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/jobs"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(f"actions/runs/{run_id}/jobs", owner, repo)
         return cast("dict[str, Any]", response.json())
 
     async def get_job_logs(self, owner: str, repo: str, job_id: int) -> str:
         """Fetch raw log text for a workflow run job."""
-        _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
-        response = await self.client.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = await self._get(f"actions/jobs/{job_id}/logs", owner, repo)
         return response.text
+
+    async def list_open_prs(
+        self,
+        owner: str,
+        repo: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch all open pull requests with minimal fields.
+
+        Returns a compact list of dicts with only number, title, author, and
+        created_at. This avoids pulling in the huge body/changelog payloads
+        that dependency bots typically produce.
+        """
+        prs: list[dict[str, Any]] = []
+        params = {
+            "state": "open",
+            "sort": "created",
+            "direction": "asc",
+        }
+        async for pr in self._list_paginated("pulls", owner, repo, params=params):
+            prs.append(
+                {
+                    "number": pr["number"],
+                    "title": pr.get("title", ""),
+                    "author": pr.get("user", {}).get("login", ""),
+                    "created_at": pr.get("created_at", ""),
+                },
+            )
+        return prs
+
+    async def get_pr_diff(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+    ) -> str:
+        """Fetch the diff of a pull request as plain text."""
+        response = await self._get(
+            f"pulls/{pr_number}",
+            owner,
+            repo,
+            headers={"Accept": "application/vnd.github.v3.diff"},
+        )
+        return response.text
+
+    async def get_pr_files(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the list of files changed in a pull request."""
+        files: list[dict[str, Any]] = []
+        async for f in self._list_paginated(f"pulls/{pr_number}/files", owner, repo):
+            files.append(
+                {
+                    "filename": f["filename"],
+                    "status": f.get("status", ""),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                },
+            )
+        return files
+
+    async def get_file_contents(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch file contents from a repository.
+
+        Returns a dict with 'name', 'path', 'size', 'content' (base64), and 'encoding'.
+        """
+        params = {"ref": ref} if ref else None
+        response = await self._get(f"contents/{path}", owner, repo, params=params)
+        return cast("dict[str, Any]", response.json())
+
+    async def list_commits(
+        self,
+        owner: str,
+        repo: str,
+        sha: str | None = None,
+        per_page: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent commits for a repository or branch."""
+        params: dict[str, Any] = {"per_page": per_page}
+        if sha:
+            params["sha"] = sha
+        response = await self._get("commits", owner, repo, params=params)
+        data = response.json()
+        return [
+            {
+                "sha": c["sha"][:7],
+                "message": c.get("commit", {}).get("message", "").split("\n")[0],
+                "author": c.get("commit", {}).get("author", {}).get("name", ""),
+                "date": c.get("commit", {}).get("author", {}).get("date", ""),
+            }
+            for c in data
+        ]
+
+    async def get_commit(
+        self,
+        owner: str,
+        repo: str,
+        sha: str,
+    ) -> dict[str, Any]:
+        """Fetch details of a specific commit."""
+        response = await self._get(f"commits/{sha}", owner, repo)
+        data = response.json()
+        return {
+            "sha": data["sha"],
+            "message": data.get("commit", {}).get("message", ""),
+            "author": data.get("commit", {}).get("author", {}).get("name", ""),
+            "date": data.get("commit", {}).get("author", {}).get("date", ""),
+            "files": [
+                {
+                    "filename": f["filename"],
+                    "status": f.get("status", ""),
+                    "patch": f.get("patch", ""),
+                }
+                for f in data.get("files", [])
+            ],
+        }
+
+    async def list_branches(
+        self,
+        owner: str,
+        repo: str,
+    ) -> list[str]:
+        """Fetch branch names for a repository."""
+        return [b["name"] async for b in self._list_paginated("branches", owner, repo)]
 
     async def get_repositories(self, owner: str) -> list[str]:
         """Fetch non-forked repositories from GitHub API.
@@ -234,7 +484,7 @@ def _check_bot_author(author: str, bots: list[BotConfig]) -> BotConfig:
 ToolFn = Callable[..., Awaitable[str]]
 
 
-def create_tools(
+def _create_write_tools(
     client: GitHubClient,
     bots: list[BotConfig],
     *,
@@ -254,7 +504,16 @@ def create_tools(
         if dry_run:
             return f"[DRY-RUN] Would have merged PR #{pr_number} in {owner}/{repo}."
 
-        res = await client.merge_pr(owner, repo, pr_number)
+        try:
+            res = await client.merge_pr(owner, repo, pr_number)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 405:
+                return (
+                    f"PR #{pr_number} cannot be merged right now (GitHub 405 — not mergeable). "
+                    "A prior merge likely introduced a conflict. "
+                    "Call get_pr_status to confirm, then rebase_bot_pr if CONFLICT."
+                )
+            raise
         message = res.get("message", "PR merged successfully.")
         return f"Successfully merged PR #{pr_number} in {owner}/{repo}: {message}"
 
@@ -352,7 +611,7 @@ def create_agent_tools(
     review_wait: int,
 ) -> tuple[ToolFn, ...]:
     """Create all agent tool functions, including legacy tools, status tools, and workflow log tools."""
-    merge_bot_pr, rebase_bot_pr, wait_for_reviews = create_tools(
+    merge_bot_pr, rebase_bot_pr, wait_for_reviews = _create_write_tools(
         client=client,
         bots=bots,
         dry_run=dry_run,
@@ -373,7 +632,10 @@ def create_agent_tools(
         ci_status = "NONE"
 
         if head_sha:
-            check_runs_data = await client.get_commit_check_runs(owner, repo, head_sha)
+            check_runs_data, commit_status_data = await asyncio.gather(
+                client.get_commit_check_runs(owner, repo, head_sha),
+                client.get_commit_status(owner, repo, head_sha),
+            )
             check_runs = check_runs_data.get("check_runs", [])
             for run in check_runs:
                 checks_summary.append(
@@ -384,7 +646,6 @@ def create_agent_tools(
                     },
                 )
 
-            commit_status_data = await client.get_commit_status(owner, repo, head_sha)
             legacy_statuses = commit_status_data.get("statuses", [])
             legacy_state = commit_status_data.get("state") if legacy_statuses else None
             for status in legacy_statuses:
@@ -473,13 +734,132 @@ def create_agent_tools(
 
         return "\n".join(failed_jobs_logs)
 
+    async def list_bot_prs(owner: str, repo: str) -> str:
+        """List open dependency-bot pull requests for a repository.
+
+        Returns a compact JSON list with only the essential fields:
+        number, title, author, and created_at. Sorted oldest first.
+        Only PRs authored by configured bots are included.
+        """
+        allowed_authors = {b.author for b in bots}
+        all_prs = await client.list_open_prs(owner, repo)
+        bot_prs = [pr for pr in all_prs if pr["author"] in allowed_authors]
+        if not bot_prs:
+            return json.dumps({"bot_prs": [], "count": 0})
+        return json.dumps({"bot_prs": bot_prs, "count": len(bot_prs)}, indent=2)
+
+    async def get_pr_diff(owner: str, repo: str, pr_number: int) -> str:
+        """Get the diff of a pull request as plain text.
+
+        Returns the unified diff showing all changes in the PR.
+        """
+        return await client.get_pr_diff(owner, repo, pr_number)
+
+    async def get_pr_files(owner: str, repo: str, pr_number: int) -> str:
+        """Get the list of files changed in a pull request.
+
+        Returns a JSON list with filename, status (added/modified/removed),
+        additions count, and deletions count for each file.
+        """
+        files = await client.get_pr_files(owner, repo, pr_number)
+        return json.dumps(files, indent=2)
+
+    async def get_file_contents(
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str | None = None,
+    ) -> str:
+        """Get the contents of a file from a GitHub repository.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            path: Path to the file within the repository.
+            ref: Optional git ref (branch, tag, or SHA) to read from.
+
+        Returns the file content as a JSON object with name, path, size,
+        content (base64-encoded), and encoding fields.
+
+        """
+        data = await client.get_file_contents(owner, repo, path, ref)
+        return json.dumps(
+            {
+                "name": data.get("name"),
+                "path": data.get("path"),
+                "size": data.get("size"),
+                "content": data.get("content"),
+                "encoding": data.get("encoding"),
+            },
+            indent=2,
+        )
+
+    async def list_commits(
+        owner: str,
+        repo: str,
+        sha: str | None = None,
+        per_page: int = 30,
+    ) -> str:
+        """List recent commits for a repository or branch.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            sha: Optional branch name or SHA to list commits from.
+            per_page: Number of commits to return (default 30).
+
+        Returns a JSON list of commits with sha, message, author, and date.
+
+        """
+        commits = await client.list_commits(owner, repo, sha, per_page)
+        return json.dumps(commits, indent=2)
+
+    async def get_commit_details(owner: str, repo: str, sha: str) -> str:
+        """Get details of a specific commit including changed files and patches.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            sha: The commit SHA to look up.
+
+        Returns a JSON object with sha, message, author, date, and files
+        (each with filename, status, and patch).
+
+        """
+        data = await client.get_commit(owner, repo, sha)
+        return json.dumps(data, indent=2)
+
+    async def list_branches(owner: str, repo: str) -> str:
+        """List branch names for a repository.
+
+        Returns a JSON list of branch name strings.
+        """
+        branches = await client.list_branches(owner, repo)
+        return json.dumps(branches)
+
     return (
         merge_bot_pr,
         rebase_bot_pr,
         wait_for_reviews,
         get_pr_status,
         get_pr_workflow_run_logs,
+        list_bot_prs,
+        get_pr_diff,
+        get_pr_files,
+        get_file_contents,
+        list_commits,
+        get_commit_details,
+        list_branches,
     )
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    """Return True if child is equal to or contained within parent."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return child == parent
 
 
 def _validate_target_path(
@@ -490,45 +870,29 @@ def _validate_target_path(
     """Validate a path string against directory traversal and disallowed locations."""
     if path_str == "/":
         return f"Security Error: {context_msg} targeting root directory is denied."
-    if "../" in path_str:
+    if ".." in Path(path_str).parts:
         return f"Security Error: {context_msg} with directory traversal is denied."
-    if path_str.startswith(("/", "~")):
-        import tempfile
 
-        resolved = Path(path_str).expanduser().resolve()
-        workspace_path = Path(workspace_dir).resolve()
-        system_temp = Path(tempfile.gettempdir()).resolve()
+    try:
+        path = Path(path_str).expanduser()
+        if not path.is_absolute():
+            resolved = (Path(workspace_dir) / path).resolve()
+        else:
+            resolved = path.resolve()
+    except Exception as e:
+        return f"Security Error: {context_msg} has invalid path: {e}"
 
-        # Check if resolved is in workspace
-        try:
-            resolved.relative_to(workspace_path)
-            in_workspace = True
-        except ValueError:
-            in_workspace = resolved == workspace_path
+    workspace_path = Path(workspace_dir).resolve()
+    system_temp = Path(tempfile.gettempdir()).resolve()
+    fallback_temps = [Path(p).resolve() for p in ("/tmp", "/private/tmp")]
 
-        # Check if resolved is in system temp directory
-        in_tmp = False
-        try:
-            resolved.relative_to(system_temp)
-            in_tmp = True
-        except ValueError:
-            in_tmp = resolved == system_temp
+    in_workspace = _is_under(resolved, workspace_path)
+    in_tmp = _is_under(resolved, system_temp) or any(
+        _is_under(resolved, fp) for fp in fallback_temps
+    )
 
-        # Fallback for common UNIX temp paths if not already covered
-        if not in_tmp:
-            for fallback_str in ("/tmp", "/private/tmp"):
-                fallback_path = Path(fallback_str).resolve()
-                try:
-                    resolved.relative_to(fallback_path)
-                    in_tmp = True
-                    break
-                except ValueError:
-                    if resolved == fallback_path:
-                        in_tmp = True
-                        break
-
-        if not (in_workspace or in_tmp):
-            return f"Security Error: {context_msg} targeting path outside workspace and temp directory is denied: {path_str}"
+    if not (in_workspace or in_tmp):
+        return f"Security Error: {context_msg} targeting path outside workspace and temp directory is denied: {path_str}"
     return None
 
 
@@ -603,7 +967,6 @@ def validate_sandboxed_command(command_line: str, workspace_dir: str) -> str | N
 
             if exe_name == "env" and len(tokens) > i + 1:
                 # Flags that consume the next token as their argument
-                _ENV_FLAGS_WITH_ARG = {"-u", "--unset", "-S", "--split-string"}
                 j = i + 1
                 while j < len(tokens):
                     t = tokens[j]
@@ -692,9 +1055,6 @@ def create_run_command_tool(
     srt_settings_path: str | Path = "",
 ) -> Callable[..., Awaitable[str]]:
     """Create a sandboxed run_command tool bound to a workspace."""
-    import json
-    import tempfile
-
     from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH
 
     config_path = None

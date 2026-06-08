@@ -161,9 +161,6 @@ def get_dry_run_policies() -> list[Any]:
         return False
 
     return [
-        policy.deny("merge_pull_request", name="dry_run_block_merge"),
-        policy.deny("mcp_github_merge_pull_request", name="dry_run_block_mcp_merge"),
-        policy.deny("github_merge_pull_request", name="dry_run_block_github_merge"),
         policy.deny("run_command", when=is_git_push, name="dry_run_block_push"),
         policy.deny(
             "run_command_sandboxed",

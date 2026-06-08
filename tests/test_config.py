@@ -1,11 +1,10 @@
 import hashlib
 import json
-import logging
 import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.antigravity import types
@@ -17,7 +16,7 @@ from dependency_director.config import (
     get_dry_run_policies,
     get_safety_policies,
 )
-from dependency_director.main import _SuppressMcpProbeFilter, run_agent_for_repo
+from dependency_director.main import run_agent_for_repo
 
 
 @pytest.mark.parametrize(
@@ -114,9 +113,6 @@ async def test_safety_policies_enforcement() -> None:
 def test_dry_run_policies_enforcement() -> None:
     policies = get_dry_run_policies()
     names = [p.name for p in policies]
-    assert "dry_run_block_merge" in names
-    assert "dry_run_block_mcp_merge" in names
-    assert "dry_run_block_github_merge" in names
     assert "dry_run_block_push" in names
 
     # Find the block push policy and test it
@@ -128,69 +124,62 @@ def test_dry_run_policies_enforcement() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_config_includes_skills_path() -> None:
+async def test_agent_config_includes_skills_path(mock_agent_class: MagicMock) -> None:
     settings = Settings()
     settings.github_token = "dummy-token"
     settings.gemini_api_key = "dummy-key"
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        # Mock agent.chat returning an awaitable object with text() coroutine
-        mock_response = AsyncMock()
-        mock_response.text.return_value = "Triage completed successfully."
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
+    mock_agent_instance = mock_agent_class.return_value
+    mock_response = AsyncMock()
+    mock_response.text.return_value = "Triage completed successfully."
+    mock_agent_instance.chat = AsyncMock(return_value=mock_response)
 
-        # Mock agent.conversation.total_usage
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 100
-        mock_usage.candidates_token_count = 50
-        mock_usage.thoughts_token_count = 10
-        mock_usage.total_token_count = 160
-        mock_agent_instance.conversation.total_usage = mock_usage
+    mock_usage = mock_agent_instance.conversation.total_usage
+    mock_usage.prompt_token_count = 100
+    mock_usage.candidates_token_count = 50
+    mock_usage.thoughts_token_count = 10
+    mock_usage.total_token_count = 160
 
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
-        mock_agent_class.assert_called_once()
-        config_passed = mock_agent_class.call_args[1]["config"]
+    mock_agent_class.assert_called_once()
+    config_passed = mock_agent_class.call_args[1]["config"]
 
-        assert hasattr(config_passed, "skills_paths")
-        assert len(config_passed.skills_paths) == 1
-        skills_dir = config_passed.skills_paths[0]
-        assert ".agents/skills" in skills_dir
+    assert hasattr(config_passed, "skills_paths")
+    assert len(config_passed.skills_paths) == 1
+    skills_dir = config_passed.skills_paths[0]
+    assert ".agents/skills" in skills_dir
 
-        # Verify the directory exists and contains the expected skill
-        assert Path(skills_dir).exists(), (
-            f"Skills directory {skills_dir} does not exist"
-        )
-        skill_folder = Path(skills_dir) / "code-review-and-quality"
-        assert skill_folder.exists(), f"Skill folder {skill_folder} does not exist"
-        skill_file = skill_folder / "SKILL.md"
-        assert skill_file.exists(), f"Skill definition file {skill_file} does not exist"
+    # Verify the directory exists and contains the expected skill
+    assert Path(skills_dir).exists(), f"Skills directory {skills_dir} does not exist"
+    skill_folder = Path(skills_dir) / "code-review-and-quality"
+    assert skill_folder.exists(), f"Skill folder {skill_folder} does not exist"
+    skill_file = skill_folder / "SKILL.md"
+    assert skill_file.exists(), f"Skill definition file {skill_file} does not exist"
 
-        # Verify workspaces configuration
+    # Verify workspaces configuration
 
-        repo = "test-owner/test-repo"
-        expected_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
-        expected_dir = str(
-            Path(tempfile.gettempdir()) / f"dependency-director-{expected_hash}",
-        )
-        assert hasattr(config_passed, "workspaces")
-        assert expected_dir in config_passed.workspaces
-        assert tempfile.gettempdir() not in config_passed.workspaces
-        assert (
-            str(Path(tempfile.gettempdir()) / "dependency-director")
-            not in config_passed.workspaces
-        )
+    repo = "test-owner/test-repo"
+    expected_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
+    expected_dir = str(
+        Path(tempfile.gettempdir()) / f"dependency-director-{expected_hash}",
+    )
+    assert hasattr(config_passed, "workspaces")
+    assert expected_dir in config_passed.workspaces
+    assert tempfile.gettempdir() not in config_passed.workspaces
+    assert (
+        str(Path(tempfile.gettempdir()) / "dependency-director")
+        not in config_passed.workspaces
+    )
 
 
 # ============================================================
@@ -237,7 +226,7 @@ def test_dry_run_git_push_substring() -> None:
 
 
 @pytest.mark.asyncio
-async def test_workspace_cleanup_on_start() -> None:
+async def test_workspace_cleanup_on_start(mock_agent_class: MagicMock) -> None:
     """Verify that run_agent_for_repo cleans up stale workspace directories."""
     settings = Settings()
     settings.github_token = "dummy-token"
@@ -257,33 +246,16 @@ async def test_workspace_cleanup_on_start() -> None:
 
     assert Path(stale_file).exists()
 
-    async def _empty_chunks() -> AsyncGenerator[None]:
-        return
-        yield  # makes this an async generator
-
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = MagicMock()
-        mock_response.chunks = _empty_chunks()
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 0
-        mock_usage.candidates_token_count = 0
-        mock_usage.thoughts_token_count = 0
-        mock_usage.total_token_count = 0
-        mock_agent_instance.conversation.total_usage = mock_usage
-
-        await run_agent_for_repo(
-            repo=repo,
-            settings=settings,
-            max_attempts=3,
-            dry_run=False,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
+    await run_agent_for_repo(
+        repo=repo,
+        settings=settings,
+        max_attempts=3,
+        dry_run=False,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
     # Stale content should be gone, workspace cleaned up after run
     assert not Path(stale_file).exists()
@@ -328,7 +300,7 @@ def test_default_bots_constant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_config_vertex_fields() -> None:
+async def test_agent_config_vertex_fields(mock_agent_class: MagicMock) -> None:
     """Verify that Vertex AI settings are passed through to LocalAgentConfig."""
     settings = Settings()
     settings.github_token = "dummy-token"
@@ -337,38 +309,27 @@ async def test_agent_config_vertex_fields() -> None:
     settings.google_cloud_project = "my-project"
     settings.google_cloud_location = "us-central1"
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = AsyncMock()
-        mock_response.text.return_value = "Done."
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 0
-        mock_usage.candidates_token_count = 0
-        mock_usage.thoughts_token_count = 0
-        mock_usage.total_token_count = 0
-        mock_agent_instance.conversation.total_usage = mock_usage
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
-
-        config_passed = mock_agent_class.call_args[1]["config"]
-        assert config_passed.vertex is True
-        assert config_passed.project == "my-project"
-        assert config_passed.location == "us-central1"
+    config_passed = mock_agent_class.call_args[1]["config"]
+    assert config_passed.vertex is True
+    assert config_passed.project == "my-project"
+    assert config_passed.location == "us-central1"
 
 
 @pytest.mark.asyncio
-async def test_agent_config_no_vertex_excludes_project() -> None:
+async def test_agent_config_no_vertex_excludes_project(
+    mock_agent_class: MagicMock,
+) -> None:
     """When vertex=False, project/location must NOT be passed even if env vars are set."""
     settings = Settings()
     settings.github_token = "dummy-token"
@@ -377,34 +338,21 @@ async def test_agent_config_no_vertex_excludes_project() -> None:
     settings.google_cloud_project = "stale-project-from-env"
     settings.google_cloud_location = "us-central1"
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = AsyncMock()
-        mock_response.text.return_value = "Done."
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 0
-        mock_usage.candidates_token_count = 0
-        mock_usage.thoughts_token_count = 0
-        mock_usage.total_token_count = 0
-        mock_agent_instance.conversation.total_usage = mock_usage
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
-
-        config_passed = mock_agent_class.call_args[1]["config"]
-        assert config_passed.vertex is not True
-        assert config_passed.project is None
-        assert config_passed.location is None
+    config_passed = mock_agent_class.call_args[1]["config"]
+    assert config_passed.vertex is not True
+    assert config_passed.project is None
+    assert config_passed.location is None
 
 
 @pytest.mark.parametrize(
@@ -446,104 +394,61 @@ def test_settings_vertex_loading(
 
 
 @pytest.mark.asyncio
-async def test_agent_config_disables_builtin_run_command() -> None:
+async def test_agent_config_disables_builtin_run_command(
+    mock_agent_class: MagicMock,
+) -> None:
     """Verify that the agent config disables the built-in run_command tool and registers the custom one."""
     settings = Settings()
     settings.github_token = "dummy-token"
     settings.gemini_api_key = "dummy-key"
     settings.vertex = False
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = AsyncMock()
-        mock_response.text.return_value = "Done."
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 0
-        mock_usage.candidates_token_count = 0
-        mock_usage.thoughts_token_count = 0
-        mock_usage.total_token_count = 0
-        mock_agent_instance.conversation.total_usage = mock_usage
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
+    config_passed = mock_agent_class.call_args[1]["config"]
+    from google.antigravity.types import BuiltinTools
 
-        config_passed = mock_agent_class.call_args[1]["config"]
-        from google.antigravity.types import BuiltinTools
-
-        assert BuiltinTools.RUN_COMMAND in config_passed.capabilities.disabled_tools
-        registered_tool_names = [
-            getattr(t, "__name__", "") for t in config_passed.tools
-        ]
-        assert "run_command_sandboxed" in registered_tool_names
-
-
-@pytest.mark.parametrize(
-    ("message", "expected"),
-    [
-        ("Could not fetch prompts: some error", False),
-        ("Could not fetch resources: some error", False),
-        ("Hello", True),
-    ],
-)
-def test_suppress_mcp_probe_filter(message: str, *, expected: bool) -> None:
-    filt = _SuppressMcpProbeFilter()
-    rec = logging.LogRecord("test", logging.INFO, "pathname", 1, message, (), None)
-    assert filt.filter(rec) is expected
+    assert BuiltinTools.RUN_COMMAND in config_passed.capabilities.disabled_tools
+    registered_tool_names = [getattr(t, "__name__", "") for t in config_passed.tools]
+    assert "run_command_sandboxed" in registered_tool_names
 
 
 @pytest.mark.asyncio
-async def test_run_agent_for_repo_with_hint() -> None:
+async def test_run_agent_for_repo_with_hint(mock_agent_class: MagicMock) -> None:
     settings = Settings()
     settings.github_token = "dummy-token"
     settings.gemini_api_key = "dummy-key"
 
-    async def _empty_chunks() -> AsyncGenerator[None]:
-        return
-        yield
+    mock_agent_instance = mock_agent_class.return_value
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = MagicMock()
-        mock_response.chunks = _empty_chunks()
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+        hint="Some test hint",
+    )
 
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 0
-        mock_usage.candidates_token_count = 0
-        mock_usage.thoughts_token_count = 0
-        mock_usage.total_token_count = 0
-        mock_agent_instance.conversation.total_usage = mock_usage
-
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-            hint="Some test hint",
-        )
-
-        mock_agent_instance.chat.assert_called_once()
-        prompt_arg = mock_agent_instance.chat.call_args[0][0]
-        assert "Additional context: Some test hint" in prompt_arg
+    mock_agent_instance.chat.assert_called_once()
+    prompt_arg = mock_agent_instance.chat.call_args[0][0]
+    assert "Additional context: Some test hint" in prompt_arg
 
 
 @pytest.mark.asyncio
-async def test_run_agent_for_repo_processes_chunks() -> None:
+async def test_run_agent_for_repo_processes_chunks(mock_agent_class: MagicMock) -> None:
     settings = Settings()
     settings.github_token = "dummy-token"
     settings.gemini_api_key = "dummy-key"
@@ -565,68 +470,112 @@ async def test_run_agent_for_repo_processes_chunks() -> None:
         yield types.ToolResult(name="rebase_bot_pr", error=None)
         yield types.Text(text="Done!", step_index=1)
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = MagicMock()
-        mock_response.chunks = _mock_chunks()
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
+    mock_agent_instance = mock_agent_class.return_value
+    mock_response = MagicMock()
+    mock_response.chunks = _mock_chunks()
+    mock_agent_instance.chat = AsyncMock(return_value=mock_response)
 
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 10
-        mock_usage.candidates_token_count = 5
-        mock_usage.thoughts_token_count = 2
-        mock_usage.total_token_count = 17
-        mock_agent_instance.conversation.total_usage = mock_usage
+    mock_usage = mock_agent_instance.conversation.total_usage
+    mock_usage.prompt_token_count = 10
+    mock_usage.candidates_token_count = 5
+    mock_usage.thoughts_token_count = 2
+    mock_usage.total_token_count = 17
 
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
 
 @pytest.mark.asyncio
-async def test_run_agent_for_repo_tool_error_hook() -> None:
+async def test_run_agent_for_repo_tool_error_hook(mock_agent_class: MagicMock) -> None:
     settings = Settings()
     settings.github_token = "dummy-token"
     settings.gemini_api_key = "dummy-key"
 
-    async def _empty_chunks() -> AsyncGenerator[None]:
-        return
-        yield
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
 
-    with patch("dependency_director.main.Agent") as mock_agent_class:
-        mock_agent_instance = mock_agent_class.return_value
-        mock_agent_instance.__aenter__.return_value = mock_agent_instance
-        mock_response = MagicMock()
-        mock_response.chunks = _empty_chunks()
-        mock_agent_instance.chat = AsyncMock(return_value=mock_response)
+    config_passed = mock_agent_class.call_args[1]["config"]
+    assert len(config_passed.hooks) == 1
+    hook_fn = config_passed.hooks[0]
+    await hook_fn(Exception("Test tool failure exception"))
 
-        mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 0
-        mock_usage.candidates_token_count = 0
-        mock_usage.thoughts_token_count = 0
-        mock_usage.total_token_count = 0
-        mock_agent_instance.conversation.total_usage = mock_usage
 
-        await run_agent_for_repo(
-            repo="test-owner/test-repo",
-            settings=settings,
-            max_attempts=3,
-            dry_run=True,
-            auto_merge=False,
-            verify_all=False,
-            standalone_fix=False,
-            review_wait=0,
-        )
+# --- agent tool registration ---
 
-        config_passed = mock_agent_class.call_args[1]["config"]
-        assert len(config_passed.hooks) == 1
-        hook_fn = config_passed.hooks[0]
-        await hook_fn(Exception("Test tool failure exception"))
+
+@pytest.mark.asyncio
+async def test_agent_config_no_mcp_servers(mock_agent_class: MagicMock) -> None:
+    """Agent should not use any MCP servers — all GitHub API access is via host tools."""
+    settings = Settings()
+    settings.github_token = "test-pat-token"
+    settings.gemini_api_key = "dummy-key"
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+
+    config_passed = mock_agent_class.call_args[1]["config"]
+    assert not config_passed.mcp_servers
+
+
+@pytest.mark.asyncio
+async def test_agent_config_registers_all_host_tools(
+    mock_agent_class: MagicMock,
+) -> None:
+    """All 12 host tools (+ optional run_command) should be registered."""
+    settings = Settings()
+    settings.github_token = "test-pat-token"
+    settings.gemini_api_key = "dummy-key"
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+
+    config_passed = mock_agent_class.call_args[1]["config"]
+    tool_names = {t.__name__ for t in config_passed.tools}
+    expected = {
+        "list_bot_prs",
+        "merge_bot_pr",
+        "rebase_bot_pr",
+        "wait_for_reviews",
+        "get_pr_status",
+        "get_pr_workflow_run_logs",
+        "get_pr_diff",
+        "get_pr_files",
+        "get_file_contents",
+        "list_commits",
+        "get_commit_details",
+        "list_branches",
+        "run_command_sandboxed",
+    }
+    assert tool_names == expected

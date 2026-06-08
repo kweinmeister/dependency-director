@@ -34,31 +34,31 @@ def get_system_instructions(
 
     if no_sandbox:
         guardrails_content = f"""- Only process PRs authored by {bot_authors_quoted}.
-- NO-SANDBOX mode: No shell access. MUST NOT clone repositories, install deps, run tests, or edit code. Only merge green PRs or rebase/comment via host tools."""
-        workflow_content = f"""1. List open PRs for '{owner}' authored by {bot_authors_quoted}.
-2. Check status via 'get_pr_status(owner, repo, pr_number)'. Do NOT run gh CLI/retrieve logs.
+- NO-SANDBOX mode: No shell access. MUST NOT clone repositories or edit code. Only merge green PRs or rebase via host tools."""
+        workflow_content = """1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs.
+2. Check status via 'get_pr_status(owner, repo, pr_number)'.
    - GREEN: ci_status='GREEN', mergeable=True, mergeable_state='clean'.
    - CONFLICT: ci_status='CONFLICT' or mergeable=False.
    - RED: ci_status='RED'.
    - PENDING: Poll status every 30s (max 10x). Skip if still pending.
 3. Process PRs oldest-to-newest:
    - GREEN: Call merge_bot_pr(owner, repo, pr_number). Stop on failure (Do NOT clone).
-   - CONFLICT: Call rebase_bot_pr if edited only by bot. Else skip.
+   - CONFLICT: Call rebase_bot_pr if edited only by bot, then skip to the next PR (Dependabot processes rebases asynchronously). Else skip.
    - RED: Skip, log '✗ #<pr> cannot be fixed in non-sandboxed mode'."""
     else:
         guardrails_content = f"""- Only process PRs authored by {bot_authors_quoted}.
 - Clone only under subdirectories of {workspace_dir}. Always specify working_dir.
 - Use 'run_command_sandboxed' for all shell commands (built-in 'run_command' is disabled).
-- Network is restricted to package registries (PyPI, npm, crates.io) and GitHub. Do NOT use blocked hosts/tools like gh CLI."""
-        workflow_content = f"""1. List open PRs for '{owner}' authored by {bot_authors_quoted}.
-2. Check status via 'get_pr_status(owner, repo, pr_number)'. Do NOT run gh CLI/retrieve logs.
+- Network is restricted to package registries (PyPI, npm, crates.io) and GitHub."""
+        workflow_content = f"""1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs.
+2. Check status via 'get_pr_status(owner, repo, pr_number)'. Do NOT retrieve logs here (only for RED PRs).
    - GREEN: ci_status='GREEN', mergeable=True, mergeable_state='clean'.
    - CONFLICT: ci_status='CONFLICT' or mergeable=False.
    - RED: ci_status='RED'.
    - PENDING: Poll status every 30s (max 10x). Skip if still pending.
 3. Process PRs oldest-to-newest:
    - GREEN: Call merge_bot_pr. Stop on failure (Do NOT clone).
-   - CONFLICT: If edited only by bot, call rebase_bot_pr. Else clone to {workspace_dir}, merge main, resolve conflicts, test, push.
+   - CONFLICT: If edited only by bot, call rebase_bot_pr then skip to the next PR (Dependabot processes rebases asynchronously). Else clone to {workspace_dir}, merge main, resolve conflicts, test, push.
    - RED: Retrieve logs via 'get_pr_workflow_run_logs'. Clone to {workspace_dir}, install deps, test, fix, verify, and: {fix_strategy}
 4. Max {max_attempts} fix attempts per RED PR before skipping.
 5. Run 'code-review-and-quality' self-review before committing."""
@@ -75,13 +75,8 @@ def get_system_instructions(
         types.SystemInstructionSection(
             title="post_action_checks",
             content="""- Re-list PRs and re-check mergeability after merging or pushing to main (due to potential new conflicts).
-- After pushing a fix, verify CI with 'get_pr_status'. If PENDING, poll (max 10 retries). If still pending, report 'fix pushed, CI pending' and proceed.
-- Process PRs individually on their respective branches.""",
-        ),
-        types.SystemInstructionSection(
-            title="github_api_guidelines",
-            content="""- Fetch open PRs using 'mcp_github_list_pull_requests' and filter by author locally. Do NOT use 'mcp_github_search_issues' (disabled).
-- On 404/403/Permission Denied, stop execution immediately without calling other tools.""",
+- GitHub may return mergeable_state: 'unknown' briefly after a push — re-check once and proceed (not a CONFLICT).
+- After pushing a fix, verify CI with 'get_pr_status'. If PENDING, poll (max 10 retries). If still pending, report 'fix pushed, CI pending' and proceed.""",
         ),
         types.SystemInstructionSection(
             title="code_quality",
@@ -90,13 +85,13 @@ def get_system_instructions(
         ),
         types.SystemInstructionSection(
             title="output_format",
-            content=f"""- Log '✗ #<n> could not be fixed after {max_attempts} attempts' if RED PR fixes fail.
-- Do NOT announce actions before execution. State reasons if halting early.
-- Format CLI output as:
+            content=f"""- Do NOT announce actions before execution. State reasons if halting early.
+- Emit output sequentially as you work (not as one block at the end). Format CLI output as:
   1. Initial list of open PRs with statuses (GREEN/RED/CONFLICT).
   2. Execution prefix: '→ Merging #12 (green)' or '→ Fixing #14 (failing CI)'.
-  3. Completion prefix: '✓ #12 merged' or '✗ #14 failed after N attempts'.
-  4. Final markdown summary list of all processed PRs.""",
+  3. Completion prefix: '✓ #12 merged', '⏭ #23 skipped (rebase requested)', or '✗ #14 failed after N attempts'.
+  4. Final markdown summary list of all processed PRs.
+- Log '✗ #<n> could not be fixed after {max_attempts} attempts' if RED PR fixes fail.""",
         ),
     ]
 
@@ -111,7 +106,7 @@ def get_system_instructions(
         sections.append(
             types.SystemInstructionSection(
                 title="fast_track_green_prs",
-                content="""Merge green PRs directly via 'merge_bot_pr' without cloning or testing. Stop immediately if merge fails.""",
+                content="""Merge green PRs directly via 'merge_bot_pr' without cloning or testing. Re-check mergeability via 'get_pr_status' between sequential merges (a prior merge can introduce conflicts). Stop immediately if merge fails for any reason other than a conflict.""",
             ),
         )
 
@@ -119,14 +114,14 @@ def get_system_instructions(
         sections.append(
             types.SystemInstructionSection(
                 title="auto_merge_mode",
-                content="""Enable auto-merge on fix PRs via 'gh pr merge <pr_number> --auto --squash'.""",
+                content="""Merge fix PRs using 'merge_bot_pr' once CI turns green.""",
             ),
         )
     else:
         sections.append(
             types.SystemInstructionSection(
                 title="manual_review_mode",
-                content="""MUST NOT merge. Leave fix PRs open for manual review.""",
+                content="""MUST NOT merge fix PRs. Leave fix PRs open for manual review. Green PRs can still be merged using 'merge_bot_pr'.""",
             ),
         )
 
@@ -134,7 +129,7 @@ def get_system_instructions(
         sections.append(
             types.SystemInstructionSection(
                 title="dry_run_mode",
-                content="""Dry-run mode: Log actions but MUST NOT push, merge, or create PRs.""",
+                content="""Dry-run mode: Call all tools normally — the safety policies enforce simulation automatically and no real changes will occur. Do not skip, avoid, or work around tool calls. Treat tool responses marked [DRY-RUN] as if the action succeeded for the purpose of deciding what to do next. Since no real merges occur, do NOT re-check PR status between merges — proceed directly to the next PR.""",
             ),
         )
 

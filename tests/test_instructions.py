@@ -78,6 +78,7 @@ def test_has_required_section(
         "get_pr_workflow_run_logs",
         "merge_bot_pr",
         "rebase_bot_pr",
+        "list_bot_prs",
         "code-review-and-quality",
     ],
 )
@@ -100,6 +101,14 @@ def test_no_gh_cli_diagnostic_commands_in_workflow(
 def test_clone_only_for_red(instructions: types.TemplatedSystemInstructions) -> None:
     content = _section_content(instructions, "workflow")
     assert "do not clone" in content.lower()
+
+
+def test_conflict_rebase_skips_to_next_pr(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    content = _section_content(instructions, "workflow")
+    assert "rebase_bot_pr" in content
+    assert "asynchronously" in content
 
 
 # --- Code quality ---
@@ -128,6 +137,7 @@ def test_post_action_checks(instructions: types.TemplatedSystemInstructions) -> 
     assert "re-list" in content.lower() or "re-check" in content.lower()
     assert "get_pr_status" in content
     assert "max 10 retries" in content
+    assert "unknown" in content  # mergeable_state: 'unknown' guidance
 
 
 def test_post_action_owner_not_leaked_as_template_literal(
@@ -159,11 +169,10 @@ def test_max_attempts_appears_in_workflow(value: int) -> None:
 # --- owner ---
 
 
-def test_owner_appears_in_identity_and_sections() -> None:
+def test_owner_appears_in_identity() -> None:
     inst = get_system_instructions(max_attempts=3, owner="my-org")
     assert inst.identity is not None
     assert "my-org" in inst.identity
-    assert "my-org" in _section_content(inst, "workflow")
 
 
 def test_owner_with_special_chars() -> None:
@@ -245,20 +254,23 @@ def test_conditional_section_absent_when_disabled(
 def test_auto_merge_content() -> None:
     inst = _get_instructions(auto_merge=True)
     content = _section_content(inst, "auto_merge_mode")
-    assert "gh pr merge" in content
-    assert "--auto --squash" in content
+    assert "merge_bot_pr" in content
+    assert "green" in content
 
 
 def test_manual_review_content() -> None:
     inst = _get_instructions(auto_merge=False)
     content = _section_content(inst, "manual_review_mode")
-    assert "MUST NOT merge" in content
+    assert "MUST NOT merge fix PRs" in content
 
 
 def test_dry_run_content() -> None:
     inst = _get_instructions(dry_run=True)
     content = _section_content(inst, "dry_run_mode")
-    assert "MUST NOT" in content
+    assert "safety policies enforce simulation" in content
+    assert "Do not skip" in content
+    assert "[DRY-RUN]" in content
+    assert "do NOT re-check PR status between merges" in content
 
 
 def test_verify_all_content() -> None:
@@ -356,12 +368,11 @@ def test_bot_authors_in_guardrails(
     assert "renovate[bot]" in content
 
 
-def test_bot_authors_in_workflow(
+def test_bot_prs_tool_in_workflow(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
     content = _section_content(instructions, "workflow")
-    assert "dependabot[bot]" in content
-    assert "renovate[bot]" in content
+    assert "list_bot_prs" in content
 
 
 def test_custom_bots_in_instructions() -> None:
