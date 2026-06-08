@@ -325,7 +325,8 @@ async def test_wait_for_reviews_polls_until_timeout(mock_client: MagicMock) -> N
     mock_client.get_pr_reviews = AsyncMock(return_value=[])
 
     with patch(
-        "dependency_director.tools.asyncio.sleep", new_callable=AsyncMock
+        "dependency_director.tools.asyncio.sleep",
+        new_callable=AsyncMock,
     ) as mock_sleep:
         result = await wait("owner", "repo", 42)
     assert "no review comments" in result.lower()

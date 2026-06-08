@@ -246,7 +246,7 @@ async def test_workspace_cleanup_on_start() -> None:
     repo = "test-owner/test-repo"
     repo_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
     workspace_dir = str(
-        Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}"
+        Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}",
     )
 
     # Create a stale file in the workspace to simulate leftover from a prior run

@@ -243,7 +243,7 @@ async def run_agent_for_repo(
 
         repo_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
         workspace_tmp = str(
-            Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}"
+            Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}",
         )
         await asyncio.to_thread(_prepare_workspace, workspace_tmp)
 
