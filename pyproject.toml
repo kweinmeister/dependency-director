@@ -1,0 +1,48 @@
+[project]
+name = "dependency-director"
+version = "0.1.0"
+description = "Autonomous dependency triage and patching agent using the Google Antigravity SDK."
+readme = "README.md"
+requires-python = ">=3.13.13"
+dependencies = [
+    "click>=8.4.1",
+    "google-antigravity>=0.1.2",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.12.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.15.16",
+    "ty>=0.0.44",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=dependency_director --cov-report=term-missing --durations=10"
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+strict = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+depdirector = "dependency_director.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dependency_director"]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
