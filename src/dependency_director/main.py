@@ -3,25 +3,16 @@
 import asyncio
 import hashlib
 import logging
-import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import textwrap
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-import anyio
-import anyio.abc
 import click
-import mcp.client.stdio
-from anyio.streams.text import TextReceiveStream
 from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks
-from google.antigravity.mcp.bridge import McpBridge
-from mcp.client import stdio
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -32,6 +23,7 @@ from dependency_director.config import (
     get_dry_run_policies,
     get_safety_policies,
 )
+from dependency_director.instructions import get_system_instructions
 from dependency_director.tools import (
     GitHubClient,
     create_agent_tools,
@@ -39,75 +31,6 @@ from dependency_director.tools import (
     is_ripgrep_available,
     is_srt_available,
 )
-
-
-# Monkey-patch: the upstream Antigravity SDK's McpStdioServer does not
-# support passing custom environment variables to the MCP server subprocess.
-# This patch adds `env` support so the GitHub MCP server can receive
-# GITHUB_PERSONAL_ACCESS_TOKEN without inheriting the full host environment.
-# TODO: Remove once the SDK adds native `env` support to McpStdioServer.
-class PatchedMcpStdioServer(types.McpStdioServer):  # type: ignore[misc]
-    env: dict[str, str] | None = None
-
-
-async def patched_connect_stdio(
-    self: McpBridge,
-    command: str,
-    args: Sequence[str],
-    server_cfg: types.McpStdioServer | types.McpStreamableHttpServer | None = None,
-) -> None:
-    env = getattr(server_cfg, "env", None)
-    params = stdio.StdioServerParameters(
-        command=command,
-        args=list(args),
-        env=env,
-    )
-    await self._connect(params, server_cfg)
-
-
-McpBridge.connect_stdio = cast("Any", patched_connect_stdio)
-
-
-# Monkey-patch: Wrap the MCP client's stdio subprocess creation to capture
-# and prefix the stderr logs (such as the GitHub MCP server startup message)
-# with a clean emoji.
-async def _stderr_reader(process: anyio.abc.Process, errlog: Any) -> None:
-    if process.stderr is None:
-        return
-    text_stream = TextReceiveStream(process.stderr, encoding="utf-8")
-    try:
-        async for chunk in text_stream:
-            if "GitHub MCP Server running on stdio" in chunk:
-                chunk = chunk.replace(
-                    "GitHub MCP Server running on stdio",
-                    "🔌 GitHub MCP Server running on stdio",
-                )
-            errlog.write(chunk)
-            errlog.flush()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-async def patched_create_process(
-    command: str,
-    args: list[str],
-    env: dict[str, str] | None = None,
-    errlog: Any = sys.stderr,
-    cwd: Any = None,
-) -> anyio.abc.Process:
-    process = await anyio.open_process(
-        [command, *args],
-        env=env,
-        stderr=subprocess.PIPE,
-        cwd=cwd,
-        start_new_session=True,
-    )
-    asyncio.create_task(_stderr_reader(process, errlog))
-    return process
-
-
-mcp.client.stdio._create_platform_compatible_process = patched_create_process  # type: ignore # pytype: disable=invalid-assignment
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SKILLS_PATH = PROJECT_ROOT / ".agents" / "skills"
@@ -127,26 +50,14 @@ console = Console(
 )
 
 
-class _SuppressMcpProbeFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return (
-            "Could not fetch prompts" not in record.getMessage()
-            and "Could not fetch resources" not in record.getMessage()
-        )
-
-
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
 )
-logging.getLogger().addFilter(_SuppressMcpProbeFilter())
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("dependency_director")
 logger.setLevel(logging.INFO)
-
-
-from dependency_director.instructions import get_system_instructions  # noqa: E402
 
 
 async def get_repositories(owner: str, token: str) -> list[str]:
@@ -193,6 +104,13 @@ async def run_agent_for_repo(
         wait_for_reviews,
         get_pr_status,
         get_pr_workflow_run_logs,
+        list_bot_prs,
+        get_pr_diff,
+        get_pr_files,
+        get_file_contents,
+        list_commits,
+        get_commit_details,
+        list_branches,
     ) = create_agent_tools(
         client=client,
         bots=settings.bots,
@@ -200,37 +118,8 @@ async def run_agent_for_repo(
         review_wait=review_wait,
     )
 
+    workspace_tmp: str | None = None
     try:
-        click.secho(
-            f"🔗 Configuring GitHub MCP server connection for {repo}...",
-            fg="blue",
-        )
-        mcp_servers: list[types.McpServerConfig] = [
-            PatchedMcpStdioServer(
-                name="github",
-                command="npx",
-                args=["-y", "@modelcontextprotocol/server-github"],
-                env={
-                    "GITHUB_PERSONAL_ACCESS_TOKEN": settings.github_token,
-                    "PATH": os.environ.get("PATH", ""),
-                },
-                disabled_tools=[
-                    "merge_pull_request",
-                    "search_issues",
-                    "search_repositories",
-                    "search_code",
-                    "search_users",
-                    "create_repository",
-                    "fork_repository",
-                    "create_or_update_file",
-                    "push_files",
-                    "create_branch",
-                    "create_issue",
-                    "update_issue",
-                ],
-            ),
-        ]
-
         # Gather safety policies
         policies = get_safety_policies()
 
@@ -286,11 +175,18 @@ async def run_agent_for_repo(
         skills_path = str(SKILLS_PATH)
 
         agent_tools: list[Any] = [
+            list_bot_prs,
             merge_bot_pr,
             rebase_bot_pr,
             wait_for_reviews,
             get_pr_status,
             get_pr_workflow_run_logs,
+            get_pr_diff,
+            get_pr_files,
+            get_file_contents,
+            list_commits,
+            get_commit_details,
+            list_branches,
         ]
         if run_command is not None:
             agent_tools.append(run_command)
@@ -305,7 +201,6 @@ async def run_agent_for_repo(
             if settings.vertex
             else None,
             system_instructions=system_instructions,
-            mcp_servers=mcp_servers,
             policies=policies,
             hooks=[RepoToolErrorHook()],
             tools=agent_tools,
@@ -405,7 +300,8 @@ async def run_agent_for_repo(
         cleanup_sandbox = getattr(run_command, "cleanup", None)
         if cleanup_sandbox:
             cleanup_sandbox()
-        await asyncio.to_thread(_cleanup_workspace, workspace_tmp)
+        if workspace_tmp:
+            await asyncio.to_thread(_cleanup_workspace, workspace_tmp)
 
 
 async def run_agent(
@@ -488,7 +384,6 @@ async def run_agent(
                     fg="red",
                     bold=True,
                 )
-                await client.close()
                 sys.exit(1)
             finally:
                 await client.close()

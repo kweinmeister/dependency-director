@@ -26,6 +26,7 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "--cov=dependency_director --cov-report=term-missing --durations=10"
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.13"

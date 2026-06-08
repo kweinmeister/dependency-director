@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from dependency_director.config import DEFAULT_BOTS
-from dependency_director.tools import GitHubClient, ToolFn, create_agent_tools
+from dependency_director.tools import (
+    GitHubClient,
+    GitHubNotFoundError,
+    ToolFn,
+    create_agent_tools,
+)
 
 # ============================================================
 # GitHubClient Unit Tests
@@ -94,8 +99,9 @@ async def test_github_client_get_workflow_runs_for_commit() -> None:
         assert result["total_count"] == 1
         assert result["workflow_runs"][0]["id"] == 98765
         mock_get.assert_called_once_with(
-            "https://api.github.com/repos/owner/repo/actions/runs?head_sha=sha123",
+            "https://api.github.com/repos/owner/repo/actions/runs",
             headers=c.headers,
+            params={"head_sha": "sha123"},
         )
         await c.close()
 
@@ -148,11 +154,6 @@ async def test_github_client_get_job_logs() -> None:
 
 
 @pytest.fixture
-def mock_client() -> MagicMock:
-    return MagicMock(spec=GitHubClient)
-
-
-@pytest.fixture
 def tools(mock_client: MagicMock) -> tuple[ToolFn, ...]:
     return create_agent_tools(
         client=mock_client,
@@ -162,17 +163,29 @@ def tools(mock_client: MagicMock) -> tuple[ToolFn, ...]:
     )
 
 
+@pytest.fixture
+def get_pr_status(tools: tuple[ToolFn, ...]) -> ToolFn:
+    fn = tools[3]
+    fn_name = getattr(fn, "__name__", "")
+    assert fn_name == "get_pr_status", f"Unexpected tool at index 3: {fn_name!r}"
+    return fn
+
+
+@pytest.fixture
+def get_pr_workflow_run_logs(tools: tuple[ToolFn, ...]) -> ToolFn:
+    fn = tools[4]
+    fn_name = getattr(fn, "__name__", "")
+    assert fn_name == "get_pr_workflow_run_logs", (
+        f"Unexpected tool at index 4: {fn_name!r}"
+    )
+    return fn
+
+
 @pytest.mark.asyncio
 async def test_tool_get_pr_status_green(
     mock_client: MagicMock,
-    tools: tuple[ToolFn, ...],
+    get_pr_status: ToolFn,
 ) -> None:
-    # Under create_tools, the tools are:
-    # merge_bot_pr, rebase_bot_pr, wait_for_reviews, get_pr_status, get_pr_workflow_run_logs
-    # Let's verify by retrieving get_pr_status by name or index
-    get_pr_status = tools[3]
-    assert getattr(get_pr_status, "__name__", None) == "get_pr_status"
-
     mock_client.get_pr_details = AsyncMock(
         return_value={
             "number": 22,
@@ -211,10 +224,8 @@ async def test_tool_get_pr_status_green(
 @pytest.mark.asyncio
 async def test_tool_get_pr_status_red_failing_check_run(
     mock_client: MagicMock,
-    tools: tuple[ToolFn, ...],
+    get_pr_status: ToolFn,
 ) -> None:
-    get_pr_status = tools[3]
-
     mock_client.get_pr_details = AsyncMock(
         return_value={
             "number": 22,
@@ -248,10 +259,8 @@ async def test_tool_get_pr_status_red_failing_check_run(
 @pytest.mark.asyncio
 async def test_tool_get_pr_status_pending(
     mock_client: MagicMock,
-    tools: tuple[ToolFn, ...],
+    get_pr_status: ToolFn,
 ) -> None:
-    get_pr_status = tools[3]
-
     mock_client.get_pr_details = AsyncMock(
         return_value={
             "number": 22,
@@ -285,10 +294,8 @@ async def test_tool_get_pr_status_pending(
 @pytest.mark.asyncio
 async def test_tool_get_pr_status_conflict(
     mock_client: MagicMock,
-    tools: tuple[ToolFn, ...],
+    get_pr_status: ToolFn,
 ) -> None:
-    get_pr_status = tools[3]
-
     mock_client.get_pr_details = AsyncMock(
         return_value={
             "number": 22,
@@ -322,14 +329,8 @@ async def test_tool_get_pr_status_conflict(
 @pytest.mark.asyncio
 async def test_tool_get_pr_workflow_run_logs(
     mock_client: MagicMock,
-    tools: tuple[ToolFn, ...],
+    get_pr_workflow_run_logs: ToolFn,
 ) -> None:
-    get_pr_workflow_run_logs = tools[4]
-    assert (
-        getattr(get_pr_workflow_run_logs, "__name__", None)
-        == "get_pr_workflow_run_logs"
-    )
-
     mock_client.get_pr_details = AsyncMock(
         return_value={
             "number": 22,
@@ -372,3 +373,43 @@ async def test_tool_get_pr_workflow_run_logs(
     # It should have truncated to only include the last 50 lines
     assert "log line 1" not in result
     assert "log line 50" in result
+
+
+@pytest.mark.asyncio
+async def test_tool_get_pr_workflow_run_logs_api_error_on_logs(
+    mock_client: MagicMock,
+    get_pr_workflow_run_logs: ToolFn,
+) -> None:
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 22,
+            "head": {"sha": "sha123"},
+        },
+    )
+    mock_client.get_workflow_runs_for_commit = AsyncMock(
+        return_value={
+            "total_count": 1,
+            "workflow_runs": [{"id": 98765}],
+        },
+    )
+    mock_client.get_workflow_run_jobs = AsyncMock(
+        return_value={
+            "jobs": [
+                {
+                    "id": 111,
+                    "name": "build",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+            ],
+        },
+    )
+
+    mock_client.get_job_logs = AsyncMock(
+        side_effect=GitHubNotFoundError("GitHub API error 404"),
+    )
+
+    result = await get_pr_workflow_run_logs("owner", "repo", 22)
+
+    assert "--- FAILED JOB: build (ID: 111) ---" in result
+    assert "Failed to retrieve log: GitHub API error 404" in result
