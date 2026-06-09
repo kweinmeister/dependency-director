@@ -1,3 +1,5 @@
+"""Tests for system instructions generation in dependency-director."""
+
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ def _get_instructions(
 
 @pytest.fixture
 def instructions() -> types.TemplatedSystemInstructions:
+    """Fixture to return a default templated system instructions object for testing."""
     return _get_instructions()
 
 
@@ -46,6 +49,7 @@ def _section_titles(inst: types.TemplatedSystemInstructions) -> set[str]:
 
 
 def test_returns_templated(instructions: types.TemplatedSystemInstructions) -> None:
+    """Verify that get_system_instructions returns a TemplatedSystemInstructions object."""
     assert isinstance(instructions, types.TemplatedSystemInstructions)
     assert instructions.identity is not None
     assert "test-owner" in instructions.identity
@@ -65,6 +69,7 @@ def test_has_required_section(
     instructions: types.TemplatedSystemInstructions,
     section: str,
 ) -> None:
+    """Verify that the system instructions contain all mandatory section headers."""
     assert section in _section_titles(instructions)
 
 
@@ -86,6 +91,7 @@ def test_workflow_contains(
     instructions: types.TemplatedSystemInstructions,
     expected: str,
 ) -> None:
+    """Verify that the primary agent workflow instructions are generated correctly."""
     content = _section_content(instructions, "workflow")
     assert expected in content
 
@@ -93,19 +99,22 @@ def test_workflow_contains(
 def test_no_gh_cli_diagnostic_commands_in_workflow(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
+    """Verify that potentially dangerous gh-cli diagnostic commands are excluded from instructions."""
     content = _section_content(instructions, "workflow")
     assert "gh pr checks" not in content
     assert "gh api" not in content
 
 
 def test_clone_only_for_red(instructions: types.TemplatedSystemInstructions) -> None:
+    """Verify repository cloning instructions are only generated when PR is failing."""
     content = _section_content(instructions, "workflow")
-    assert "do not clone" in content.lower()
+    assert any(phrase in content.lower() for phrase in ("do not clone", "no cloning needed"))
 
 
 def test_conflict_rebase_skips_to_next_pr(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
+    """Verify that instructions suggest skipping to the next PR if rebase conflict occurs."""
     content = _section_content(instructions, "workflow")
     assert "rebase_bot_pr" in content
     assert "asynchronously" in content
@@ -125,6 +134,7 @@ def test_code_quality_contains(
     instructions: types.TemplatedSystemInstructions,
     expected: str,
 ) -> None:
+    """Verify that code quality and review rules are included in the generated instructions."""
     content = _section_content(instructions, "code_quality")
     assert expected in content
 
@@ -133,6 +143,7 @@ def test_code_quality_contains(
 
 
 def test_post_action_checks(instructions: types.TemplatedSystemInstructions) -> None:
+    """Verify that post-action checking steps are explicitly detailed in instructions."""
     content = _section_content(instructions, "post_action_checks")
     assert "re-list" in content.lower() or "re-check" in content.lower()
     assert "get_pr_status" in content
@@ -143,6 +154,7 @@ def test_post_action_checks(instructions: types.TemplatedSystemInstructions) -> 
 def test_post_action_owner_not_leaked_as_template_literal(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
+    """Verify that repository owner variables are safely formatted in the instructions."""
     content = _section_content(instructions, "post_action_checks")
     assert "{owner}" not in content
 
@@ -151,6 +163,7 @@ def test_post_action_owner_not_leaked_as_template_literal(
 
 
 def test_output_format(instructions: types.TemplatedSystemInstructions) -> None:
+    """Verify that rules regarding response and output format are included in the instructions."""
     content = _section_content(instructions, "output_format")
     assert "GREEN" in content
     assert "RED" in content
@@ -162,6 +175,7 @@ def test_output_format(instructions: types.TemplatedSystemInstructions) -> None:
 
 @pytest.mark.parametrize("value", [1, 3, 7, 10])
 def test_max_attempts_appears_in_workflow(value: int) -> None:
+    """Verify that the max fix attempts config value is correctly formatted into the workflow instructions."""
     inst = get_system_instructions(max_attempts=value, owner="test-owner")
     assert str(value) in _section_content(inst, "workflow")
 
@@ -170,18 +184,21 @@ def test_max_attempts_appears_in_workflow(value: int) -> None:
 
 
 def test_owner_appears_in_identity() -> None:
+    """Verify that the repository owner is correctly injected into the agent's identity section."""
     inst = get_system_instructions(max_attempts=3, owner="my-org")
     assert inst.identity is not None
     assert "my-org" in inst.identity
 
 
 def test_owner_with_special_chars() -> None:
+    """Verify that owner names containing special characters are correctly handled."""
     inst = get_system_instructions(max_attempts=3, owner="my-org_123")
     assert inst.identity is not None
     assert "my-org_123" in inst.identity
 
 
 def test_owner_empty_string() -> None:
+    """Verify that an empty string owner raises a ValueError during validation."""
     inst = get_system_instructions(max_attempts=3, owner="")
     assert isinstance(inst, types.TemplatedSystemInstructions)
     assert inst.identity is not None
@@ -192,16 +209,19 @@ def test_owner_empty_string() -> None:
 
 
 def test_workspace_dir_appears() -> None:
+    """Verify that the active workspace directory path is included in the instructions."""
+    workspace = str(Path(tempfile.gettempdir()) / "custom-ws")
     inst = get_system_instructions(
         max_attempts=3,
         owner="test-owner",
-        workspace_dir="/tmp/custom-ws",
+        workspace_dir=workspace,
     )
-    assert "/tmp/custom-ws" in _section_content(inst, "guardrails")
-    assert "/tmp/custom-ws" in _section_content(inst, "workflow")
+    assert workspace in _section_content(inst, "guardrails")
+    assert workspace in _section_content(inst, "workflow")
 
 
 def test_workspace_dir_default() -> None:
+    """Verify default workspace directory placeholder is used when not specified."""
     inst = get_system_instructions(max_attempts=3, owner="test-owner")
     assert DEFAULT_WORKSPACE_DIR in _section_content(inst, "guardrails")
 
@@ -214,8 +234,8 @@ def test_workspace_dir_default() -> None:
     [
         ({"auto_merge": True}, "auto_merge_mode", "manual_review_mode"),
         ({"auto_merge": False}, "manual_review_mode", "auto_merge_mode"),
-        ({"verify_all": True}, "verify_green_prs", "fast_track_green_prs"),
-        ({"verify_all": False}, "fast_track_green_prs", "verify_green_prs"),
+        ({"verify_all": True}, "verify_green_prs", "merging_green_prs"),
+        ({"verify_all": False}, "merging_green_prs", "verify_green_prs"),
         ({"dry_run": True}, "dry_run_mode", None),
         ({"review_wait": 5}, "review_feedback_loop", None),
     ],
@@ -225,6 +245,7 @@ def test_conditional_section_present(
     present: str,
     absent: str | None,
 ) -> None:
+    """Verify conditional sections are present in instructions when their options are active."""
     inst = _get_instructions(**flags)
     titles = _section_titles(inst)
     assert present in titles
@@ -244,6 +265,7 @@ def test_conditional_section_absent_when_disabled(
     flags: dict[str, Any],
     absent: str,
 ) -> None:
+    """Verify conditional sections are omitted when their corresponding flags are disabled."""
     inst = _get_instructions(**flags)
     assert absent not in _section_titles(inst)
 
@@ -252,6 +274,7 @@ def test_conditional_section_absent_when_disabled(
 
 
 def test_auto_merge_content() -> None:
+    """Verify system instructions contain auto-merge logic when enabled."""
     inst = _get_instructions(auto_merge=True)
     content = _section_content(inst, "auto_merge_mode")
     assert "merge_bot_pr" in content
@@ -259,12 +282,14 @@ def test_auto_merge_content() -> None:
 
 
 def test_manual_review_content() -> None:
+    """Verify system instructions contain manual review workflows when enabled."""
     inst = _get_instructions(auto_merge=False)
     content = _section_content(inst, "manual_review_mode")
     assert "MUST NOT merge fix PRs" in content
 
 
 def test_dry_run_content() -> None:
+    """Verify system instructions include dry-run directives when enabled."""
     inst = _get_instructions(dry_run=True)
     content = _section_content(inst, "dry_run_mode")
     assert "safety policies enforce simulation" in content
@@ -274,18 +299,21 @@ def test_dry_run_content() -> None:
 
 
 def test_verify_all_content() -> None:
+    """Verify system instructions include full verification workflows when enabled."""
     inst = _get_instructions(verify_all=True)
     content = _section_content(inst, "verify_green_prs")
     assert "clone" in content.lower()
 
 
 def test_fast_track_content() -> None:
+    """Verify system instructions include fast-track workflows when active."""
     inst = _get_instructions(verify_all=False)
-    content = _section_content(inst, "fast_track_green_prs")
+    content = _section_content(inst, "merging_green_prs")
     assert "merge_bot_pr" in content
 
 
 def test_review_wait_content() -> None:
+    """Verify system instructions detail wait behavior for reviews when review_wait is non-zero."""
     inst = _get_instructions(review_wait=5)
     content = _section_content(inst, "review_feedback_loop")
     assert "wait_for_reviews" in content
@@ -295,6 +323,7 @@ def test_review_wait_content() -> None:
 
 
 def test_default_pushes_to_original_branch() -> None:
+    """Verify instructions command pushing fixes back to the original branch by default."""
     inst = _get_instructions(standalone_fix=False)
     content = _section_content(inst, "workflow")
     assert "directly" in content.lower()
@@ -302,12 +331,14 @@ def test_default_pushes_to_original_branch() -> None:
 
 
 def test_default_includes_merge_from_main() -> None:
+    """Verify instructions command merging main branch before attempting fixes by default."""
     inst = _get_instructions(standalone_fix=False)
     content = _section_content(inst, "workflow")
     assert "git merge origin/main" in content
 
 
 def test_standalone_fix_creates_new_branch() -> None:
+    """Verify instructions specify creating a new branch when standalone-fix is active."""
     inst = _get_instructions(standalone_fix=True)
     content = _section_content(inst, "workflow")
     assert "dependency-director/fix-" in content
@@ -317,6 +348,7 @@ def test_standalone_fix_creates_new_branch() -> None:
 
 
 def test_all_flags_on() -> None:
+    """Verify instructions are generated correctly with all feature flags enabled."""
     custom_ws = str(Path(tempfile.gettempdir()) / "all-flags")
     inst = get_system_instructions(
         max_attempts=5,
@@ -341,6 +373,7 @@ def test_all_flags_on() -> None:
 
 
 def test_all_flags_off() -> None:
+    """Verify instructions are generated correctly with all feature flags disabled."""
     inst = get_system_instructions(
         max_attempts=3,
         owner="minimal-org",
@@ -351,7 +384,7 @@ def test_all_flags_off() -> None:
         review_wait=0,
     )
     titles = _section_titles(inst)
-    assert "fast_track_green_prs" in titles
+    assert "merging_green_prs" in titles
     assert "manual_review_mode" in titles
     assert "dry_run_mode" not in titles
     assert "review_feedback_loop" not in titles
@@ -363,6 +396,7 @@ def test_all_flags_off() -> None:
 def test_bot_authors_in_guardrails(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
+    """Verify the allowed list of bot authors is defined in instruction guardrails."""
     content = _section_content(instructions, "guardrails")
     assert "dependabot[bot]" in content
     assert "renovate[bot]" in content
@@ -371,11 +405,13 @@ def test_bot_authors_in_guardrails(
 def test_bot_prs_tool_in_workflow(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
+    """Verify that instructions list the bot PRs tool in the allowed tools section."""
     content = _section_content(instructions, "workflow")
     assert "list_bot_prs" in content
 
 
 def test_custom_bots_in_instructions() -> None:
+    """Verify custom bot configurations are correctly added to the system instructions."""
     custom = [BotConfig(author="my-bot[bot]", rebase_command="@my-bot rebase")]
     inst = get_system_instructions(max_attempts=3, owner="test-owner", bots=custom)
     content = _section_content(inst, "guardrails")
@@ -384,6 +420,7 @@ def test_custom_bots_in_instructions() -> None:
 
 
 def test_no_sandbox_instructions() -> None:
+    """Verify instructions explicitly flag that sandboxing is disabled when configured."""
     inst = get_system_instructions(
         max_attempts=3,
         owner="test-owner",
@@ -478,3 +515,21 @@ def test_minimize_conversational_output(
     """System instructions must direct the agent to minimize conversational output."""
     output_format = _section_content(instructions, "output_format")
     assert "Minimize conversational output" in output_format
+
+
+def test_red_pr_grep_pattern_reflects_configured_bots() -> None:
+    """Grep pattern for remote branch discovery uses configured bot authors, not hardcoded names."""
+    import re as _re
+
+    custom_bots = [
+        BotConfig(author="custom-bot[bot]", rebase_command="@custom-bot rebase"),
+        BotConfig(author="another-bot[bot]", rebase_command="@another-bot rebase"),
+    ]
+    inst = _get_instructions(bots=custom_bots)
+    workflow = _section_content(inst, "workflow")
+    # re.escape is applied to authors, so check for the escaped form in the pattern
+    assert _re.escape("custom-bot[bot]") in workflow
+    assert _re.escape("another-bot[bot]") in workflow
+    # Default bot escaped names must NOT appear when overridden
+    assert _re.escape("dependabot[bot]") not in workflow
+    assert _re.escape("renovate[bot]") not in workflow

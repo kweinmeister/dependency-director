@@ -24,6 +24,9 @@ dev = [
     "ty>=0.0.44",
 ]
 
+[tool.pyrefly.errors]
+bad-override-mutable-attribute = "ignore"
+
 [tool.pytest.ini_options]
 addopts = "--cov=dependency_director --cov-report=term-missing --durations=10"
 asyncio_mode = "auto"
@@ -32,6 +35,10 @@ asyncio_mode = "auto"
 python_version = "3.13"
 ignore_missing_imports = true
 strict = true
+disallow_untyped_decorators = false
+python_executable = ".venv/bin/python"
+
+
 
 [build-system]
 requires = ["hatchling"]
@@ -47,3 +54,13 @@ packages = ["src/dependency_director"]
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "SLF001", "PLR", "ANN401"]
+[tool.ruff]
+line-length = 120
+
+[tool.pyrefly]
+python-version = "3.13.0"
+ignore-missing-imports = ["*"]
+
