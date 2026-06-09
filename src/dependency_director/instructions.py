@@ -28,14 +28,15 @@ def get_system_instructions(
     bot_authors_quoted = ", ".join(f"'{a}'" for a in bot_authors)
 
     if standalone_fix:
-        fix_strategy = """commit to new branch 'dependency-director/fix-<pr-number>', push, and open PR targeting main referencing original."""
+        fix_strategy = """commit to local branch, push using 'git push origin pr-<pr-number>:dependency-director/fix-<pr-pr_number>', and open PR targeting main referencing original."""
     else:
-        fix_strategy = """commit directly to update PR branch, merge main ('git merge origin/main'), resolve conflicts, re-test, and push. Do NOT create new branch/PR."""
+        fix_strategy = """commit to local branch, merge main ('git merge origin/main'), resolve conflicts, re-test, and push directly to remote branch using 'git push origin pr-<pr-number>:<remote-pr-branch>'. Do NOT create new branch/PR."""
 
     if no_sandbox:
         guardrails_content = f"""- Only process PRs authored by {bot_authors_quoted}.
-- NO-SANDBOX mode: No shell access. MUST NOT clone repositories or edit code. Only merge green PRs or rebase via host tools."""
-        workflow_content = """1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs.
+- NO-SANDBOX mode: No shell access. MUST NOT clone repositories or edit code. Only merge green PRs or rebase via host tools.
+- Trust tool outputs (e.g. 'list_bot_prs'). Do NOT search, browse, or inspect the host environment, files, or directories (e.g. tests, conftest.py, .env)."""
+        workflow_content = """1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs. If none are found, halt immediately and exit.
 2. Check status via 'get_pr_status(owner, repo, pr_number)'.
    - GREEN: ci_status='GREEN', mergeable=True, mergeable_state='clean'.
    - CONFLICT: ci_status='CONFLICT' or mergeable=False.
@@ -49,8 +50,9 @@ def get_system_instructions(
         guardrails_content = f"""- Only process PRs authored by {bot_authors_quoted}.
 - Clone only under subdirectories of {workspace_dir}. Always specify working_dir.
 - Use 'run_command_sandboxed' for all shell commands (built-in 'run_command' is disabled).
-- Network is restricted to package registries (PyPI, npm, crates.io) and GitHub."""
-        workflow_content = f"""1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs.
+- Network is restricted to package registries (PyPI, npm, crates.io) and GitHub.
+- Trust tool outputs (e.g. 'list_bot_prs'). Do NOT search, browse, or inspect the host environment, files, or directories (e.g. tests, conftest.py, .env)."""
+        workflow_content = f"""1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs. If none are found, halt immediately and exit.
 2. Check status via 'get_pr_status(owner, repo, pr_number)'. Do NOT retrieve logs here (only for RED PRs).
    - GREEN: ci_status='GREEN', mergeable=True, mergeable_state='clean'.
    - CONFLICT: ci_status='CONFLICT' or mergeable=False.
@@ -59,7 +61,7 @@ def get_system_instructions(
 3. Process PRs oldest-to-newest:
    - GREEN: Call merge_bot_pr. Stop on failure (Do NOT clone).
    - CONFLICT: If edited only by bot, call rebase_bot_pr then skip to the next PR (Dependabot processes rebases asynchronously). Else clone to {workspace_dir}, merge main, resolve conflicts, test, push.
-   - RED: Retrieve logs via 'get_pr_workflow_run_logs'. Clone to {workspace_dir}, install deps, test, fix, verify, and: {fix_strategy}
+   - RED: Retrieve logs via 'get_pr_workflow_run_logs'. Clone to {workspace_dir} and checkout the PR branch using: 'git fetch origin pull/<pr_number>/head:pr-<pr_number> && git checkout pr-<pr_number>', install deps, test, fix, verify, and: {fix_strategy}
 4. Max {max_attempts} fix attempts per RED PR before skipping.
 5. Run 'code-review-and-quality' self-review before committing."""
 
@@ -86,6 +88,7 @@ def get_system_instructions(
         types.SystemInstructionSection(
             title="output_format",
             content=f"""- Do NOT announce actions before execution. State reasons if halting early.
+- Minimize conversational output. Do not describe your reasoning, internal state, or plans; only output the sequential CLI logs and final summary.
 - Emit output sequentially as you work (not as one block at the end). Format CLI output as:
   1. Initial list of open PRs with statuses (GREEN/RED/CONFLICT).
   2. Execution prefix: '→ Merging #12 (green)' or '→ Fixing #14 (failing CI)'.

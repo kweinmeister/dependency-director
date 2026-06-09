@@ -144,8 +144,42 @@ async def test_github_client_get_job_logs() -> None:
         mock_get.assert_called_once_with(
             "https://api.github.com/repos/owner/repo/actions/jobs/111/logs",
             headers=c.headers,
+            follow_redirects=True,
         )
         await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_get_job_logs_redirect_handling() -> None:
+    import httpx as httpx_mod
+
+    c = GitHubClient(token="dummy")
+
+    async def mock_handle_request(request: httpx_mod.Request) -> httpx_mod.Response:
+        url_str = str(request.url)
+        if url_str == "https://api.github.com/repos/owner/repo/actions/jobs/111/logs":
+            return httpx_mod.Response(
+                status_code=302,
+                headers={"Location": "https://azure-blob-storage.com/logs-xyz"},
+                request=request,
+            )
+        if url_str == "https://azure-blob-storage.com/logs-xyz":
+            return httpx_mod.Response(
+                status_code=200,
+                text="actual log contents",
+                request=request,
+            )
+        return httpx_mod.Response(status_code=404, request=request)
+
+    mock_transport = MagicMock()
+    mock_transport.aclose = AsyncMock()
+    mock_transport.handle_async_request = AsyncMock(side_effect=mock_handle_request)
+    c.client._transport = mock_transport
+
+    result = await c.get_job_logs("owner", "repo", 111)
+    assert result == "actual log contents"
+    assert mock_transport.handle_async_request.call_count == 2
+    await c.close()
 
 
 # ============================================================

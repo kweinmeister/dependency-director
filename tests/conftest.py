@@ -89,3 +89,38 @@ def mock_agent_class() -> Generator[MagicMock]:
         mock_agent_instance.conversation.total_usage = mock_usage
 
         yield mock_cls
+
+
+@pytest.fixture(autouse=True)
+def mock_list_open_prs() -> Generator[MagicMock]:
+    """Mock list_open_prs globally to return a dummy bot PR in tests."""
+    with patch(
+        "dependency_director.tools.GitHubClient.list_open_prs",
+        new_callable=AsyncMock,
+    ) as mock:
+
+        async def side_effect(owner: str, repo: str) -> list[dict[str, str | int]]:
+            import inspect
+
+            allowed_authors = ["dependabot[bot]"]
+            frame = inspect.currentframe()
+            while frame:
+                if frame.f_code.co_name == "run_agent_for_repo":
+                    settings = frame.f_locals.get("settings")
+                    if settings and hasattr(settings, "bots"):
+                        allowed_authors = [b.author for b in settings.bots]
+                    break
+                frame = frame.f_back
+
+            return [
+                {
+                    "number": 12 + i,
+                    "title": f"bump foo for {author}",
+                    "author": author,
+                    "created_at": "2026-06-08T00:00:00Z",
+                }
+                for i, author in enumerate(allowed_authors)
+            ]
+
+        mock.side_effect = side_effect
+        yield mock

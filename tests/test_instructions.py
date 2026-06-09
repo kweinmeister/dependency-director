@@ -455,3 +455,26 @@ def test_no_sandbox_workflow_still_has_merge_and_rebase() -> None:
     assert "merge_bot_pr" in workflow
     assert "rebase_bot_pr" in workflow
     assert "get_pr_status" in workflow
+
+
+def test_halt_on_no_prs(instructions: types.TemplatedSystemInstructions) -> None:
+    """System instructions must direct the agent to halt if no PRs are found."""
+    workflow = _section_content(instructions, "workflow")
+    assert "If none are found, halt immediately and exit" in workflow
+
+
+def test_trust_tool_outputs_no_host_inspection(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """System instructions must direct the agent to trust tool outputs and not inspect host environment/files."""
+    guardrails = _section_content(instructions, "guardrails")
+    assert "Trust tool outputs" in guardrails
+    assert "Do NOT search, browse, or inspect the host environment" in guardrails
+
+
+def test_minimize_conversational_output(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """System instructions must direct the agent to minimize conversational output."""
+    output_format = _section_content(instructions, "output_format")
+    assert "Minimize conversational output" in output_format

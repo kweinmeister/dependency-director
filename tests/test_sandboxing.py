@@ -168,9 +168,22 @@ async def test_sandbox_git_metadata_write_denied(tmp_path: Path) -> None:
     )
     assert not os.path.exists(hook_file)
 
-    # Try writing to .git/config
+
+@requires_srt
+@pytest.mark.asyncio
+async def test_sandbox_git_metadata_write_config_allowed(tmp_path: Path) -> None:
+    workspace = str(tmp_path / "workspace")
+    os.makedirs(workspace, exist_ok=True)
+
+    # Create the .git directory structure
+    git_dir = os.path.join(workspace, ".git")
+    os.makedirs(git_dir, exist_ok=True)
+
+    run_command = create_run_command_tool(workspace)
+
+    # 1. Try writing to .git/config via non-git command (which should be blocked)
     config_file = os.path.join(git_dir, "config")
-    cmd = f"echo 'evil' > {config_file}"
+    cmd = f"echo 'evil-config' > {config_file}"
     output = await run_command(cmd)
 
     assert any(
@@ -182,7 +195,43 @@ async def test_sandbox_git_metadata_write_denied(tmp_path: Path) -> None:
             "Read-only file system",
         )
     )
-    assert not os.path.exists(config_file)
+    assert (
+        not os.path.exists(config_file)
+        or open(config_file).read().strip() != "evil-config"
+    )
+
+    # 2. Try writing to .git/config via git command (which should be allowed)
+    await run_command("git init")
+    cmd_git = "git config core.repositoryformatversion 0"
+    output_git = await run_command(cmd_git)
+    assert "Operation not permitted" not in output_git
+    assert "Permission denied" not in output_git
+    assert os.path.exists(config_file)
+    with open(config_file) as f:
+        content = f.read()
+    assert "repositoryformatversion = 0" in content
+
+
+@requires_srt
+@pytest.mark.asyncio
+async def test_sandbox_git_metadata_write_compound_command(tmp_path: Path) -> None:
+    workspace = str(tmp_path / "workspace")
+    os.makedirs(workspace, exist_ok=True)
+
+    git_dir = os.path.join(workspace, ".git")
+    os.makedirs(git_dir, exist_ok=True)
+    config_file = os.path.join(git_dir, "config")
+
+    run_command = create_run_command_tool(workspace)
+
+    # Compound command starting with echo but executing git init afterwards.
+    # It should be detected as a git command, enabling allowGitConfig, and succeeding.
+    cmd = "echo 'initiating...' && git init"
+    output = await run_command(cmd)
+
+    assert "Operation not permitted" not in output
+    assert "Permission denied" not in output
+    assert os.path.exists(config_file)
 
 
 @requires_srt
@@ -540,25 +589,23 @@ async def test_sandbox_git_metadata_write_bypass_symlink(tmp_path: Path) -> None
     workspace = str(tmp_path / "workspace")
     os.makedirs(workspace, exist_ok=True)
 
-    git_dir = os.path.join(workspace, ".git")
-    os.makedirs(git_dir, exist_ok=True)
-    config_file = os.path.join(git_dir, "config")
+    env_file = os.path.join(workspace, ".env")
 
-    # Pre-create .git/config with some initial content
-    with open(config_file, "w") as f:
-        f.write("[core]\n\trepositoryformatversion = 0\n")
+    # Pre-create .env with some initial content
+    with open(env_file, "w") as f:
+        f.write("KEY=VAL\n")
 
     run_command = create_run_command_tool(workspace)
 
-    # 1. Create a symbolic link to the config file outside the .git folder but inside the workspace
-    link_file = os.path.join(workspace, "config_link")
-    cmd_link = f"ln -s {config_file} {link_file}"
+    # 1. Create a symbolic link to the env file outside the .git folder but inside the workspace
+    link_file = os.path.join(workspace, "env_link")
+    cmd_link = f"ln -s {env_file} {link_file}"
     await run_command(cmd_link)
     assert os.path.exists(link_file)
     assert os.path.islink(link_file)
 
     # 2. Try writing to the link file inside the sandbox
-    cmd_write = f"echo 'evil_config_payload' >> {link_file}"
+    cmd_write = f"echo 'evil_env_payload' >> {link_file}"
     output = await run_command(cmd_write)
 
     assert any(
@@ -571,11 +618,11 @@ async def test_sandbox_git_metadata_write_bypass_symlink(tmp_path: Path) -> None
         )
     )
 
-    # If the write fails, the original config file will NOT be modified
-    with open(config_file) as f:
-        config_content = f.read()
+    # If the write fails, the original env file will NOT be modified
+    with open(env_file) as f:
+        env_content = f.read()
 
-    assert "evil_config_payload" not in config_content
+    assert "evil_env_payload" not in env_content
 
 
 @pytest.mark.asyncio
@@ -727,8 +774,9 @@ async def test_sandbox_diagnostics_formatting(tmp_path: Path) -> None:
         srt_settings_path=str(settings_file),
     )
 
-    # 1. Mock process returning network blocked message
+    # 1. Mock process returning network blocked message (with non-zero exit code)
     mock_process = AsyncMock()
+    mock_process.returncode = 1
     mock_process.communicate.return_value = (
         b"some output\nConnection blocked by network allowlist\n",
         b"",
@@ -740,8 +788,23 @@ async def test_sandbox_diagnostics_formatting(tmp_path: Path) -> None:
             in output
         )
 
-    # 2. Mock process returning filesystem permission denied message
+    # 2. Mock process returning network blocked message (with zero exit code)
     mock_process = AsyncMock()
+    mock_process.returncode = 0
+    mock_process.communicate.return_value = (
+        b"some output\nConnection blocked by network allowlist\n",
+        b"",
+    )
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
+        output = await run_command("echo 'simulate_network_blocked'")
+        assert (
+            "[Sandbox Violation] Outbound network connection blocked by sandbox-runtime policy"
+            not in output
+        )
+
+    # 3. Mock process returning filesystem permission denied message (with non-zero exit code)
+    mock_process = AsyncMock()
+    mock_process.returncode = 1
     mock_process.communicate.return_value = (
         b"",
         b"cat: /root/secret: Permission denied\n",
@@ -752,6 +815,114 @@ async def test_sandbox_diagnostics_formatting(tmp_path: Path) -> None:
             "[Sandbox Diagnostic] Filesystem access failed with 'Permission denied'"
             in output
         )
+
+    # 4. Mock process returning filesystem permission denied message (with zero exit code)
+    mock_process = AsyncMock()
+    mock_process.returncode = 0
+    mock_process.communicate.return_value = (
+        b"",
+        b"cat: /root/secret: Permission denied\n",
+    )
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
+        output = await run_command("cat /root/secret")
+        assert (
+            "[Sandbox Diagnostic] Filesystem access failed with 'Permission denied'"
+            not in output
+        )
+
+
+@pytest.mark.asyncio
+async def test_sandbox_cache_env_overrides(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    workspace = str(tmp_path / "workspace")
+    os.makedirs(workspace, exist_ok=True)
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+
+    run_command = create_run_command_tool(
+        workspace,
+        srt_settings_path=str(settings_file),
+    )
+
+    mock_process = AsyncMock()
+    mock_process.communicate.return_value = (b"", b"")
+    mock_process.returncode = 0
+
+    with patch(
+        "asyncio.create_subprocess_exec",
+        return_value=mock_process,
+    ) as mock_exec:
+        await run_command("echo hello")
+        mock_exec.assert_called_once()
+        kwargs = mock_exec.call_args.kwargs
+        env = kwargs.get("env", {})
+
+        cache_base = str(Path(workspace) / ".cache")
+        assert env.get("NPM_CONFIG_CACHE") == os.path.join(cache_base, "npm")
+        assert env.get("YARN_CACHE_FOLDER") == os.path.join(cache_base, "yarn")
+        assert env.get("PNPM_HOME") == os.path.join(cache_base, "pnpm")
+        assert env.get("BUN_INSTALL") == os.path.join(cache_base, "bun")
+        assert env.get("DENO_DIR") == os.path.join(cache_base, "deno")
+        assert env.get("PIP_CACHE_DIR") == os.path.join(cache_base, "pip")
+        assert env.get("UV_CACHE_DIR") == os.path.join(cache_base, "uv")
+        assert env.get("POETRY_CACHE_DIR") == os.path.join(cache_base, "poetry")
+        assert env.get("PIPENV_CACHE_DIR") == os.path.join(cache_base, "pipenv")
+        assert env.get("GOMODCACHE") == os.path.join(cache_base, "go", "pkg", "mod")
+        assert env.get("CARGO_HOME") == os.path.join(cache_base, "cargo")
+        assert env.get("GEM_HOME") == os.path.join(cache_base, "gems")
+        assert env.get("GEM_PATH") == os.path.join(cache_base, "gems")
+        assert env.get("COMPOSER_CACHE_DIR") == os.path.join(cache_base, "composer")
+        assert env.get("GRADLE_USER_HOME") == os.path.join(cache_base, "gradle")
+        assert env.get("NUGET_PACKAGES") == os.path.join(cache_base, "nuget")
+        assert env.get("DOTNET_CLI_HOME") == os.path.join(cache_base, "dotnet")
+        assert env.get("PUB_CACHE") == os.path.join(cache_base, "pub-cache")
+        assert env.get("MIX_HOME") == os.path.join(cache_base, "mix")
+        assert env.get("XDG_CACHE_HOME") == cache_base
+
+
+@pytest.mark.asyncio
+async def test_sandbox_git_credential_env_overrides(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    workspace = str(tmp_path / "workspace")
+    os.makedirs(workspace, exist_ok=True)
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+
+    run_command = create_run_command_tool(
+        workspace,
+        srt_settings_path=str(settings_file),
+        github_token="test-token-123",
+    )
+
+    mock_process = AsyncMock()
+    mock_process.communicate.return_value = (b"", b"")
+    mock_process.returncode = 0
+
+    with patch(
+        "asyncio.create_subprocess_exec",
+        return_value=mock_process,
+    ) as mock_exec:
+        await run_command("echo hello")
+        mock_exec.assert_called_once()
+        kwargs = mock_exec.call_args.kwargs
+        env = kwargs.get("env", {})
+
+        assert env.get("GIT_CONFIG_COUNT") == "2"
+        assert (
+            env.get("GIT_CONFIG_KEY_0")
+            == "url.https://x-access-token:test-token-123@github.com/.insteadOf"
+        )
+        assert env.get("GIT_CONFIG_VALUE_0") == "https://github.com/"
+        assert (
+            env.get("GIT_CONFIG_KEY_1")
+            == "url.https://x-access-token:test-token-123@github.com/.insteadOf"
+        )
+        assert env.get("GIT_CONFIG_VALUE_1") == "git@github.com:"
+        assert env.get("GIT_TERMINAL_PROMPT") == "0"
 
 
 def test_sandbox_run_command_cleanup(tmp_path: Path) -> None:
@@ -813,3 +984,68 @@ async def test_run_command_always_uses_exec_not_shell(tmp_path: Path) -> None:
         await run_command("echo test")
         mock_exec.assert_called_once()
         mock_shell.assert_not_called()
+
+
+def test_validate_sandboxed_command_git_config() -> None:
+    from dependency_director.tools import validate_sandboxed_command
+
+    def assert_blocked(cmd: str) -> None:
+        res = validate_sandboxed_command(cmd, "/tmp")
+        assert res is not None
+        assert "Security Error" in res
+
+    # Blocked keys (including mixed case to test case-insensitivity)
+    assert_blocked("git config core.hookspath /evil")
+    assert_blocked("git config Core.HooksPath /evil")
+    assert_blocked("git config --global credential.helper store")
+    assert_blocked("git config --global Credential.Helper store")
+    assert_blocked("git config --local url.https://.insteadof git://")
+    assert_blocked("git config --local Url.https://.insteadof git://")
+    assert_blocked("git -c core.sshcommand=evil clone")
+    assert_blocked("git -c Core.SSHcommand=evil clone")
+    assert_blocked("git --config http.proxy=evil clone")
+
+    # Verify that argument-consuming flags like -f and --file don't bypass checks
+    assert_blocked("git config -f .git/config core.hookspath /evil")
+    assert_blocked("git config --file=.git/config credential.helper store")
+    assert_blocked("git config --file .git/config credential.helper store")
+    assert_blocked("git config --type bool core.hookspath true")
+    assert_blocked("git config --default dummy --get core.hookspath")
+
+    # Verify environment variable prefix bypass check (env vars shouldn't blind executable validation)
+    # Note: These are blocked because 'curl' and 'sudo' are blocked executables, not because of the env variables.
+    assert_blocked("HTTP_PROXY=http://evil.com curl http://example.com")
+    assert_blocked("A=B C=D sudo id")
+
+    # Verify blocked environment variables
+    assert_blocked("GIT_CONFIG_PARAMETERS='core.sshcommand=evil' git status")
+    assert_blocked("LD_PRELOAD=evil.so git status")
+    assert_blocked("DYLD_INSERT_LIBRARIES=evil.dylib git status")
+    assert_blocked("DYLD_LIBRARY_PATH=/tmp git status")
+
+    # Verify blocked git options
+    assert_blocked("git --config-env=core.sshcommand=ENV_VAR clone")
+    assert_blocked("git --config-env core.sshcommand=ENV_VAR clone")
+    assert_blocked("git --git-dir=/tmp/evil-git-dir status")
+    assert_blocked("git --git-dir /tmp/evil-git-dir status")
+
+    # Allowed commands
+    assert (
+        validate_sandboxed_command("git config core.repositoryformatversion", "/tmp")
+        is None
+    )
+    assert (
+        validate_sandboxed_command(
+            "git config -f .git/config core.repositoryformatversion",
+            "/tmp",
+        )
+        is None
+    )
+    assert (
+        validate_sandboxed_command(
+            "git clone https://github.com/my-url.dot/repo",
+            "/tmp",
+        )
+        is None
+    )
+    assert validate_sandboxed_command("git status", "/tmp") is None

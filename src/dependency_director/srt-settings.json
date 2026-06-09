@@ -69,7 +69,7 @@
       "~/go/bin"
     ],
     "allowWrite": ["/tmp"],
-    "denyWrite": [".env", ".git/hooks", ".git/config"],
+    "denyWrite": [".env", ".git/hooks"],
     "allowGitConfig": false
   },
   "enableWeakerNetworkIsolation": false
