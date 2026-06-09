@@ -146,9 +146,24 @@ async def run_agent_for_repo(
             run_command = create_run_command_tool(
                 workspace_tmp,
                 srt_settings_path=settings.srt_settings,
+                github_token=settings.github_token,
             )
 
         owner, repo_name = repo.split("/", 1)
+
+        # Pre-check if there are any open bot PRs before spawning the agent
+        client = GitHubClient(token=settings.github_token)
+        try:
+            open_prs = await client.list_open_prs(owner, repo_name)
+            allowed_authors = {b.author for b in settings.bots}
+            bot_prs = [pr for pr in open_prs if pr.get("author") in allowed_authors]
+        finally:
+            await client.close()
+
+        if not bot_prs:
+            click.echo("Open Pull Requests (Initial List)\n")
+            click.echo(f" • No open dependency update PRs were found for {repo}.\n")
+            return
 
         # Get agent system instructions
         system_instructions = get_system_instructions(

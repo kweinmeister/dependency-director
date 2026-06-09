@@ -579,3 +579,42 @@ async def test_agent_config_registers_all_host_tools(
         "run_command_sandboxed",
     }
     assert tool_names == expected
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_early_halt(
+    mock_agent_class: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If list_open_prs returns no PRs matching bots, the agent should not be spawned and run_agent_for_repo should return early."""
+    from unittest.mock import patch
+
+    from dependency_director.config import Settings
+    from dependency_director.main import run_agent_for_repo
+
+    settings = Settings()
+    settings.github_token = "dummy-token"
+    settings.gemini_api_key = "dummy-key"
+
+    with patch(
+        "dependency_director.tools.GitHubClient.list_open_prs",
+        new_callable=AsyncMock,
+    ) as mock_list:
+        mock_list.return_value = []
+
+        await run_agent_for_repo(
+            repo="test-owner/test-repo",
+            settings=settings,
+            max_attempts=3,
+        )
+
+        mock_agent_class.assert_not_called()
+
+        captured = capsys.readouterr()
+        assert "Open Pull Requests (Initial List)" in captured.out
+        assert (
+            "No open dependency update PRs were found for test-owner/test-repo"
+            in captured.out
+        )
+        assert "Final Summary" not in captured.out
+        assert "No dependency update PRs were processed." not in captured.out

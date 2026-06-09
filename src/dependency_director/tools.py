@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import copy
 import json
 import os
 import re
@@ -47,6 +48,7 @@ class GitHubClient:
 
     def __init__(self, token: str) -> None:
         """Initialize GitHub API client with optional auth token."""
+        self._user_cache: dict[str, str] = {}
         self.headers: dict[str, str] = {
             "Accept": "application/vnd.github+json",
             "User-Agent": "dependency-director-agent",
@@ -88,6 +90,7 @@ class GitHubClient:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         json_data: Any = None,
+        follow_redirects: bool = False,
     ) -> httpx.Response:
         _validate_repo_params(owner, repo)
         url = f"https://api.github.com/repos/{owner}/{repo}/{path.lstrip('/')}"
@@ -95,6 +98,9 @@ class GitHubClient:
 
         method_upper = method.upper()
         kwargs: dict[str, Any] = {"headers": req_headers}
+        if follow_redirects:
+            kwargs["follow_redirects"] = True
+
         if method_upper == "GET":
             if params is not None:
                 kwargs["params"] = params
@@ -123,6 +129,7 @@ class GitHubClient:
         repo: str,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        follow_redirects: bool = False,
     ) -> httpx.Response:
         return await self._request(
             "GET",
@@ -131,6 +138,7 @@ class GitHubClient:
             repo,
             params=params,
             headers=headers,
+            follow_redirects=follow_redirects,
         )
 
     async def _put(
@@ -286,7 +294,12 @@ class GitHubClient:
 
     async def get_job_logs(self, owner: str, repo: str, job_id: int) -> str:
         """Fetch raw log text for a workflow run job."""
-        response = await self._get(f"actions/jobs/{job_id}/logs", owner, repo)
+        response = await self._get(
+            f"actions/jobs/{job_id}/logs",
+            owner,
+            repo,
+            follow_redirects=True,
+        )
         return response.text
 
     async def list_open_prs(
@@ -427,17 +440,68 @@ class GitHubClient:
         Uses pagination to get all repositories for the given owner.
         """
         _validate_repo_params(owner, "dummy-repo")
-        endpoint_prefix = f"https://api.github.com/users/{owner}/repos"
+
+        is_authenticated_user = False
+        if "Authorization" in self.headers:
+            token = self.headers["Authorization"]
+            if token in self._user_cache:
+                cached_login = self._user_cache[token]
+                if cached_login and cached_login.lower() == owner.lower():
+                    is_authenticated_user = True
+            else:
+                try:
+                    response = await self.client.get(
+                        "https://api.github.com/user",
+                        headers=self.headers,
+                    )
+                    response.raise_for_status()
+                    user_data = response.json()
+                    if isinstance(user_data, dict):
+                        login = user_data.get("login", "")
+                        self._user_cache[token] = login
+                        if login.lower() == owner.lower():
+                            is_authenticated_user = True
+                except GitHubAuthenticationError:
+                    raise
+                except Exception:
+                    # Fall back to users/{owner}/repos endpoint on other failures (e.g. network/mock issues)
+                    pass
+
+        if is_authenticated_user:
+            endpoint_prefix = "https://api.github.com/user/repos"
+        else:
+            endpoint_prefix = f"https://api.github.com/users/{owner}/repos"
+
         repos: list[str] = []
         page = 1
         while True:
-            url = f"{endpoint_prefix}?type=owner&per_page=100&page={page}"
-            response = await self.client.get(url, headers=self.headers)
+            if is_authenticated_user:
+                url = f"{endpoint_prefix}?affiliation=owner&per_page=100&page={page}"
+            else:
+                url = f"{endpoint_prefix}?type=owner&per_page=100&page={page}"
             try:
+                response = await self.client.get(url, headers=self.headers)
                 response.raise_for_status()
-            except httpx.HTTPStatusError as e:
+            except (httpx.HTTPStatusError, GitHubNotFoundError) as e:
+                is_404 = False
+                if isinstance(e, GitHubNotFoundError) or (
+                    isinstance(e, httpx.HTTPStatusError)
+                    and e.response.status_code == 404
+                ):
+                    is_404 = True
+
+                # If /user/repos returns 404, fall back to public /users/{owner}/repos
+                if is_authenticated_user and page == 1 and is_404:
+                    is_authenticated_user = False
+                    endpoint_prefix = f"https://api.github.com/users/{owner}/repos"
+                    continue
+
+                status_code = getattr(e, "status_code", None)
+                if status_code is None and isinstance(e, httpx.HTTPStatusError):
+                    status_code = e.response.status_code
                 if (
-                    e.response.status_code == 404
+                    not is_authenticated_user
+                    and status_code == 404
                     and page == 1
                     and "users" in endpoint_prefix
                 ):
@@ -962,6 +1026,37 @@ def validate_sandboxed_command(command_line: str, workspace_dir: str) -> str | N
             continue
 
         if is_next_executable:
+            if "=" in token and not token.startswith("-"):
+                parts = token.split("=", 1)
+                env_key = parts[0].strip().lower()
+                env_value = parts[1].strip().lower() if len(parts) > 1 else ""
+
+                blocked_env_vars = {
+                    "ld_preload",
+                    "ld_library_path",
+                    "dyld_insert_libraries",
+                    "dyld_library_path",
+                    "git_ssh_command",
+                    "git_ssh",
+                }
+                if env_key in blocked_env_vars:
+                    return (
+                        f"Security Error: Environment variable '{parts[0]}' is blocked."
+                    )
+
+                if "git_config" in env_key or env_key == "git_config_parameters":
+                    blocked_config_prefixes = (
+                        "credential.helper",
+                        "core.hookspath",
+                        "core.sshcommand",
+                        "url.",
+                        "http.proxy",
+                        "https.proxy",
+                    )
+                    for prefix in blocked_config_prefixes:
+                        if prefix in env_value:
+                            return f"Security Error: Environment variable '{parts[0]}' contains blocked git configuration key '{prefix}'."
+                continue
             is_next_executable = False
             exe_name = Path(token).name.lower()
 
@@ -1011,6 +1106,56 @@ def validate_sandboxed_command(command_line: str, workspace_dir: str) -> str | N
                     err = _validate_target_path(arg, workspace_dir, "Command 'rm'")
                     if err:
                         return err
+
+            if exe_name == "git":
+                # Check for blocked options
+                blocked_git_options = ("--config-env", "--git-dir")
+                for token in tokens[i + 1 :]:
+                    if token.split("=", 1)[0].lower() in blocked_git_options:
+                        return f"Security Error: Git option '{token.split('=', 1)[0]}' is blocked."
+
+                blocked_config_prefixes = (
+                    "credential.helper",
+                    "core.hookspath",
+                    "core.sshcommand",
+                    "url.",
+                    "http.proxy",
+                    "https.proxy",
+                )
+                for j, token in enumerate(tokens[i + 1 :], start=i + 1):
+                    # Check for git -c key=value or git --config key=value
+                    if token in ("-c", "--config") and j + 1 < len(tokens):
+                        config_expr = tokens[j + 1]
+                        key = config_expr.split("=", 1)[0].strip().lower()
+                        for prefix in blocked_config_prefixes:
+                            if key.startswith(prefix) or key == prefix:
+                                return f"Security Error: Git configuration key '{prefix}' is blocked."
+                    # Check for git config key value
+                    elif token == "config":
+                        skip_next = False
+                        for k in range(j + 1, len(tokens)):
+                            config_token = tokens[k]
+                            if config_token in operators:
+                                break
+                            if skip_next:
+                                skip_next = False
+                                continue
+                            if config_token in (
+                                "-f",
+                                "--file",
+                                "--blob",
+                                "--type",
+                                "--default",
+                            ):
+                                skip_next = True
+                                continue
+                            if config_token.startswith("-"):
+                                continue
+                            key = config_token.split("=", 1)[0].strip().lower()
+                            for prefix in blocked_config_prefixes:
+                                if key.startswith(prefix) or key == prefix:
+                                    return f"Security Error: Git configuration key '{prefix}' is blocked."
+                            break
     return None
 
 
@@ -1024,19 +1169,20 @@ def _format_command_result(
 
     diagnostics = []
     combined = stdout_str + stderr_str
-    if (
-        "Connection blocked by network allowlist" in combined
-        or "X-Proxy-Error: blocked-by-allowlist" in combined
-    ):
-        diagnostics.append(
-            "[Sandbox Violation] Outbound network connection blocked by sandbox-runtime policy. "
-            "Allowed domains are configured in srt-settings.json.",
-        )
-    if "Operation not permitted" in combined or "Permission denied" in combined:
-        diagnostics.append(
-            "[Sandbox Diagnostic] Filesystem access failed with 'Permission denied' / 'Operation not permitted'. "
-            "If this path is outside the allowed directories, it was blocked by the sandbox-runtime policy configured in srt-settings.json.",
-        )
+    if returncode != 0:
+        if (
+            "Connection blocked by network allowlist" in combined
+            or "X-Proxy-Error: blocked-by-allowlist" in combined
+        ):
+            diagnostics.append(
+                "[Sandbox Violation] Outbound network connection blocked by sandbox-runtime policy. "
+                "Allowed domains are configured in srt-settings.json.",
+            )
+        if "Operation not permitted" in stderr_str or "Permission denied" in stderr_str:
+            diagnostics.append(
+                "[Sandbox Diagnostic] Filesystem access failed with 'Permission denied' / 'Operation not permitted'. "
+                "If this path is outside the allowed directories, it was blocked by the sandbox-runtime policy configured in srt-settings.json.",
+            )
 
     parts = [
         "--- STDOUT ---",
@@ -1053,6 +1199,7 @@ def _format_command_result(
 def create_run_command_tool(
     workspace_dir: str,
     srt_settings_path: str | Path = "",
+    github_token: str | None = None,
 ) -> Callable[..., Awaitable[str]]:
     """Create a sandboxed run_command tool bound to a workspace."""
     from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH
@@ -1060,14 +1207,16 @@ def create_run_command_tool(
     config_path = None
     init_error = None
     cleanup = None
+    srt_config = {}
 
     base_path = srt_settings_path or DEFAULT_SRT_SETTINGS_PATH
     try:
         with Path(base_path).open() as f:
             srt_config = json.load(f)
 
-        # Patch workspace into allowWrite and allowRead
         fs_config = srt_config.setdefault("filesystem", {})
+        fs_config["allowGitConfig"] = False
+
         allow_write = fs_config.setdefault("allowWrite", [])
         if workspace_dir not in allow_write:
             allow_write.append(workspace_dir)
@@ -1110,43 +1259,125 @@ def create_run_command_tool(
         if init_error:
             return init_error
 
-        # Support both 'working_dir' and the legacy/alternative 'Cwd' parameter name
         target_cwd = working_dir or Cwd or workspace_dir
 
         env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_TEMPLATE_DIR"] = "/dev/null"
 
-        if not config_path:
-            return "Error: Sandbox configuration was not initialized."
+        cache_base = Path(workspace_dir) / ".cache"
+        env["NPM_CONFIG_CACHE"] = str(cache_base / "npm")
+        env["YARN_CACHE_FOLDER"] = str(cache_base / "yarn")
+        env["PNPM_HOME"] = str(cache_base / "pnpm")
+        env["BUN_INSTALL"] = str(cache_base / "bun")
+        env["DENO_DIR"] = str(cache_base / "deno")
+        env["PIP_CACHE_DIR"] = str(cache_base / "pip")
+        env["UV_CACHE_DIR"] = str(cache_base / "uv")
+        env["POETRY_CACHE_DIR"] = str(cache_base / "poetry")
+        env["PIPENV_CACHE_DIR"] = str(cache_base / "pipenv")
+        env["GOMODCACHE"] = str(cache_base / "go" / "pkg" / "mod")
+        env["CARGO_HOME"] = str(cache_base / "cargo")
+        env["GEM_HOME"] = str(cache_base / "gems")
+        env["GEM_PATH"] = str(cache_base / "gems")
+        env["COMPOSER_CACHE_DIR"] = str(cache_base / "composer")
+        env["GRADLE_USER_HOME"] = str(cache_base / "gradle")
+        env["NUGET_PACKAGES"] = str(cache_base / "nuget")
+        env["DOTNET_CLI_HOME"] = str(cache_base / "dotnet")
+        env["PUB_CACHE"] = str(cache_base / "pub-cache")
+        env["MIX_HOME"] = str(cache_base / "mix")
+        env["XDG_CACHE_HOME"] = str(cache_base)
+
+        token = github_token or os.environ.get("GITHUB_TOKEN")
+        if token:
+            env["GIT_CONFIG_COUNT"] = "2"
+            env["GIT_CONFIG_KEY_0"] = (
+                f"url.https://x-access-token:{token}@github.com/.insteadOf"
+            )
+            env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+            env["GIT_CONFIG_KEY_1"] = (
+                f"url.https://x-access-token:{token}@github.com/.insteadOf"
+            )
+            env["GIT_CONFIG_VALUE_1"] = "git@github.com:"
+            env["GIT_TERMINAL_PROMPT"] = "0"
+
         validation_err = validate_sandboxed_command(command_line, workspace_dir)
         if validation_err:
             return validation_err
-        process = await asyncio.create_subprocess_exec(
-            "srt",
-            "--settings",
-            config_path,
-            "-c",
-            command_line,
-            cwd=target_cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-        comm_coro = process.communicate()
+
         try:
-            stdout, stderr = await asyncio.wait_for(comm_coro, timeout=300)
-        except TimeoutError:
-            comm_coro.close()
-            with contextlib.suppress(Exception):
-                process.kill()
-            await process.wait()
-            return "Error: Command timed out after 300 seconds."
-        return _format_command_result(
-            stdout,
-            stderr,
-            process.returncode if process.returncode is not None else -1,
-        )
+            tokens = tokenize_command(command_line)
+        except ValueError:
+            return "Security Error: Invalid shell command quoting."
+
+        is_git_command = False
+        operators = {";", "&&", "||", "|", "&"}
+        is_next_executable = True
+        for token in tokens:
+            if token in operators:
+                is_next_executable = True
+                continue
+            if is_next_executable:
+                if "=" in token and not token.startswith("-"):
+                    continue
+                is_next_executable = False
+                exe_name = Path(token).name.lower()
+                if exe_name == "git":
+                    is_git_command = True
+                    break
+
+        active_config_path = config_path
+        git_config_temp_path = None
+
+        if is_git_command:
+            git_config = copy.deepcopy(srt_config)
+            git_config["filesystem"]["allowGitConfig"] = True
+
+            try:
+                with tempfile.NamedTemporaryFile(
+                    suffix=".json",
+                    mode="w",
+                    delete=False,
+                ) as temp_f:
+                    json.dump(git_config, temp_f)
+                    git_config_temp_path = temp_f.name
+                    active_config_path = git_config_temp_path
+            except Exception as e:
+                return f"Error: Failed to create temporary config for Git: {e}"
+
+        try:
+            if not active_config_path:
+                return "Error: Sandbox configuration was not initialized."
+
+            process = await asyncio.create_subprocess_exec(
+                "srt",
+                "--settings",
+                active_config_path,
+                "-c",
+                command_line,
+                cwd=target_cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            comm_coro = process.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(comm_coro, timeout=300)
+            except TimeoutError:
+                comm_coro.close()
+                with contextlib.suppress(Exception):
+                    process.kill()
+                await process.wait()
+                return "Error: Command timed out after 300 seconds."
+            return _format_command_result(
+                stdout,
+                stderr,
+                process.returncode if process.returncode is not None else -1,
+            )
+        finally:
+            if git_config_temp_path:
+                with contextlib.suppress(Exception):
+                    Path(git_config_temp_path).unlink(missing_ok=True)
 
     if init_error is None and cleanup is not None:
         setattr(run_command_sandboxed, "cleanup", cleanup)  # noqa: B010

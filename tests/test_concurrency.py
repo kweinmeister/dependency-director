@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Never
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx as httpx_mod
@@ -17,6 +17,10 @@ async def test_get_repositories_filters_forks() -> None:
     mock_repos_page2: list[dict[str, Any]] = []
 
     with patch("httpx.AsyncClient.get") as mock_get:
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "not-test-owner"}
+
         mock_response1 = MagicMock()
         mock_response1.status_code = 200
         mock_response1.json.return_value = mock_repos_page1
@@ -25,13 +29,13 @@ async def test_get_repositories_filters_forks() -> None:
         mock_response2.status_code = 200
         mock_response2.json.return_value = mock_repos_page2
 
-        mock_get.side_effect = [mock_response1, mock_response2]
+        mock_get.side_effect = [mock_user, mock_response1, mock_response2]
 
         repos = await get_repositories(owner="test-owner", token="dummy-token")
         assert repos == ["test-owner/repo-1", "test-owner/repo-3"]
 
-        assert mock_get.call_count == 2
-        _, kwargs = mock_get.call_args_list[0]
+        assert mock_get.call_count == 3
+        _, kwargs = mock_get.call_args_list[1]
         assert "Authorization" in kwargs["headers"]
         assert kwargs["headers"]["Authorization"] == "Bearer dummy-token"
 
@@ -47,6 +51,10 @@ async def test_get_repositories_pagination() -> None:
     page_3_data: list[dict[str, Any]] = []  # Empty list to end pagination
 
     with patch("httpx.AsyncClient.get") as mock_get:
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "not-test-owner"}
+
         response_1 = MagicMock()
         response_1.status_code = 200
         response_1.json.return_value = page_1_data
@@ -59,11 +67,11 @@ async def test_get_repositories_pagination() -> None:
         response_3.status_code = 200
         response_3.json.return_value = page_3_data
 
-        mock_get.side_effect = [response_1, response_2, response_3]
+        mock_get.side_effect = [mock_user, response_1, response_2, response_3]
 
         repos = await get_repositories(owner="test-owner", token="dummy-token")
         assert repos == ["test-owner/repo-1", "test-owner/repo-2"]
-        assert mock_get.call_count == 3
+        assert mock_get.call_count == 4
 
 
 @pytest.mark.asyncio
@@ -143,6 +151,10 @@ async def test_run_agent_concurrency(
 @pytest.mark.asyncio
 async def test_get_repositories_http_error() -> None:
     with patch("httpx.AsyncClient.get") as mock_get:
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "not-test-owner"}
+
         mock_response = MagicMock()
         mock_response.status_code = 401
         mock_response.raise_for_status.side_effect = httpx_mod.HTTPStatusError(
@@ -150,7 +162,7 @@ async def test_get_repositories_http_error() -> None:
             request=MagicMock(),
             response=mock_response,
         )
-        mock_get.return_value = mock_response
+        mock_get.side_effect = [mock_user, mock_response]
 
         with pytest.raises(httpx_mod.HTTPStatusError):
             await get_repositories(owner="test-owner", token="bad-token")
@@ -176,9 +188,13 @@ async def test_get_repositories_empty_token() -> None:
 @pytest.mark.asyncio
 async def test_get_repositories_no_repos() -> None:
     with patch("httpx.AsyncClient.get") as mock_get:
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "not-test-owner"}
+
         mock_response = MagicMock()
         mock_response.json.return_value = []
-        mock_get.return_value = mock_response
+        mock_get.side_effect = [mock_user, mock_response]
 
         repos = await get_repositories(owner="test-owner", token="dummy")
         assert repos == []
@@ -186,6 +202,10 @@ async def test_get_repositories_no_repos() -> None:
 
 @pytest.mark.asyncio
 async def test_get_repositories_falls_back_to_orgs_on_404() -> None:
+    mock_user = MagicMock()
+    mock_user.status_code = 200
+    mock_user.json.return_value = {"login": "not-my-org"}
+
     mock_404 = MagicMock()
     mock_404.status_code = 404
     mock_404.raise_for_status.side_effect = httpx_mod.HTTPStatusError(
@@ -204,14 +224,14 @@ async def test_get_repositories_falls_back_to_orgs_on_404() -> None:
     mock_org_page2.json.return_value = []
 
     with patch("httpx.AsyncClient.get") as mock_get:
-        mock_get.side_effect = [mock_404, mock_org_page1, mock_org_page2]
+        mock_get.side_effect = [mock_user, mock_404, mock_org_page1, mock_org_page2]
 
         repos = await get_repositories(owner="my-org", token="dummy")
         assert repos == ["my-org/org-repo-1"]
 
         calls = mock_get.call_args_list
-        assert "/users/my-org/repos?type=owner" in calls[0][0][0]
-        assert "/orgs/my-org/repos?type=sources" in calls[1][0][0]
+        assert "/users/my-org/repos?type=owner" in calls[1][0][0]
+        assert "/orgs/my-org/repos?type=sources" in calls[2][0][0]
 
 
 @pytest.mark.asyncio
@@ -445,3 +465,244 @@ async def test_run_agent_verify_all_no_sandbox_incompatible() -> None:
             )
 
         assert exc_info.value.code == 1
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_authenticated_owner() -> None:
+    owner = "test-owner"
+    token = "dummy-token"
+
+    mock_user_response = MagicMock()
+    mock_user_response.status_code = 200
+    mock_user_response.json.return_value = {
+        "login": "TeSt-OwNeR",
+    }  # Mix case to test case-insensitivity
+
+    mock_repos_response = MagicMock()
+    mock_repos_response.status_code = 200
+    mock_repos_response.json.return_value = [
+        {"name": "repo-priv", "fork": False},
+        {"name": "repo-fork", "fork": True},
+    ]
+
+    mock_repos_empty = MagicMock()
+    mock_repos_empty.status_code = 200
+    mock_repos_empty.json.return_value = []
+
+    calls = []
+
+    def side_effect(url: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(url)
+        if "api.github.com/user" in str(url) and "repos" not in str(url):
+            return mock_user_response
+        if "api.github.com/user/repos" in str(url):
+            if len(calls) == 2:
+                return mock_repos_response
+            return mock_repos_empty
+        msg = f"Unexpected URL: {url}"
+        raise ValueError(msg)
+
+    with patch("httpx.AsyncClient.get", side_effect=side_effect):
+        repos = await get_repositories(owner=owner, token=token)
+        assert repos == ["test-owner/repo-priv"]
+        assert len(calls) == 3
+        assert "user/repos?affiliation=owner" in str(calls[1])
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_other_owner() -> None:
+    owner = "other-owner"
+    token = "dummy-token"
+
+    mock_user_response = MagicMock()
+    mock_user_response.status_code = 200
+    mock_user_response.json.return_value = {"login": "test-owner"}
+
+    mock_repos_response = MagicMock()
+    mock_repos_response.status_code = 200
+    mock_repos_response.json.return_value = [
+        {"name": "repo-pub", "fork": False},
+    ]
+
+    mock_repos_empty = MagicMock()
+    mock_repos_empty.status_code = 200
+    mock_repos_empty.json.return_value = []
+
+    calls = []
+
+    def side_effect(url: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(url)
+        if "api.github.com/user" in str(url) and "repos" not in str(url):
+            return mock_user_response
+        if f"api.github.com/users/{owner}/repos" in str(url):
+            if len(calls) == 2:
+                return mock_repos_response
+            return mock_repos_empty
+        msg = f"Unexpected URL: {url}"
+        raise ValueError(msg)
+
+    with patch("httpx.AsyncClient.get", side_effect=side_effect):
+        repos = await get_repositories(owner=owner, token=token)
+        assert repos == [f"{owner}/repo-pub"]
+        assert len(calls) == 3
+        assert f"users/{owner}/repos?type=owner" in str(calls[1])
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_user_endpoint_fails() -> None:
+    owner = "test-owner"
+    token = "dummy-token"
+
+    mock_user_response = MagicMock()
+    mock_user_response.status_code = 401
+
+    mock_repos_response = MagicMock()
+    mock_repos_response.status_code = 200
+    mock_repos_response.json.return_value = [
+        {"name": "repo-pub", "fork": False},
+    ]
+
+    mock_repos_empty = MagicMock()
+    mock_repos_empty.status_code = 200
+    mock_repos_empty.json.return_value = []
+
+    calls = []
+
+    def side_effect(url: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(url)
+        if "api.github.com/user" in str(url) and "repos" not in str(url):
+            # This triggers exception/fallback
+            raise httpx_mod.HTTPStatusError(
+                message="Unauthorized",
+                request=MagicMock(),
+                response=mock_user_response,
+            )
+        if f"api.github.com/users/{owner}/repos" in str(url):
+            if len(calls) == 2:
+                return mock_repos_response
+            return mock_repos_empty
+        msg = f"Unexpected URL: {url}"
+        raise ValueError(msg)
+
+    with patch("httpx.AsyncClient.get", side_effect=side_effect):
+        repos = await get_repositories(owner=owner, token=token)
+        assert repos == [f"{owner}/repo-pub"]
+        assert len(calls) == 3
+        assert f"users/{owner}/repos?type=owner" in str(calls[1])
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_scope_error_propagates() -> None:
+    owner = "test-owner"
+    token = "scope-error-token"
+
+    from dependency_director.tools import GitHubAuthenticationError
+
+    def side_effect(url: Any, *args: Any, **kwargs: Any) -> Never:
+        msg = "Unauthorized/Bad Scope"
+        raise GitHubAuthenticationError(msg)
+
+    with patch("httpx.AsyncClient.get", side_effect=side_effect):
+        with pytest.raises(GitHubAuthenticationError, match="Unauthorized/Bad Scope"):
+            await get_repositories(owner=owner, token=token)
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_user_repos_404_fallback() -> None:
+    owner = "test-owner"
+    token = "fallback-404-token"
+
+    mock_user_response = MagicMock()
+    mock_user_response.status_code = 200
+    mock_user_response.json.return_value = {"login": "test-owner"}
+
+    mock_user_repos_404 = MagicMock()
+    mock_user_repos_404.status_code = 404
+    mock_user_repos_404.raise_for_status.side_effect = httpx_mod.HTTPStatusError(
+        message="Not Found",
+        request=MagicMock(),
+        response=mock_user_repos_404,
+    )
+
+    mock_public_repos = MagicMock()
+    mock_public_repos.status_code = 200
+    mock_public_repos.json.return_value = [{"name": "public-repo", "fork": False}]
+
+    mock_empty = MagicMock()
+    mock_empty.status_code = 200
+    mock_empty.json.return_value = []
+
+    calls = []
+
+    def side_effect(url: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(str(url))
+        if "api.github.com/user" in str(url) and "repos" not in str(url):
+            return mock_user_response
+        if "api.github.com/user/repos" in str(url):
+            raise httpx_mod.HTTPStatusError(
+                message="Not Found",
+                request=MagicMock(),
+                response=mock_user_repos_404,
+            )
+        if f"api.github.com/users/{owner}/repos" in str(url):
+            if len(calls) == 3:
+                return mock_public_repos
+            return mock_empty
+        msg = f"Unexpected URL: {url}"
+        raise ValueError(msg)
+
+    with patch("httpx.AsyncClient.get", side_effect=side_effect):
+        repos = await get_repositories(owner=owner, token=token)
+        assert repos == ["test-owner/public-repo"]
+        assert len(calls) == 4
+        assert "user/repos" in calls[1]
+        assert "users/test-owner/repos" in calls[2]
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_token_caching() -> None:
+    owner = "test-owner"
+    token = "cached-token"
+
+    mock_user_response = MagicMock()
+    mock_user_response.status_code = 200
+    mock_user_response.json.return_value = {"login": "test-owner"}
+
+    mock_repos_response = MagicMock()
+    mock_repos_response.status_code = 200
+    mock_repos_response.json.return_value = [{"name": "repo-1", "fork": False}]
+
+    mock_empty = MagicMock()
+    mock_empty.status_code = 200
+    mock_empty.json.return_value = []
+
+    calls = []
+
+    def side_effect(url: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(str(url))
+        if "api.github.com/user" in str(url) and "repos" not in str(url):
+            return mock_user_response
+        if "api.github.com/user/repos" in str(url):
+            if len(calls) == 2 or len(calls) == 4:
+                return mock_repos_response
+            return mock_empty
+        msg = f"Unexpected URL: {url}"
+        raise ValueError(msg)
+
+    with patch("httpx.AsyncClient.get", side_effect=side_effect):
+        from dependency_director.tools import GitHubClient
+
+        client = GitHubClient(token=token)
+        try:
+            repos_1 = await client.get_repositories(owner=owner)
+            assert repos_1 == ["test-owner/repo-1"]
+            assert len(calls) == 3
+            assert "user" in calls[0]
+            assert "user/repos" in calls[1]
+
+            repos_2 = await client.get_repositories(owner=owner)
+            assert repos_2 == ["test-owner/repo-1"]
+            assert len(calls) == 5
+            assert "user/repos" in calls[3]
+        finally:
+            await client.close()

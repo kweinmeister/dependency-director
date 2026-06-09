@@ -28,17 +28,13 @@ DEFAULT_SRT_SETTINGS_PATH: str = str(
 
 SAFE_ENV_ALLOWLIST: set[str] = {
     "BUNDLE_PATH",
-    "CARGO_HOME",
     "CC",
     "CFLAGS",
     "CI",
     "CONDA_PREFIX",
     "CXX",
     "CXXFLAGS",
-    "DOTNET_CLI_HOME",
     "DOTNET_ROOT",
-    "GEM_HOME",
-    "GEM_PATH",
     "GIT_AUTHOR_EMAIL",
     "GIT_AUTHOR_NAME",
     "GIT_COMMITTER_EMAIL",
@@ -52,7 +48,6 @@ SAFE_ENV_ALLOWLIST: set[str] = {
     "GOBIN",
     "GOPATH",
     "GOROOT",
-    "GRADLE_USER_HOME",
     "HOME",
     "JAVA_HOME",
     "LANG",
@@ -80,9 +75,6 @@ SAFE_ENV_ALLOWLIST: set[str] = {
     "TZ",
     "USER",
     "VIRTUAL_ENV",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
 }
 
