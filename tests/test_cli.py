@@ -1,3 +1,5 @@
+"""Tests for the dependency-director command-line interface."""
+
 from collections.abc import Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,11 +11,13 @@ from dependency_director.main import cli
 
 @pytest.fixture(autouse=True)
 def mock_srt() -> Generator[None]:
+    """Fixture to mock SRT availability for testing."""
     with patch("dependency_director.main.is_srt_available", return_value=True):
         yield
 
 
 def test_cli_help() -> None:
+    """Verify that the CLI --help option prints usage instructions."""
     runner = CliRunner()
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
@@ -22,6 +26,7 @@ def test_cli_help() -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_target_owner_repo(mock_run_agent: MagicMock) -> None:
+    """Verify CLI execution when provided with an owner/repository target."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -50,6 +55,7 @@ def test_cli_target_owner_repo(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_target_owner_only(mock_run_agent: MagicMock) -> None:
+    """Verify CLI execution when provided with an owner-only target."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -78,6 +84,7 @@ def test_cli_target_owner_only(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_no_target_uses_env(mock_run_agent: MagicMock) -> None:
+    """Verify CLI falls back to the owner environment variable if target is omitted."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -107,6 +114,7 @@ def test_cli_no_target_uses_env(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_no_target_no_env_errors(mock_run_agent: MagicMock) -> None:
+    """Verify CLI returns an error when neither target nor environment owner is set."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -123,6 +131,7 @@ def test_cli_no_target_no_env_errors(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_all_overrides(mock_run_agent: MagicMock) -> None:
+    """Verify CLI successfully overrides default configuration with command-line flags."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -164,6 +173,49 @@ def test_cli_all_overrides(mock_run_agent: MagicMock) -> None:
         )
 
 
+@patch("dependency_director.main.run_agent", new_callable=AsyncMock)
+def test_cli_short_flags_overrides(mock_run_agent: MagicMock) -> None:
+    """Verify CLI successfully overrides default configuration with short command-line flags."""
+    runner = CliRunner()
+    with patch("dependency_director.main.Settings") as mock_settings_cls:
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.concurrency = 1
+        mock_settings.max_fix_attempts = 3
+        mock_settings.review_wait = 0
+        mock_settings.no_sandbox = False
+
+        result = runner.invoke(
+            cli,
+            [
+                "test-owner/test-repo",
+                "-c",
+                "4",
+                "-m",
+                "5",
+                "-d",
+                "-a",
+                "-v",
+                "-w",
+                "5",
+            ],
+        )
+
+        assert result.exit_code == 0
+        mock_run_agent.assert_called_once_with(
+            "test-owner",
+            4,
+            5,
+            "test-owner/test-repo",
+            dry_run=True,
+            auto_merge=True,
+            verify_all=True,
+            standalone_fix=False,
+            review_wait=5,
+            hint=None,
+            no_sandbox=False,
+        )
+
+
 # ============================================================
 # CLI edge cases
 # ============================================================
@@ -171,6 +223,7 @@ def test_cli_all_overrides(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_target_trailing_slash_rejected(mock_run_agent: MagicMock) -> None:
+    """Verify CLI rejects target strings containing a trailing slash."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -185,6 +238,7 @@ def test_cli_target_trailing_slash_rejected(mock_run_agent: MagicMock) -> None:
 
 
 def test_cli_help_contains_target_description() -> None:
+    """Verify CLI help text includes a description of the target argument."""
     runner = CliRunner()
     result = runner.invoke(cli, ["--help"])
     assert "TARGET" in result.output
@@ -193,6 +247,7 @@ def test_cli_help_contains_target_description() -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_review_wait_default_from_env(mock_run_agent: MagicMock) -> None:
+    """Verify CLI review wait time defaults to the environment variable if not specified."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -221,7 +276,8 @@ def test_cli_review_wait_default_from_env(mock_run_agent: MagicMock) -> None:
 
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
-def test_cli_print_banner(_mock_run_agent: MagicMock) -> None:
+def test_cli_print_banner(_mock_run_agent: MagicMock) -> None:  # noqa: PT019
+    """Verify CLI prints the startup banner as part of its execution."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -238,6 +294,7 @@ def test_cli_print_banner(_mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_hint_passed_to_run_agent(mock_run_agent: MagicMock) -> None:
+    """Verify CLI passes a user-provided hint directly to the agent run function."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -258,6 +315,7 @@ def test_cli_hint_passed_to_run_agent(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_no_hint_passes_none(mock_run_agent: MagicMock) -> None:
+    """Verify CLI passes None for hints when the option is not specified."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
@@ -277,6 +335,7 @@ def test_cli_no_hint_passes_none(mock_run_agent: MagicMock) -> None:
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_srt_not_available_exits(mock_run_agent: MagicMock) -> None:
+    """Verify CLI exits with an error when srt is missing and sandboxing is active."""
     runner = CliRunner()
     with (
         patch("dependency_director.main.Settings") as mock_settings_cls,
@@ -301,6 +360,7 @@ def test_cli_srt_not_available_exits(mock_run_agent: MagicMock) -> None:
 def test_cli_srt_not_available_but_no_sandbox_allowed(
     mock_run_agent: MagicMock,
 ) -> None:
+    """Verify CLI runs successfully when srt is missing but sandboxing is bypassed."""
     runner = CliRunner()
     with (
         patch("dependency_director.main.Settings") as mock_settings_cls,
@@ -324,6 +384,7 @@ def test_cli_srt_not_available_but_no_sandbox_allowed(
 def test_cli_srt_installed_but_missing_ripgrep_on_linux(
     mock_run_agent: MagicMock,
 ) -> None:
+    """Verify CLI exits when running on Linux with srt but missing ripgrep."""
     runner = CliRunner()
     with (
         patch("dependency_director.main.Settings") as mock_settings_cls,
@@ -350,6 +411,7 @@ def test_cli_srt_installed_but_missing_ripgrep_on_linux(
 def test_cli_srt_installed_but_not_functioning(
     mock_run_agent: MagicMock,
 ) -> None:
+    """Verify CLI exits when srt is installed but fails to execute commands."""
     runner = CliRunner()
     with (
         patch("dependency_director.main.Settings") as mock_settings_cls,
@@ -373,6 +435,7 @@ def test_cli_srt_installed_but_not_functioning(
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_verify_all_with_no_sandbox_rejected(mock_run_agent: MagicMock) -> None:
+    """Verify CLI rejects running in verify-all mode if sandboxing is disabled."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value

@@ -1,6 +1,8 @@
 """Configuration settings and command filtering logic for dependency-director."""
 
 import importlib.resources
+import shlex
+from pathlib import Path
 from typing import Any
 
 from google.antigravity.hooks import policy
@@ -62,6 +64,8 @@ SAFE_ENV_ALLOWLIST: set[str] = {
     "NVM_DIR",
     "OLDPWD",
     "PATH",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_INDEX_URL",
     "PKG_CONFIG_PATH",
     "PWD",
     "PYENV_ROOT",
@@ -74,6 +78,8 @@ SAFE_ENV_ALLOWLIST: set[str] = {
     "TMPDIR",
     "TZ",
     "USER",
+    "UV_EXTRA_INDEX_URL",
+    "UV_INDEX_URL",
     "VIRTUAL_ENV",
     "XDG_RUNTIME_DIR",
 }
@@ -138,9 +144,6 @@ def get_dry_run_policies() -> list[Any]:
         cmd_stripped = cmd.strip()
         if not cmd_stripped:
             return False
-        import shlex
-        from pathlib import Path
-
         try:
             tokens = shlex.split(cmd_stripped)
         except ValueError:

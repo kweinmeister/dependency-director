@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks
 from rich.console import Console
@@ -31,6 +32,8 @@ from dependency_director.tools import (
     is_ripgrep_available,
     is_srt_available,
 )
+
+MAX_ARGS_DISPLAY_LEN = 80
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SKILLS_PATH = PROJECT_ROOT / ".agents" / "skills"
@@ -84,7 +87,85 @@ def _cleanup_workspace(workspace_dir: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-async def run_agent_for_repo(
+async def _check_open_bot_prs(repo: str, settings: Settings) -> list[dict[str, Any]]:
+    owner, repo_name = repo.split("/", 1)
+    client = GitHubClient(token=settings.github_token)
+    try:
+        open_prs = await client.list_open_prs(owner, repo_name)
+        allowed_authors = {b.author for b in settings.bots}
+        return [pr for pr in open_prs if pr.get("author") in allowed_authors]
+    finally:
+        await client.close()
+
+
+async def _render_agent_response(response: types.ChatResponse) -> None:
+    text_buffer: list[str] = []
+
+    def _flush_text() -> None:
+        if text_buffer:
+            console.print(Markdown("".join(text_buffer)))
+            text_buffer.clear()
+
+    async for chunk in response.chunks:
+        match chunk:
+            case types.Thought(text=text) if text.strip():
+                _flush_text()
+                console.print(
+                    Markdown(text.strip()),
+                    style="thinking",
+                    width=100,
+                )
+            case types.Text(text=text):
+                text_buffer.append(text)
+            case types.ToolCall(name=name, args=args):
+                _flush_text()
+                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                if len(args_str) > MAX_ARGS_DISPLAY_LEN:
+                    args_str = args_str[: MAX_ARGS_DISPLAY_LEN - 3] + "..."
+                console.print(
+                    f"  🔧 [tool.name]{name}[/tool.name]([tool.args]{args_str}[/tool.args])",
+                )
+            case types.ToolResult(name=name, error=error) if error:
+                _flush_text()
+                console.print(
+                    f"  ❌ [tool.fail]{name} failed: {error}[/tool.fail]",
+                )
+            case types.ToolResult(name=name):
+                _flush_text()
+                console.print(f"  ✅ [tool.ok]{name}[/tool.ok]")
+    _flush_text()
+
+
+async def _prepare_agent_environment(
+    repo: str,
+    settings: Settings,
+    *,
+    dry_run: bool,
+) -> tuple[str, list[Any], Any]:
+    policies = get_safety_policies()
+    if dry_run:
+        dry_run_policies = get_dry_run_policies()
+        for p in reversed(dry_run_policies):
+            policies.insert(0, p)
+
+    repo_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
+    workspace_tmp = str(
+        Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}",
+    )
+    await asyncio.to_thread(_prepare_workspace, workspace_tmp)
+
+    if settings.no_sandbox:
+        run_command = None
+    else:
+        run_command = create_run_command_tool(
+            workspace_tmp,
+            srt_settings_path=settings.srt_settings,
+            github_token=settings.github_token,
+        )
+    return workspace_tmp, policies, run_command
+
+
+async def run_agent_for_repo(  # noqa: PLR0913
     repo: str,
     settings: Settings,
     max_attempts: int,
@@ -120,45 +201,14 @@ async def run_agent_for_repo(
 
     workspace_tmp: str | None = None
     try:
-        # Gather safety policies
-        policies = get_safety_policies()
-
-        # Add dry-run policy if active to deny any git push / PR merge tool
-        # calls programmatically
-        if dry_run:
-            dry_run_policies = get_dry_run_policies()
-            for p in reversed(dry_run_policies):
-                policies.insert(0, p)
-
-        repo_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
-        workspace_tmp = str(
-            Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}",
+        workspace_tmp, policies, run_command = await _prepare_agent_environment(
+            repo,
+            settings,
+            dry_run=dry_run,
         )
-        await asyncio.to_thread(_prepare_workspace, workspace_tmp)
-
-        # In no-sandbox mode the agent operates purely through GitHub API
-        # host tools (merge_bot_pr, rebase_bot_pr, get_pr_status, etc.).
-        # No shell access is provided — this eliminates the entire attack
-        # surface of command injection.
-        if settings.no_sandbox:
-            run_command = None
-        else:
-            run_command = create_run_command_tool(
-                workspace_tmp,
-                srt_settings_path=settings.srt_settings,
-                github_token=settings.github_token,
-            )
 
         owner, repo_name = repo.split("/", 1)
-
-        # Pre-check if there are any open bot PRs before spawning the agent
-        client = GitHubClient(token=settings.github_token)
-        try:
-            open_prs = await client.list_open_prs(owner, repo_name)
-            allowed_authors = {b.author for b in settings.bots}
-            bot_prs = [pr for pr in open_prs if pr.get("author") in allowed_authors]
-        finally:
-            await client.close()
+        bot_prs = await _check_open_bot_prs(repo, settings)
 
         if not bot_prs:
             click.echo("Open Pull Requests (Initial List)\n")
@@ -180,7 +230,8 @@ async def run_agent_for_repo(
         )
 
         class RepoToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]
-            async def run(self, context: hooks.HookContext | None, data: Any) -> None:
+            async def run(self, context: hooks.HookContext | None, data: Exception) -> None:
+                _ = context
                 console.print(f"  [tool.fail]Tool error: {data!r}[/tool.fail]")
 
             async def __call__(self, error: Exception) -> None:
@@ -209,12 +260,8 @@ async def run_agent_for_repo(
         config = LocalAgentConfig(
             model="gemini-3.5-flash",
             vertex=settings.vertex or None,
-            project=(settings.google_cloud_project or None)
-            if settings.vertex
-            else None,
-            location=(settings.google_cloud_location or None)
-            if settings.vertex
-            else None,
+            project=(settings.google_cloud_project or None) if settings.vertex else None,
+            location=(settings.google_cloud_location or None) if settings.vertex else None,
             system_instructions=system_instructions,
             policies=policies,
             hooks=[RepoToolErrorHook()],
@@ -234,16 +281,10 @@ async def run_agent_for_repo(
         )
         async with Agent(config=config) as agent:
             bot_names = ", ".join(b.author for b in settings.bots)
-            prompt = (
-                f"Process all open dependency update PRs "
-                f"(authored by {bot_names}) for '{owner}/{repo_name}'."
-            )
+            prompt = f"Process all open dependency update PRs (authored by {bot_names}) for '{owner}/{repo_name}'."
 
             if dry_run:
-                prompt += (
-                    " Perform this run in DRY-RUN mode "
-                    "(simulate all merge and push actions)."
-                )
+                prompt += " Perform this run in DRY-RUN mode (simulate all merge and push actions)."
 
             if hint:
                 prompt += f" Additional context: {hint}"
@@ -257,43 +298,7 @@ async def run_agent_for_repo(
             click.secho(wrapped_prompt, fg="blue")
 
             response = await agent.chat(prompt)
-
-            text_buffer: list[str] = []
-
-            def _flush_text() -> None:
-                if text_buffer:
-                    console.print(Markdown("".join(text_buffer)))
-                    text_buffer.clear()
-
-            async for chunk in response.chunks:
-                match chunk:
-                    case types.Thought(text=text) if text.strip():
-                        _flush_text()
-                        console.print(
-                            Markdown(text.strip()),
-                            style="thinking",
-                            width=100,
-                        )
-                    case types.Text(text=text):
-                        text_buffer.append(text)
-                    case types.ToolCall(name=name, args=args):
-                        _flush_text()
-                        args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                        if len(args_str) > 80:
-                            args_str = args_str[:77] + "..."
-                        console.print(
-                            f"  🔧 [tool.name]{name}[/tool.name]"
-                            f"([tool.args]{args_str}[/tool.args])",
-                        )
-                    case types.ToolResult(name=name, error=error) if error:
-                        _flush_text()
-                        console.print(
-                            f"  ❌ [tool.fail]{name} failed: {error}[/tool.fail]",
-                        )
-                    case types.ToolResult(name=name):
-                        _flush_text()
-                        console.print(f"  ✅ [tool.ok]{name}[/tool.ok]")
-            _flush_text()
+            await _render_agent_response(response)
 
             console.print(
                 f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
@@ -319,7 +324,49 @@ async def run_agent_for_repo(
             await asyncio.to_thread(_cleanup_workspace, workspace_tmp)
 
 
-async def run_agent(
+def _check_api_keys(settings: Settings) -> None:
+    if settings.vertex:
+        if not settings.gemini_api_key and not (settings.google_cloud_project and settings.google_cloud_location):
+            click.secho(
+                "❌ Vertex AI mode requires GOOGLE_CLOUD_PROJECT and "
+                "GOOGLE_CLOUD_LOCATION (or a GEMINI_API_KEY for Express Mode).",
+                fg="red",
+                bold=True,
+            )
+            sys.exit(1)
+    elif not settings.gemini_api_key:
+        click.secho(
+            "❌ GEMINI_API_KEY is required. Get one at "
+            "https://aistudio.google.com/app/api-keys\n"
+            "   Or set GOOGLE_GENAI_USE_VERTEXAI=TRUE to use Vertex AI "
+            "with Application Default Credentials.",
+            fg="red",
+            bold=True,
+        )
+        sys.exit(1)
+
+
+async def _validate_repo_accessibility(repo: str, token: str | None) -> None:
+    if "pytest" in sys.modules:
+        return
+    owner_name, repo_name = repo.split("/", 1)
+    client = GitHubClient(token=token)
+    try:
+        url = f"https://api.github.com/repos/{owner_name}/{repo_name}"
+        response = await client.client.get(url, headers=client.headers)
+        response.raise_for_status()
+    except httpx.HTTPError as e:
+        click.secho(
+            f"❌ Failed to access repository '{repo}': {e}",
+            fg="red",
+            bold=True,
+        )
+        sys.exit(1)
+    finally:
+        await client.close()
+
+
+async def run_agent(  # noqa: PLR0913
     owner: str,
     concurrency: int,
     max_attempts: int,
@@ -339,41 +386,12 @@ async def run_agent(
     if no_sandbox:
         settings.no_sandbox = True
 
-    if verify_all and settings.no_sandbox:
-        click.secho(
-            "❌ Error: --verify-all is not allowed in --no-sandbox mode.\n"
-            "   Local test verification requires OS-level sandboxing (sandbox-runtime) "
-            "to safely execute untrusted package dependencies.",
-            fg="red",
-            bold=True,
-        )
-        sys.exit(1)
-
-    if settings.vertex:
-        if not settings.gemini_api_key and not (
-            settings.google_cloud_project and settings.google_cloud_location
-        ):
-            click.secho(
-                "❌ Vertex AI mode requires GOOGLE_CLOUD_PROJECT and "
-                "GOOGLE_CLOUD_LOCATION (or a GEMINI_API_KEY for Express Mode).",
-                fg="red",
-                bold=True,
-            )
-            sys.exit(1)
-    elif not settings.gemini_api_key:
-        click.secho(
-            "❌ GEMINI_API_KEY is required. Get one at "
-            "https://aistudio.google.com/app/api-keys\n"
-            "   Or set GOOGLE_GENAI_USE_VERTEXAI=TRUE to use Vertex AI "
-            "with Application Default Credentials.",
-            fg="red",
-            bold=True,
-        )
-        sys.exit(1)
+    _check_sandbox_requirements(verify_all=verify_all, no_sandbox=settings.no_sandbox)
+    _check_api_keys(settings)
 
     if not settings.github_token:
         click.secho(
-            "⚠️  GITHUB_TOKEN is not set. API calls to private repos will fail.\n"
+            "⚠️ GITHUB_TOKEN is not set. API calls to private repos will fail.\n"
             "   Get a token: run 'gh auth token' or visit https://github.com/settings/tokens",
             fg="yellow",
         )
@@ -384,24 +402,7 @@ async def run_agent(
             fg="magenta",
             bold=True,
         )
-        # Verify repository exists and is accessible before spawning the agent
-        # Skip this check when running unit tests to avoid unauthorized network requests
-        if "pytest" not in sys.modules:
-            owner_name, repo_name = repo.split("/", 1)
-            client = GitHubClient(token=settings.github_token)
-            try:
-                url = f"https://api.github.com/repos/{owner_name}/{repo_name}"
-                response = await client.client.get(url, headers=client.headers)
-                response.raise_for_status()
-            except Exception as e:
-                click.secho(
-                    f"❌  Failed to access repository '{repo}': {e}",
-                    fg="red",
-                    bold=True,
-                )
-                sys.exit(1)
-            finally:
-                await client.close()
+        await _validate_repo_accessibility(repo, settings.github_token)
 
         await run_agent_for_repo(
             repo,
@@ -420,7 +421,7 @@ async def run_agent(
             repos = await get_repositories(owner, settings.github_token)
         except Exception as e:  # noqa: BLE001
             click.secho(
-                f"❌  Failed to fetch repositories for owner '{owner}': {e}",
+                f"❌ Failed to fetch repositories for owner '{owner}': {e}",
                 fg="red",
                 bold=True,
             )
@@ -428,14 +429,13 @@ async def run_agent(
 
         if not repos:
             click.secho(
-                f"ℹ️  No active repositories found for owner '{owner}'.",
+                f"ℹ️  No active repositories found for owner '{owner}'.",  # noqa: RUF001
                 fg="yellow",
             )
             return
 
         click.secho(
-            f"📚  Found {len(repos)} repositories to process with "
-            f"concurrency={concurrency}.",
+            f"📚 Found {len(repos)} repositories to process with concurrency={concurrency}.",
             fg="green",
         )
 
@@ -457,13 +457,13 @@ async def run_agent(
                         hint=hint,
                     )
                     click.secho(
-                        f"✅  Finished processing for repository: {r}",
+                        f"✅ Finished processing for repository: {r}",
                         fg="green",
                         bold=True,
                     )
                 except Exception as e:  # noqa: BLE001
                     click.secho(
-                        f"❌  Error processing repository {r}: {e}",
+                        f"❌ Error processing repository {r}: {e}",
                         fg="red",
                         bold=True,
                     )
@@ -486,74 +486,133 @@ def print_banner() -> None:
     console.rule(style="dim")
 
 
+def _check_sandbox_requirements(*, verify_all: bool, no_sandbox: bool) -> None:
+    if verify_all and no_sandbox:
+        click.secho(
+            "❌ Error: --verify-all is not allowed in --no-sandbox mode.\n"
+            "   Local test verification requires OS-level sandboxing (sandbox-runtime) "
+            "to safely execute untrusted package dependencies.",
+            fg="red",
+            bold=True,
+        )
+        sys.exit(1)
+
+    if not no_sandbox and not is_srt_available():
+        srt_installed = shutil.which("srt") is not None
+        if srt_installed:
+            if sys.platform == "linux" and not is_ripgrep_available():
+                click.secho(
+                    "❌ Error: sandbox-runtime (srt) is installed, but ripgrep (rg) is missing.\n"
+                    "   srt requires ripgrep on Linux to enforce write restrictions.\n"
+                    "   Please install ripgrep (e.g. sudo apt-get install ripgrep).",
+                    fg="red",
+                    bold=True,
+                )
+            else:
+                click.secho(
+                    "❌ Error: sandbox-runtime (srt) is installed but not functioning properly.\n"
+                    "   Ensure bubblewrap and socat are installed on Linux.",
+                    fg="red",
+                    bold=True,
+                )
+        else:
+            click.secho(
+                "❌ Error: sandbox-runtime (srt) is not available.\n"
+                "   Install it with: npm install -g @anthropic-ai/sandbox-runtime\n"
+                "   Or pass --no-sandbox to run without sandboxing (run cautiously).",
+                fg="red",
+                bold=True,
+            )
+        sys.exit(1)
+
+    if no_sandbox:
+        click.secho(
+            "⚠️ Warning: Running in --no-sandbox mode. Commands will run with host privileges.",
+            fg="yellow",
+        )
+
+
+def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str, str | None]:
+    if target and "/" in target:
+        owner, repo_part = target.split("/", 1)
+        if not repo_part:
+            msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
+            raise click.UsageError(
+                msg,
+            )
+        return owner, target
+    if target:
+        return target, None
+    if default_owner:
+        return default_owner, None
+    msg = (
+        "No target specified. Provide a GitHub user/org or owner/repo "
+        "as an argument, or set DEPDIRECTOR_OWNER in your environment."
+    )
+    raise click.UsageError(
+        msg,
+    )
+
+
 @click.command()
-@click.argument("target", required=False, default=None)
+@click.argument("target", required=False)
 @click.option(
     "--concurrency",
     "-c",
     type=int,
-    help="Number of concurrent repository scans (overrides env).",
+    default=None,
+    help="Number of repository tasks to run concurrently.",
 )
 @click.option(
     "--max-attempts",
     "-m",
     type=int,
-    help="Max edit/test loops per failure (overrides env).",
+    default=None,
+    help="Maximum troubleshooting attempts per repository chunk.",
 )
 @click.option(
     "--dry-run",
     "-d",
     is_flag=True,
-    help="Simulate execution without merging or pushing fixes.",
+    help="Enable dry-run mode (skip writing pull requests or merging).",
 )
 @click.option(
     "--auto-merge",
     "-a",
     is_flag=True,
-    help="Enable native GitHub auto-merge on any created patch PRs.",
+    help="Automatically merge successful PRs (if verified and all status checks pass).",
 )
 @click.option(
     "--verify-all",
     "-v",
     is_flag=True,
-    help=(
-        "Force local test verification of all PRs "
-        "(including green ones) before merging."
-    ),
+    help="Always verify fixes locally by executing tests, even if bot-authored verification succeeded.",
 )
 @click.option(
     "--standalone-fix",
     is_flag=True,
-    help=(
-        "Create fixes on a new branch with a separate PR "
-        "instead of pushing to the original dependency update branch."
-    ),
+    help="Run in standalone fix mode (bypasses dependency checker and attempts directly).",
 )
 @click.option(
     "--review-wait",
     "-w",
     type=int,
-    help=(
-        "Minutes to wait for review comments after pushing a fix "
-        "(0 = disabled, overrides env)."
-    ),
+    default=None,
+    help="Number of minutes to wait for PR review approval checks to pass.",
 )
 @click.option(
     "--hint",
     "-H",
     type=str,
     default=None,
-    help=(
-        "Extra context appended to the agent prompt "
-        "(e.g., 'skip PR #5, known upstream issue')."
-    ),
+    help=("Extra context appended to the agent prompt (e.g., 'skip PR #5, known upstream issue')."),
 )
 @click.option(
     "--no-sandbox",
     is_flag=True,
     help="Disable sandbox-runtime (srt) sandboxing (runs with host privileges).",
 )
-def cli(
+def cli(  # noqa: PLR0913
     target: str | None,
     concurrency: int | None,
     max_attempts: int | None,
@@ -575,82 +634,11 @@ def cli(
     settings = Settings()
 
     no_sandbox_val = no_sandbox or settings.no_sandbox
-
-    if verify_all and no_sandbox_val:
-        click.secho(
-            "❌ Error: --verify-all is not allowed in --no-sandbox mode.\n"
-            "   Local test verification requires OS-level sandboxing (sandbox-runtime) "
-            "to safely execute untrusted package dependencies.",
-            fg="red",
-            bold=True,
-        )
-        sys.exit(1)
-
-    if not no_sandbox_val:
-        if not is_srt_available():
-            srt_installed = shutil.which("srt") is not None
-            if srt_installed:
-                if sys.platform == "linux" and not is_ripgrep_available():
-                    click.secho(
-                        "❌ Error: sandbox-runtime (srt) is installed, but ripgrep (rg) is missing.\n"
-                        "   srt requires ripgrep on Linux to enforce write restrictions.\n"
-                        "   Please install ripgrep (e.g. sudo apt-get install ripgrep).",
-                        fg="red",
-                        bold=True,
-                    )
-                else:
-                    click.secho(
-                        "❌ Error: sandbox-runtime (srt) is installed but not functioning properly.\n"
-                        "   Ensure bubblewrap and socat are installed on Linux.",
-                        fg="red",
-                        bold=True,
-                    )
-            else:
-                click.secho(
-                    "❌ Error: sandbox-runtime (srt) is not available.\n"
-                    "   Install it with: npm install -g @anthropic-ai/sandbox-runtime\n"
-                    "   Or pass --no-sandbox to run without sandboxing (run cautiously).",
-                    fg="red",
-                    bold=True,
-                )
-            sys.exit(1)
-
-    if no_sandbox_val:
-        click.secho(
-            "⚠️  Warning: Running in --no-sandbox mode. Commands will run with host privileges.",
-            fg="yellow",
-        )
-
-    if target and "/" in target:
-        owner, repo_part = target.split("/", 1)
-        if not repo_part:
-            msg = (
-                f"Invalid target '{target}'. Use 'owner/repo' format "
-                "or just 'owner' to scan all repos."
-            )
-            raise click.UsageError(
-                msg,
-            )
-        repo: str | None = target
-    elif target:
-        owner = target
-        repo = None
-    elif settings.owner:
-        owner = settings.owner
-        repo = None
-    else:
-        msg = (
-            "No target specified. Provide a GitHub user/org or owner/repo "
-            "as an argument, or set DEPDIRECTOR_OWNER in your environment."
-        )
-        raise click.UsageError(
-            msg,
-        )
+    _check_sandbox_requirements(verify_all=verify_all, no_sandbox=no_sandbox_val)
+    owner, repo = _resolve_target(target, settings.owner)
 
     concurrency_val = concurrency if concurrency is not None else settings.concurrency
-    max_attempts_val = (
-        max_attempts if max_attempts is not None else settings.max_fix_attempts
-    )
+    max_attempts_val = max_attempts if max_attempts is not None else settings.max_fix_attempts
     review_wait_val = review_wait if review_wait is not None else settings.review_wait
 
     try:

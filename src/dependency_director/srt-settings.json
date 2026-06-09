@@ -1,10 +1,11 @@
 {
   "network": {
     "allowedDomains": [
+      "*.pkg.dev",
+      "api.bitbucket.org",
       "api.github.com",
       "api.gitlab.com",
       "bitbucket.org",
-      "api.bitbucket.org",
       "codeload.github.com",
       "crates.io",
       "files.pythonhosted.org",

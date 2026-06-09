@@ -4,6 +4,8 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![SDK](https://img.shields.io/badge/sdk-google--antigravity-orange.svg)](pyproject.toml)
 
+![Dependency Director Screenshot](assets/screenshot.png)
+
 > [!NOTE]
 > `dependency-director` is a proof of concept. It automatically executes code edits, runs local tests, pushes branches, and merges pull requests. Always start with `--dry-run`, use a scoped GitHub token, and monitor runs closely.
 
@@ -79,10 +81,10 @@ flowchart TD
 
 The agent operates under two modes of programmatic safety:
 
-1. **OS-Level Sandboxing** — By default, command execution is sandboxed using [sandbox-runtime](https://github.com/anthropics/sandbox-runtime) on macOS and Linux. This enforces:
+1. **OS-Level Sandboxing** — By default, command execution is sandboxed using [sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) on macOS and Linux. This enforces:
    - **Filesystem isolation** — Read access to the home directory is denied (toolchain caches like `.pyenv`, `.npm`, `.cargo` are still allowed), and writes are restricted to `/tmp` and the active workspace. Sensitive files like `.env`, `.git/hooks`, and `.git/config` are always protected.
    - **Network restriction** — All inbound and outbound traffic is blocked except for allowlisted VCS hosts (`github.com`, `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`, `objects.githubusercontent.com`, `gitlab.com`, `bitbucket.org`). Known exfiltration endpoints are explicitly denied.
-   - **macOS + Go caveat** — Go's TLS stack queries `com.apple.trustd.agent`, which the sandbox blocks. Go dependency upgrades may fail with TLS errors unless you add `"enableWeakerNetworkIsolation": true` to your `srt-settings.json` — see the [sandbox-runtime docs](https://github.com/anthropics/sandbox-runtime) for trade-offs.
+   - **macOS + Go caveat** — Go's TLS stack queries `com.apple.trustd.agent`, which the sandbox blocks. Go dependency upgrades may fail with TLS errors unless you add `"enableWeakerNetworkIsolation": true` to your sandbox settings file (e.g. `~/.srt-settings.json` or a custom settings JSON) — see the [sandbox-runtime docs](https://github.com/anthropic-experimental/sandbox-runtime) for trade-offs.
 
 1. **Application-Level Fallback (`--no-sandbox`)** — When sandboxing is explicitly bypassed, the agent falls back to strict application-level validation. This is a **degraded safety mode**:
    - **Restricted workflows** — The agent is limited to GitHub-only operations (merge green PRs, post rebase comments). It will not clone repositories, install dependencies, or run tests.
@@ -114,6 +116,7 @@ The agent is configured via environment variables or a local `.env` file. A temp
 | `GOOGLE_CLOUD_PROJECT`          | Google Cloud project ID (required if using Vertex AI).                                     | _(Optional)_          |
 | `GOOGLE_CLOUD_LOCATION`         | Google Cloud region/location (required if using Vertex AI).                                | _(Optional)_          |
 | `DEPDIRECTOR_NO_SANDBOX`        | Set to `true` to disable sandbox-runtime (srt) sandboxing.                                 | `false`               |
+| `DEPDIRECTOR_SRT_SETTINGS`      | Custom settings JSON path for sandbox-runtime (srt).                                       | Bundled `srt-settings.json` |
 
 ---
 
