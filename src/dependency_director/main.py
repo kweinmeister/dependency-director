@@ -27,6 +27,7 @@ from dependency_director.config import (
 from dependency_director.instructions import get_system_instructions
 from dependency_director.tools import (
     GitHubClient,
+    GitHubClientError,
     create_agent_tools,
     create_run_command_tool,
     is_ripgrep_available,
@@ -355,7 +356,7 @@ async def _validate_repo_accessibility(repo: str, token: str | None) -> None:
         url = f"https://api.github.com/repos/{owner_name}/{repo_name}"
         response = await client.client.get(url, headers=client.headers)
         response.raise_for_status()
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, GitHubClientError) as e:
         click.secho(
             f"❌ Failed to access repository '{repo}': {e}",
             fg="red",
@@ -533,25 +534,60 @@ def _check_sandbox_requirements(*, verify_all: bool, no_sandbox: bool) -> None:
 
 
 def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str, str | None]:
-    if target and "/" in target:
-        owner, repo_part = target.split("/", 1)
+    """Resolve the owner and repository targets from the input string."""
+    if not target:
+        if default_owner:
+            return default_owner, None
+        msg = (
+            "No target specified. Provide a GitHub user/org or owner/repo "
+            "as an argument, or set DEPDIRECTOR_OWNER in your environment."
+        )
+        raise click.UsageError(msg)
+
+    # Clean target string (remove .git suffix)
+    s = target.strip()
+    if s.endswith(".git"):
+        s = s[:-4]
+
+    # Normalize trailing slash for URL-like formats only
+    is_url = "://" in s or "git@" in s or s.startswith("github.com/")
+    if is_url:
+        s = s.rstrip("/")
+
+    # Parse scheme/URL or SSH formats to get target_path
+    if "git@" in s and ":" in s:
+        # e.g., git@github.com:owner/repo
+        _, path = s.split(":", 1)
+        target_path = path
+    elif "://" in s:
+        # e.g., https://github.com/owner/repo
+        from urllib.parse import urlparse
+
+        parsed = urlparse(s)
+        target_path = parsed.path.lstrip("/")
+    elif s.startswith("github.com/"):
+        target_path = s[len("github.com/") :]
+    else:
+        target_path = s
+
+    # Validate and split target_path
+    if "/" in target_path:
+        owner, repo_part = target_path.split("/", 1)
         if not repo_part:
             msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
-            raise click.UsageError(
-                msg,
-            )
-        return owner, target
-    if target:
-        return target, None
-    if default_owner:
-        return default_owner, None
-    msg = (
-        "No target specified. Provide a GitHub user/org or owner/repo "
-        "as an argument, or set DEPDIRECTOR_OWNER in your environment."
-    )
-    raise click.UsageError(
-        msg,
-    )
+            raise click.UsageError(msg)
+        # Ensure we don't have further nested directories, but strip trailing slash first
+        repo_part = repo_part.rstrip("/")
+        if not repo_part or "/" in repo_part:
+            msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
+            raise click.UsageError(msg)
+        return owner, f"{owner}/{repo_part}"
+
+    if not target_path:
+        msg = f"Invalid target '{target}'."
+        raise click.UsageError(msg)
+
+    return target_path, None
 
 
 @click.command()

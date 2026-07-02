@@ -82,6 +82,84 @@ def test_cli_target_owner_only(mock_run_agent: MagicMock) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("target_input", "expected_owner", "expected_repo"),
+    [
+        ("https://github.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("https://github.com/test-owner/some-repo.git", "test-owner", "test-owner/some-repo"),
+        ("http://github.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("git@github.com:test-owner/some-repo.git", "test-owner", "test-owner/some-repo"),
+        ("github.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("https://github.com/test-owner", "test-owner", None),
+        ("https://github.com/test-owner/", "test-owner", None),
+        ("test-owner", "test-owner", None),
+    ],
+)
+@patch("dependency_director.main.run_agent", new_callable=AsyncMock)
+def test_cli_target_formats(
+    mock_run_agent: MagicMock,
+    target_input: str,
+    expected_owner: str,
+    expected_repo: str | None,
+) -> None:
+    """Verify CLI parses and normalizes various target formats correctly."""
+    runner = CliRunner()
+    with patch("dependency_director.main.Settings") as mock_settings_cls:
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.concurrency = 1
+        mock_settings.max_fix_attempts = 3
+        mock_settings.review_wait = 0
+        mock_settings.no_sandbox = False
+
+        result = runner.invoke(cli, [target_input])
+
+        assert result.exit_code == 0
+        mock_run_agent.assert_called_once_with(
+            expected_owner,
+            1,
+            3,
+            expected_repo,
+            dry_run=False,
+            auto_merge=False,
+            verify_all=False,
+            standalone_fix=False,
+            review_wait=0,
+            hint=None,
+            no_sandbox=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_target",
+    [
+        "owner/",
+        "https://github.com/",
+        "https://github.com/owner/repo/extra",
+        "",
+    ],
+)
+@patch("dependency_director.main.run_agent", new_callable=AsyncMock)
+def test_cli_invalid_target_formats_rejected(
+    mock_run_agent: MagicMock,
+    invalid_target: str,
+) -> None:
+    """Verify CLI rejects invalid target formats with a non-zero exit code."""
+    runner = CliRunner()
+    with patch("dependency_director.main.Settings") as mock_settings_cls:
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.concurrency = 1
+        mock_settings.max_fix_attempts = 3
+        mock_settings.review_wait = 0
+        mock_settings.no_sandbox = False
+
+        mock_settings.owner = None
+        result = runner.invoke(cli, [invalid_target] if invalid_target else [])
+
+        assert result.exit_code != 0
+        mock_run_agent.assert_not_called()
+
+
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_no_target_uses_env(mock_run_agent: MagicMock) -> None:
     """Verify CLI falls back to the owner environment variable if target is omitted."""
