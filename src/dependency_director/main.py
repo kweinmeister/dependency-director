@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 from google.antigravity import Agent, LocalAgentConfig, types
 from google.antigravity.hooks import hooks
 from rich.console import Console
@@ -26,6 +27,7 @@ from dependency_director.config import (
 from dependency_director.instructions import get_system_instructions
 from dependency_director.tools import (
     GitHubClient,
+    GitHubClientError,
     create_agent_tools,
     create_run_command_tool,
     is_ripgrep_available,
@@ -354,7 +356,7 @@ async def _validate_repo_accessibility(repo: str, token: str | None) -> None:
         url = f"https://api.github.com/repos/{owner_name}/{repo_name}"
         response = await client.client.get(url, headers=client.headers)
         response.raise_for_status()
-    except Exception as e:
+    except (httpx.HTTPError, GitHubClientError) as e:
         click.secho(
             f"❌ Failed to access repository '{repo}': {e}",
             fg="red",
