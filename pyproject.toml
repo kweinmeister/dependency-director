@@ -5,7 +5,7 @@ description = "Autonomous dependency triage and patching agent using the Google 
 readme = "README.md"
 requires-python = ">=3.13.13"
 dependencies = [
-    "click>=8.4.1",
+    "click>=8.4.2",
     "google-antigravity>=0.1.5",
     "httpx>=0.28.1",
     "pydantic>=2.13.4",
