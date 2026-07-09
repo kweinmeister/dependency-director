@@ -80,6 +80,27 @@ def test_settings_invalid_types(monkeypatch: pytest.MonkeyPatch) -> None:
         Settings()
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "-100"])
+def test_settings_concurrency_rejects_non_positive(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    """Concurrency=0 would deadlock asyncio.Semaphore; negative values are also invalid."""
+    monkeypatch.setenv("DEPDIRECTOR_CONCURRENCY", value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_concurrency_accepts_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Concurrency=1 (the minimum) must be accepted."""
+    monkeypatch.setenv("DEPDIRECTOR_CONCURRENCY", "1")
+    assert Settings().concurrency == 1
+
+
+def test_settings_empty_bots_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty bots list silently disables all PR processing; reject it early."""
+    monkeypatch.setenv("DEPDIRECTOR_BOTS", "[]")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 def test_safety_policy_structure() -> None:
     """Verify that the safety policy configuration conforms to the required schema."""
     policies = get_safety_policies()
@@ -129,6 +150,7 @@ async def test_agent_config_includes_skills_path(
     mock_agent_instance.chat = AsyncMock(return_value=mock_response)
     mock_usage = mock_agent_instance.conversation.total_usage
     mock_usage.prompt_token_count = 100
+    mock_usage.cached_content_token_count = 0
     mock_usage.candidates_token_count = 50
     mock_usage.thoughts_token_count = 10
     mock_usage.total_token_count = 160
@@ -413,6 +435,7 @@ async def test_run_agent_for_repo_processes_chunks(mock_agent_class: MagicMock, 
     mock_agent_instance.chat = AsyncMock(return_value=mock_response)
     mock_usage = mock_agent_instance.conversation.total_usage
     mock_usage.prompt_token_count = 10
+    mock_usage.cached_content_token_count = 0
     mock_usage.candidates_token_count = 5
     mock_usage.thoughts_token_count = 2
     mock_usage.total_token_count = 17
@@ -472,7 +495,7 @@ async def test_agent_config_no_mcp_servers(mock_agent_class: MagicMock, github_t
 
 @pytest.mark.asyncio
 async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock, github_token: str) -> None:
-    """All 12 host tools (+ optional run_command) should be registered."""
+    """All 13 host tools (+ optional run_command) should be registered."""
     settings = Settings()
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
@@ -494,6 +517,7 @@ async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock
         "rebase_bot_pr",
         "wait_for_reviews",
         "get_pr_status",
+        "wait_for_ci",
         "get_pr_workflow_run_logs",
         "get_pr_diff",
         "get_pr_files",

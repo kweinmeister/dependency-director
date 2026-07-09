@@ -1,7 +1,5 @@
 """Tests for system instructions generation in dependency-director."""
 
-import tempfile
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,20 +7,17 @@ from google.antigravity import types
 
 from dependency_director.config import DEFAULT_BOTS, BotConfig
 from dependency_director.instructions import (
-    DEFAULT_WORKSPACE_DIR,
     get_system_instructions,
 )
 
 
 def _get_instructions(
     max_attempts: int = 3,
-    owner: str = "test-owner",
     bots: list[BotConfig] = DEFAULT_BOTS,
     **kwargs: Any,
 ) -> types.TemplatedSystemInstructions:
     return get_system_instructions(
         max_attempts=max_attempts,
-        owner=owner,
         bots=bots,
         **kwargs,
     )
@@ -52,7 +47,7 @@ def test_returns_templated(instructions: types.TemplatedSystemInstructions) -> N
     """Verify that get_system_instructions returns a TemplatedSystemInstructions object."""
     assert isinstance(instructions, types.TemplatedSystemInstructions)
     assert instructions.identity is not None
-    assert "test-owner" in instructions.identity
+    assert "dependency-director" in instructions.identity
 
 
 REQUIRED_SECTIONS = [
@@ -84,7 +79,7 @@ def test_has_required_section(
         "merge_bot_pr",
         "rebase_bot_pr",
         "list_bot_prs",
-        "code-review-and-quality",
+        "self-review",
     ],
 )
 def test_workflow_contains(
@@ -145,10 +140,10 @@ def test_code_quality_contains(
 def test_post_action_checks(instructions: types.TemplatedSystemInstructions) -> None:
     """Verify that post-action checking steps are explicitly detailed in instructions."""
     content = _section_content(instructions, "post_action_checks")
-    assert "re-list" in content.lower() or "re-check" in content.lower()
-    assert "get_pr_status" in content
-    assert "max 10 retries" in content
-    assert "unknown" in content  # mergeable_state: 'unknown' guidance
+    assert "wait_for_ci" in content
+    assert "do NOT" in content
+    assert "poll" in content.lower()
+    assert "CONFLICT" in content
 
 
 def test_post_action_owner_not_leaked_as_template_literal(
@@ -176,54 +171,39 @@ def test_output_format(instructions: types.TemplatedSystemInstructions) -> None:
 @pytest.mark.parametrize("value", [1, 3, 7, 10])
 def test_max_attempts_appears_in_workflow(value: int) -> None:
     """Verify that the max fix attempts config value is correctly formatted into the workflow instructions."""
-    inst = get_system_instructions(max_attempts=value, owner="test-owner")
+    inst = get_system_instructions(max_attempts=value)
     assert str(value) in _section_content(inst, "workflow")
 
 
-# --- owner ---
+# --- identity ---
 
 
-def test_owner_appears_in_identity() -> None:
-    """Verify that the repository owner is correctly injected into the agent's identity section."""
-    inst = get_system_instructions(max_attempts=3, owner="my-org")
+def test_identity_is_generic() -> None:
+    """Verify that the agent identity is generic and does not contain repo-specific info."""
+    inst = get_system_instructions(max_attempts=3)
     assert inst.identity is not None
-    assert "my-org" in inst.identity
+    assert "dependency-director" in inst.identity
+    assert "autonomous" in inst.identity
 
 
-def test_owner_with_special_chars() -> None:
-    """Verify that owner names containing special characters are correctly handled."""
-    inst = get_system_instructions(max_attempts=3, owner="my-org_123")
-    assert inst.identity is not None
-    assert "my-org_123" in inst.identity
+# --- workspace_dir in prompt (not system instructions) ---
 
 
-def test_owner_empty_string() -> None:
-    """Verify that an empty string owner raises a ValueError during validation."""
-    inst = get_system_instructions(max_attempts=3, owner="")
-    assert isinstance(inst, types.TemplatedSystemInstructions)
-    assert inst.identity is not None
-    assert "github.com/" in inst.identity
+def test_workspace_dir_uses_placeholder() -> None:
+    """Verify that sandbox workflow references <workspace_dir> placeholder instead of a specific path."""
+    inst = get_system_instructions(max_attempts=3)
+    workflow = _section_content(inst, "workflow")
+    guardrails = _section_content(inst, "guardrails")
+    assert "<workspace_dir>" in workflow
+    assert "workspace directory" in guardrails
 
 
-# --- workspace_dir ---
-
-
-def test_workspace_dir_appears() -> None:
-    """Verify that the active workspace directory path is included in the instructions."""
-    workspace = str(Path(tempfile.gettempdir()) / "custom-ws")
-    inst = get_system_instructions(
-        max_attempts=3,
-        owner="test-owner",
-        workspace_dir=workspace,
-    )
-    assert workspace in _section_content(inst, "guardrails")
-    assert workspace in _section_content(inst, "workflow")
-
-
-def test_workspace_dir_default() -> None:
-    """Verify default workspace directory placeholder is used when not specified."""
-    inst = get_system_instructions(max_attempts=3, owner="test-owner")
-    assert DEFAULT_WORKSPACE_DIR in _section_content(inst, "guardrails")
+def test_workspace_dir_not_hardcoded() -> None:
+    """Verify no hardcoded temp paths appear in system instructions."""
+    inst = get_system_instructions(max_attempts=3)
+    all_content = " ".join(_section_content(inst, s.title) for s in inst.sections)
+    assert "/tmp/" not in all_content
+    assert "dependency-director-" not in all_content
 
 
 # --- Conditional sections (flag toggles) ---
@@ -349,16 +329,13 @@ def test_standalone_fix_creates_new_branch() -> None:
 
 def test_all_flags_on() -> None:
     """Verify instructions are generated correctly with all feature flags enabled."""
-    custom_ws = str(Path(tempfile.gettempdir()) / "all-flags")
     inst = get_system_instructions(
         max_attempts=5,
-        owner="all-flags-org",
         verify_all=True,
         auto_merge=True,
         dry_run=True,
         standalone_fix=True,
         review_wait=10,
-        workspace_dir=custom_ws,
     )
     titles = _section_titles(inst)
     assert "verify_green_prs" in titles
@@ -366,8 +343,8 @@ def test_all_flags_on() -> None:
     assert "dry_run_mode" in titles
     assert "review_feedback_loop" in titles
     assert inst.identity is not None
-    assert "all-flags-org" in inst.identity
-    assert custom_ws in _section_content(inst, "guardrails")
+    assert "dependency-director" in inst.identity
+    assert "workspace directory" in _section_content(inst, "guardrails")
     assert "dependency-director/fix-" in _section_content(inst, "workflow")
     assert "5" in _section_content(inst, "workflow")
 
@@ -376,7 +353,6 @@ def test_all_flags_off() -> None:
     """Verify instructions are generated correctly with all feature flags disabled."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="minimal-org",
         verify_all=False,
         auto_merge=False,
         dry_run=False,
@@ -413,7 +389,7 @@ def test_bot_prs_tool_in_workflow(
 def test_custom_bots_in_instructions() -> None:
     """Verify custom bot configurations are correctly added to the system instructions."""
     custom = [BotConfig(author="my-bot[bot]", rebase_command="@my-bot rebase")]
-    inst = get_system_instructions(max_attempts=3, owner="test-owner", bots=custom)
+    inst = get_system_instructions(max_attempts=3, bots=custom)
     content = _section_content(inst, "guardrails")
     assert "my-bot[bot]" in content
     assert "dependabot[bot]" not in content
@@ -423,7 +399,6 @@ def test_no_sandbox_instructions() -> None:
     """Verify instructions explicitly flag that sandboxing is disabled when configured."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="test-owner",
         no_sandbox=True,
     )
     guardrails = _section_content(inst, "guardrails")
@@ -439,7 +414,6 @@ def test_no_sandbox_instructions_no_shell_access() -> None:
     """No-sandbox guardrails must state that no shell access is available."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="test-owner",
         no_sandbox=True,
     )
     guardrails = _section_content(inst, "guardrails")
@@ -450,7 +424,6 @@ def test_no_sandbox_instructions_no_run_command_reference() -> None:
     """No-sandbox instructions must NOT reference run_command_sandboxed since the tool is not registered."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="test-owner",
         no_sandbox=True,
     )
     all_content = " ".join(_section_content(inst, s.title) for s in inst.sections)
@@ -461,7 +434,6 @@ def test_sandbox_instructions_reference_run_command() -> None:
     """Sandbox mode instructions MUST reference run_command_sandboxed since the tool IS registered."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="test-owner",
         no_sandbox=False,
     )
     guardrails = _section_content(inst, "guardrails")
@@ -472,7 +444,6 @@ def test_no_sandbox_workflow_skips_red_prs() -> None:
     """No-sandbox workflow must skip RED PRs (no local fix attempts)."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="test-owner",
         no_sandbox=True,
     )
     workflow = _section_content(inst, "workflow")
@@ -485,7 +456,6 @@ def test_no_sandbox_workflow_still_has_merge_and_rebase() -> None:
     """No-sandbox workflow must still reference merge and rebase tools."""
     inst = get_system_instructions(
         max_attempts=3,
-        owner="test-owner",
         no_sandbox=True,
     )
     workflow = _section_content(inst, "workflow")
@@ -517,19 +487,104 @@ def test_minimize_conversational_output(
     assert "Minimize conversational output" in output_format
 
 
-def test_red_pr_grep_pattern_reflects_configured_bots() -> None:
-    """Grep pattern for remote branch discovery uses configured bot authors, not hardcoded names."""
-    import re as _re
-
+def test_red_pr_branch_lookup_uses_list_branches() -> None:
+    """Branch lookup uses list_branches host tool, not shell pipe patterns."""
     custom_bots = [
         BotConfig(author="custom-bot[bot]", rebase_command="@custom-bot rebase"),
         BotConfig(author="another-bot[bot]", rebase_command="@another-bot rebase"),
     ]
     inst = _get_instructions(bots=custom_bots)
     workflow = _section_content(inst, "workflow")
-    # re.escape is applied to authors, so check for the escaped form in the pattern
-    assert _re.escape("custom-bot[bot]") in workflow
-    assert _re.escape("another-bot[bot]") in workflow
-    # Default bot escaped names must NOT appear when overridden
-    assert _re.escape("dependabot[bot]") not in workflow
-    assert _re.escape("renovate[bot]") not in workflow
+    # Must reference list_branches host tool
+    assert "list_branches" in workflow
+    # Bot branch prefixes must appear (for matching directive)
+    assert "custom-bot/" in workflow
+    assert "another-bot/" in workflow
+    # Default bot prefixes must NOT appear when overridden
+    assert "dependabot/" not in workflow
+    assert "renovate/" not in workflow
+    # Must NOT use grep pipe pattern
+    assert "grep -E" not in workflow
+    assert "git branch -r" not in workflow
+
+
+def test_red_pr_branch_lookup_uses_branch_prefixes() -> None:
+    """Branch-lookup instruction must use branch-name prefixes, not [bot] author strings.
+
+    Branch names look like 'dependabot/pip/urllib3-2.0', never 'dependabot[bot]/...'.
+    The instruction must tell the agent to match on the prefix (e.g. 'dependabot/')
+    derived from the bot author, not the full author string with [bot] suffix.
+    """
+    inst = _get_instructions()
+    workflow = _section_content(inst, "workflow")
+    # Must reference branch prefixes like 'dependabot/' and 'renovate/'
+    assert "dependabot/" in workflow
+    assert "renovate/" in workflow
+    # Must NOT tell agent to match branches against '[bot]' strings
+    assert "[bot]" not in workflow.split("list_branches")[1].split(".")[0]
+
+
+def test_sandbox_workflow_no_shell_operators() -> None:
+    """Sandbox-mode workflow must not contain pipe, &&, or || operators."""
+    inst = _get_instructions()
+    workflow = _section_content(inst, "workflow")
+    # Check for standalone shell operators (not inside quoted strings)
+    assert " | " not in workflow, "Workflow contains pipe operator"
+    assert " && " not in workflow, "Workflow contains && operator"
+    assert " || " not in workflow, "Workflow contains || operator"
+
+
+def test_workflow_diff_before_clone() -> None:
+    """RED PR workflow should reference get_pr_diff before cloning."""
+    inst = _get_instructions()
+    workflow = _section_content(inst, "workflow")
+    assert "get_pr_diff" in workflow, "get_pr_diff not found in workflow"
+    assert "before cloning" in workflow, "'before cloning' context not found"
+    # Ensure get_pr_diff appears before the "before cloning" phrase
+    diff_pos = workflow.find("get_pr_diff")
+    before_clone_pos = workflow.find("before cloning")
+    assert diff_pos < before_clone_pos, "get_pr_diff must appear before 'before cloning'"
+
+
+def test_workflow_files_before_clone() -> None:
+    """RED PR workflow should reference get_pr_files before cloning."""
+    inst = _get_instructions()
+    workflow = _section_content(inst, "workflow")
+    assert "get_pr_files" in workflow, "get_pr_files not found in workflow"
+    assert "before cloning" in workflow, "'before cloning' context not found"
+    files_pos = workflow.find("get_pr_files")
+    before_clone_pos = workflow.find("before cloning")
+    assert files_pos < before_clone_pos, "get_pr_files must appear before 'before cloning'"
+
+
+def test_post_action_checks_reference_wait_for_ci() -> None:
+    """post_action_checks should reference wait_for_ci tool instead of manual polling."""
+    inst = _get_instructions()
+    content = _section_content(inst, "post_action_checks")
+    assert "wait_for_ci" in content
+
+
+def test_guardrails_env_syntax_guidance() -> None:
+    """Guardrails should instruct agent to use 'env KEY=val cmd' not 'KEY=val cmd'."""
+    inst = _get_instructions()
+    guardrails = _section_content(inst, "guardrails")
+    assert "env KEY=val" in guardrails
+    assert "srt" in guardrails.lower() or "argv" in guardrails.lower()
+
+
+def test_merging_green_prs_uses_wait_for_ci() -> None:
+    """merging_green_prs should reference wait_for_ci, not get_pr_status for re-checks."""
+    inst = _get_instructions(verify_all=False)
+    content = _section_content(inst, "merging_green_prs")
+    assert "wait_for_ci" in content
+    # Should NOT reference manual get_pr_status polling
+    assert "get_pr_status" not in content
+
+
+def test_workflow_inlines_self_review() -> None:
+    """Workflow self-review should be inlined, not reference external skill files."""
+    inst = _get_instructions()
+    workflow = _section_content(inst, "workflow")
+    assert "self-review" in workflow
+    assert "code-review-and-quality" not in workflow
+    assert "SKILL.md" not in workflow

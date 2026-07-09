@@ -13,6 +13,7 @@ from dependency_director.tools import (
     GitHubNotFoundError,
     ToolFn,
     _check_bot_author,
+    _make_wait_for_ci,
     _make_write_tools,
 )
 
@@ -510,3 +511,80 @@ async def test_github_client_get_file_contents_404_raises_not_found() -> None:
         await c.get_file_contents("owner", "repo", "path")
     assert "GitHub API error 404" in str(exc_info.value)
     await c.close()
+
+
+# --- wait_for_ci tests (TDD) ---
+
+
+@pytest.fixture
+def ci_tool(mock_client: MagicMock) -> ToolFn:
+    """Create a wait_for_ci tool bound to a mock client."""
+    return _make_wait_for_ci(mock_client)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_ci_returns_on_green(mock_client: MagicMock, ci_tool: ToolFn) -> None:
+    """wait_for_ci returns immediately when CI is already GREEN."""
+    mock_client.get_pr_details = AsyncMock(
+        return_value={"head": {"sha": "abc123"}, "mergeable": True, "mergeable_state": "clean", "title": "bump foo"},
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={"check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]},
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = await ci_tool("owner", "repo", 42)
+    assert "GREEN" in result
+    # Should not need to poll — one call is enough
+    assert mock_client.get_pr_details.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_for_ci_returns_on_red(mock_client: MagicMock, ci_tool: ToolFn) -> None:
+    """wait_for_ci returns immediately when CI has failed."""
+    mock_client.get_pr_details = AsyncMock(
+        return_value={"head": {"sha": "abc123"}, "mergeable": True, "mergeable_state": "clean", "title": "bump foo"},
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={"check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}]},
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = await ci_tool("owner", "repo", 42)
+    assert "RED" in result
+    assert mock_client.get_pr_details.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_for_ci_none_then_green(mock_client: MagicMock, ci_tool: ToolFn) -> None:
+    """wait_for_ci polls through NONE → PENDING → GREEN."""
+    pr_details = {"head": {"sha": "abc123"}, "mergeable": True, "mergeable_state": "clean", "title": "bump foo"}
+    mock_client.get_pr_details = AsyncMock(return_value=pr_details)
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    # 1st call: no checks (NONE), 2nd: pending, 3rd: green
+    mock_client.get_commit_check_runs = AsyncMock(
+        side_effect=[
+            {"check_runs": []},
+            {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]},
+            {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]},
+        ],
+    )
+    with patch("dependency_director.tools.asyncio.sleep", new_callable=AsyncMock):
+        result = await ci_tool("owner", "repo", 42)
+    assert "GREEN" in result
+    assert mock_client.get_pr_details.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_wait_for_ci_timeout(mock_client: MagicMock, ci_tool: ToolFn) -> None:
+    """wait_for_ci gives up after max retries and reports timeout."""
+    pr_details = {"head": {"sha": "abc123"}, "mergeable": True, "mergeable_state": "clean", "title": "bump foo"}
+    mock_client.get_pr_details = AsyncMock(return_value=pr_details)
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]},
+    )
+    with patch("dependency_director.tools.asyncio.sleep", new_callable=AsyncMock):
+        result = await ci_tool("owner", "repo", 42)
+    assert "pending" in result.lower() or "timeout" in result.lower()
+    # Should have polled max retries + 1 initial call
+    assert mock_client.get_pr_details.call_count >= 10

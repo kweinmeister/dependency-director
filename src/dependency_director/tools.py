@@ -18,9 +18,36 @@ import httpx
 
 from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH, SAFE_ENV_ALLOWLIST, BotConfig
 
+
+class CompoundPart(NamedTuple):
+    """A sub-command extracted from a compound argv list.
+
+    Attributes:
+        argv: The sub-command argument list.
+        operator: The operator preceding this sub-command (None for the first).
+
+    """
+
+    argv: list[str]
+    operator: str | None
+
+
+class CommandResult(NamedTuple):
+    """Result from executing a single sandboxed command.
+
+    Attributes:
+        output: The formatted command output string.
+        returncode: The process exit code (-1 for errors before execution).
+
+    """
+
+    output: str
+    returncode: int
+
+
 OWNER_RE = re.compile(r"^[a-zA-Z0-9-]{1,39}$")
 REPO_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
-_ENV_FLAGS_WITH_ARG = {"-u", "--unset", "-S", "--split-string"}
+_ENV_FLAGS_WITH_ARG = {"-u", "--unset"}
 
 
 class GitHubClientError(Exception):
@@ -707,71 +734,109 @@ def _make_get_pr_status(client: GitHubClient) -> ToolFn:
 
         Returns a JSON string detailing PR status, mergeable state, and CI results.
         """
-        pr_details = await client.get_pr_details(owner, repo, pr_number)
-        head_sha = pr_details.get("head", {}).get("sha", "")
-        mergeable = pr_details.get("mergeable")
-        mergeable_state = pr_details.get("mergeable_state")
-
-        checks_summary: list[dict[str, Any]] = []
-        ci_status = "NONE"
-
-        if head_sha:
-            check_runs_data, commit_status_data = await asyncio.gather(
-                client.get_commit_check_runs(owner, repo, head_sha),
-                client.get_commit_status(owner, repo, head_sha),
-            )
-            check_runs = check_runs_data.get("check_runs", [])
-            checks_summary.extend(
-                {
-                    "name": run.get("name"),
-                    "status": run.get("status"),
-                    "conclusion": run.get("conclusion"),
-                }
-                for run in check_runs
-            )
-
-            legacy_statuses = commit_status_data.get("statuses", [])
-            legacy_state = commit_status_data.get("state") if legacy_statuses else None
-            checks_summary.extend(
-                {
-                    "name": status.get("context"),
-                    "status": "completed",
-                    "conclusion": "success"
-                    if status.get("state") == "success"
-                    else ("failure" if status.get("state") == "failure" else None),
-                }
-                for status in legacy_statuses
-            )
-
-            # Determine CI outcome
-            has_failures = any(
-                r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
-            )
-            has_pending = any(
-                r.get("status") not in ("completed", "success") or r.get("conclusion") is None for r in checks_summary
-            )
-
-            if has_failures or legacy_state == "failure":
-                ci_status = "RED"
-            elif has_pending or legacy_state == "pending":
-                ci_status = "PENDING"
-            elif checks_summary or legacy_state == "success":
-                ci_status = "GREEN"
-
-        if mergeable is False or mergeable_state in ("dirty", "conflict"):
-            ci_status = "CONFLICT"
-
-        summary = {
-            "pr_number": pr_number,
-            "title": pr_details.get("title"),
-            "mergeable": mergeable,
-            "mergeable_state": mergeable_state,
-            "ci_status": ci_status,
-            "checks": checks_summary,
-        }
-        return json.dumps(summary, indent=2)
+        _ci_status, result_json = await _check_ci(client, owner, repo, pr_number)
+        return result_json
 
     return get_pr_status
+
+
+async def _check_ci(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> tuple[str, str]:
+    """Single CI check — returns (ci_status, json_summary)."""
+    pr_details = await client.get_pr_details(owner, repo, pr_number)
+    head_sha = pr_details.get("head", {}).get("sha", "")
+    mergeable = pr_details.get("mergeable")
+    mergeable_state = pr_details.get("mergeable_state")
+
+    checks_summary: list[dict[str, Any]] = []
+    ci_status = "NONE"
+
+    if head_sha:
+        check_runs_data, commit_status_data = await asyncio.gather(
+            client.get_commit_check_runs(owner, repo, head_sha),
+            client.get_commit_status(owner, repo, head_sha),
+        )
+        check_runs = check_runs_data.get("check_runs", [])
+        checks_summary.extend(
+            {
+                "name": run.get("name"),
+                "status": run.get("status"),
+                "conclusion": run.get("conclusion"),
+            }
+            for run in check_runs
+        )
+
+        legacy_statuses = commit_status_data.get("statuses", [])
+        legacy_state = commit_status_data.get("state") if legacy_statuses else None
+        checks_summary.extend(
+            {
+                "name": status.get("context"),
+                "status": "completed",
+                "conclusion": "success"
+                if status.get("state") == "success"
+                else ("failure" if status.get("state") in ("failure", "error") else None),
+            }
+            for status in legacy_statuses
+        )
+
+        has_failures = any(
+            r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
+        )
+        has_pending = any(
+            r.get("status") not in ("completed", "success") or r.get("conclusion") is None for r in checks_summary
+        )
+
+        if has_failures or legacy_state in ("failure", "error"):
+            ci_status = "RED"
+        elif has_pending or legacy_state == "pending":
+            ci_status = "PENDING"
+        elif checks_summary or legacy_state == "success":
+            ci_status = "GREEN"
+
+    if mergeable is False or mergeable_state in ("dirty", "conflict"):
+        ci_status = "CONFLICT"
+
+    summary = {
+        "pr_number": pr_number,
+        "title": pr_details.get("title"),
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
+        "ci_status": ci_status,
+        "checks": checks_summary,
+    }
+    return ci_status, json.dumps(summary, indent=2)
+
+
+def _make_wait_for_ci(client: GitHubClient) -> ToolFn:
+    """Create a wait_for_ci tool that polls CI status with backoff."""
+
+    async def wait_for_ci(owner: str, repo: str, pr_number: int) -> str:
+        """Poll CI status until it settles (GREEN/RED/CONFLICT) or times out.
+
+        Uses exponential backoff: 10s, 20s, 30s, 30s, … (max 10 retries).
+        Returns the final status JSON when CI resolves.
+        """
+        _validate_repo_params(owner, repo)
+        max_retries = 10
+        delays = [min(10 * (i + 1), 30) for i in range(max_retries)]
+
+        ci_status, result_json = await _check_ci(client, owner, repo, pr_number)
+        if ci_status not in ("NONE", "PENDING"):
+            return result_json
+
+        for delay in delays:
+            await asyncio.sleep(delay)
+            ci_status, result_json = await _check_ci(client, owner, repo, pr_number)
+            if ci_status not in ("NONE", "PENDING"):
+                return result_json
+
+        return f"CI still pending for PR #{pr_number} after polling {max_retries} times. " + result_json
+
+    return wait_for_ci
 
 
 def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
@@ -955,6 +1020,7 @@ def create_agent_tools(
     )
 
     get_pr_status = _make_get_pr_status(client)
+    wait_for_ci = _make_wait_for_ci(client)
     get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client)
     list_bot_prs = _make_list_bot_prs(client, bots)
     legacy = _make_legacy_tools(client)
@@ -964,6 +1030,7 @@ def create_agent_tools(
         rebase_bot_pr,
         wait_for_reviews,
         get_pr_status,
+        wait_for_ci,
         get_pr_workflow_run_logs,
         list_bot_prs,
         legacy.get_pr_diff,
@@ -1014,52 +1081,6 @@ def _validate_target_path(
             f"Security Error: {context_msg} targeting path outside workspace and temp directory is denied: {path_str}"
         )
     return None
-
-
-def tokenize_command(command_line: str) -> list[str]:
-    """Tokenize a shell command line string, splitting operators safely outside quotes."""
-    cmd_stripped = command_line.strip()
-    in_single = False
-    in_double = False
-    escaped = False
-    spaced_cmd = []
-    i = 0
-    n = len(cmd_stripped)
-    while i < n:
-        char = cmd_stripped[i]
-        if escaped:
-            spaced_cmd.append(char)
-            escaped = False
-            i += 1
-            continue
-        if char == "\\":
-            spaced_cmd.append(char)
-            escaped = True
-            i += 1
-            continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-            spaced_cmd.append(char)
-            i += 1
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            spaced_cmd.append(char)
-            i += 1
-            continue
-        if not in_single and not in_double:
-            if i + 1 < n and cmd_stripped[i : i + 2] in ("&&", "||"):
-                spaced_cmd.append(f" {cmd_stripped[i : i + 2]} ")
-                i += 2
-                continue
-            if char in (";", "|", "&", "\n"):
-                spaced_cmd.append(f" {char} ")
-                i += 1
-                continue
-        spaced_cmd.append(char)
-        i += 1
-
-    return shlex.split("".join(spaced_cmd))
 
 
 def _check_env_var_token(token: str) -> str | None:
@@ -1211,60 +1232,130 @@ def _extract_env_command_exe(tokens: list[str], idx: int) -> str:
     return exe_name
 
 
-def _check_executable_rules(
-    exe_name: str,
-    tokens: list[str],
-    idx: int,
-    workspace_dir: str,
-    operators: set[str],
-) -> str | None:
+def split_compound_argv(argv: list[str]) -> list[CompoundPart]:
+    """Split an argv list on ``&&`` and ``||`` tokens into sub-commands.
+
+    Returns a list of CompoundPart(argv, operator) tuples.  The first
+    part has operator=None; subsequent parts record the joining operator.
+    """
+    compound_ops = {"&&", "||"}
+    parts: list[CompoundPart] = []
+    current: list[str] = []
+    current_op: str | None = None
+
+    for token in argv:
+        if token in compound_ops:
+            parts.append(CompoundPart(argv=current, operator=current_op))
+            current = []
+            current_op = token
+        else:
+            current.append(token)
+
+    parts.append(CompoundPart(argv=current, operator=current_op))
+    return parts
+
+
+def _validate_single_argv(argv: list[str], workspace_dir: str) -> str | None:
+    """Validate a single (non-compound) argv array for sandboxed execution."""
+    if not argv:
+        return "Security Error: Empty command."
+
+    # Reject dangerous shell operators (;, |, &) — these are never safe.
+    # Note: && and || are handled at the compound level, not here.
+    dangerous_operators = {";", "|", "&"}
+    if dangerous_operators & set(argv):
+        return (
+            "Security Error: Shell operators (;, |, &) are not "
+            "allowed. Use separate run_command_sandboxed calls instead."
+        )
+
+    # Find the executable (skip leading FOO=bar env assignments)
+    exe_idx = 0
+    for i, token in enumerate(argv):
+        if "=" in token and not token.startswith("-"):
+            err = _check_env_var_token(token)
+            if err:
+                return err
+            continue
+        exe_idx = i
+        break
+    else:
+        return "Security Error: No executable found in command."
+
+    exe_name = Path(argv[exe_idx]).name.lower()
+
+    # Handle `env` wrapper — reject env -S/--split-string
+    if exe_name == "env":
+        for j in range(exe_idx + 1, len(argv)):
+            if argv[j] in ("-S", "--split-string"):
+                return "Security Error: 'env -S/--split-string' is blocked."
+        exe_name = _extract_env_command_exe(argv, exe_idx)
+
+    # Block SHELL interpreters only (no legitimate use after Phase 2).
+    # Language runtimes (python3, node, ruby, etc.) are allowed —
+    # agent needs them for test execution; srt OS sandbox is the boundary.
+    blocked_shells = {"bash", "sh", "dash", "zsh", "ksh"}
+    if exe_name in blocked_shells:
+        return f"Security Error: Shell interpreter '{exe_name}' is blocked."
+
+    # Block exec pivots
+    if exe_name == "find":
+        for arg in argv[exe_idx + 1 :]:
+            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                return f"Security Error: 'find' with '{arg}' is blocked."
+    if exe_name == "xargs":
+        return "Security Error: Command 'xargs' is blocked."
+
+    # Existing executable denylist (curl, wget, sudo, etc.)
     err = _check_blocked_executables(exe_name)
     if err:
         return err
 
+    # rm path validation
     if exe_name == "rm":
-        return _check_rm_command(tokens, idx, workspace_dir, operators)
+        return _check_rm_command(argv, exe_idx, workspace_dir, set())
 
+    # git command hardening (existing + extended)
     if exe_name == "git":
-        return _check_git_command(tokens, idx, operators)
+        err = _check_git_command(argv, exe_idx, set())
+        if err:
+            return err
+        # Additional: block --upload-pack, --receive-pack
+        blocked_git_flags = {"--upload-pack", "--receive-pack"}
+        for tok in argv[exe_idx + 1 :]:
+            flag = tok.split("=", 1)[0].lower()
+            if flag in blocked_git_flags:
+                return f"Security Error: Git flag '{flag}' is blocked."
+        # Extended config key blocking
+        blocked_config_prefixes_extra = (
+            "protocol.ext.allow",
+            "remote.",
+        )
+        for j, tok in enumerate(argv[exe_idx + 1 :], start=exe_idx + 1):
+            if tok in ("-c", "--config") and j + 1 < len(argv):
+                config_key = argv[j + 1].split("=", 1)[0].strip().lower()
+                for prefix in blocked_config_prefixes_extra:
+                    if config_key.startswith(prefix):
+                        return f"Security Error: Git config '{prefix}' is blocked."
 
     return None
 
 
-def validate_sandboxed_command(command_line: str, workspace_dir: str) -> str | None:
-    """Validate command_line even when sandboxed, for defense-in-depth."""
-    try:
-        tokens = tokenize_command(command_line)
-    except ValueError:
-        return "Security Error: Invalid shell command quoting."
+def validate_argv(argv: list[str], workspace_dir: str) -> str | None:
+    """Validate an argv array for sandboxed execution (defense-in-depth).
 
-    if not tokens:
+    Supports compound commands joined by ``&&`` and ``||``.  Each
+    sub-command is validated independently.  Dangerous operators
+    (``;``, ``|``, ``&``) remain blocked.
+    """
+    if not argv:
         return "Security Error: Empty command."
 
-    operators = {";", "&&", "||", "|", "&"}
-
-    is_next_executable = True
-    for i, token in enumerate(tokens):
-        if token in operators:
-            is_next_executable = True
-            continue
-
-        if is_next_executable:
-            if "=" in token and not token.startswith("-"):
-                err = _check_env_var_token(token)
-                if err:
-                    return err
-                continue
-
-            is_next_executable = False
-            exe_name = Path(token).name.lower()
-
-            if exe_name == "env":
-                exe_name = _extract_env_command_exe(tokens, i)
-
-            err = _check_executable_rules(exe_name, tokens, i, workspace_dir, operators)
-            if err:
-                return err
+    parts = split_compound_argv(argv)
+    for part in parts:
+        err = _validate_single_argv(part.argv, workspace_dir)
+        if err:
+            return err
     return None
 
 
@@ -1331,25 +1422,22 @@ def _setup_cache_env(workspace_dir: str, env: dict[str, str]) -> None:
     env["YARN_CACHE_FOLDER"] = str(cache_base / "yarn")
 
 
+def _is_git_command_argv(argv: list[str]) -> bool:
+    """Check if the first executable in an argv list is git."""
+    for token in argv:
+        if "=" in token and not token.startswith("-"):
+            continue  # skip env var assignments
+        return Path(token).name.lower() == "git"
+    return False
+
+
 def _is_git_command(command_line: str) -> bool:
+    """Check if a command string starts with git."""
     try:
-        tokens = tokenize_command(command_line)
+        argv = shlex.split(command_line)
     except ValueError:
         return False
-    operators = {";", "&&", "||", "|", "&"}
-    is_next_executable = True
-    for token in tokens:
-        if token in operators:
-            is_next_executable = True
-            continue
-        if is_next_executable:
-            if "=" in token and not token.startswith("-"):
-                continue
-            is_next_executable = False
-            exe_name = Path(token).name.lower()
-            if exe_name == "git":
-                return True
-    return False
+    return _is_git_command_argv(argv)
 
 
 class SandboxedCommandRunner:
@@ -1393,6 +1481,9 @@ class SandboxedCommandRunner:
     ) -> str:
         """Execute a shell command. Sandboxed on macOS by default.
 
+        Supports compound commands joined by ``&&`` and ``||``.
+        Each sub-command is validated and executed independently through srt.
+
         Args:
             command_line: The exact command line string to run.
             working_dir: The directory to run the command in.
@@ -1408,27 +1499,59 @@ class SandboxedCommandRunner:
         legacy_cwd = kwargs.get("Cwd")
         target_cwd = working_dir or cwd or legacy_cwd or self.workspace_dir
 
-        env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
-        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
-        env["GIT_TEMPLATE_DIR"] = "/dev/null"
+        try:
+            argv = shlex.split(command_line)
+        except ValueError:
+            return "Security Error: Invalid shell command quoting."
 
-        _setup_cache_env(self.workspace_dir, env)
-
-        token = self.github_token or os.environ.get("GITHUB_TOKEN")
-        if token:
-            env["GIT_CONFIG_COUNT"] = "2"
-            env["GIT_CONFIG_KEY_0"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
-            env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
-            env["GIT_CONFIG_KEY_1"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
-            env["GIT_CONFIG_VALUE_1"] = "git@github.com:"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-
-        validation_err = validate_sandboxed_command(command_line, self.workspace_dir)
+        validation_err = validate_argv(argv, self.workspace_dir)
         if validation_err:
             return validation_err
 
-        is_git_command = _is_git_command(command_line)
+        parts = split_compound_argv(argv)
+
+        # Simple case: no compound operators
+        if len(parts) == 1:
+            return (await self._run_single_argv(parts[0].argv, target_cwd)).output
+
+        # Compound: run each sub-command with && / || semantics
+        all_outputs: list[str] = []
+        last_returncode = 0
+        for part in parts:
+            if part.operator == "&&" and last_returncode != 0:
+                break  # short-circuit: previous failed
+            if part.operator == "||" and last_returncode == 0:
+                continue  # short-circuit: previous succeeded
+
+            result = await self._run_single_argv(part.argv, target_cwd)
+            all_outputs.append(result.output)
+            last_returncode = result.returncode
+
+        return "\n".join(all_outputs)
+
+    async def _run_single_argv(
+        self,
+        argv: list[str],
+        target_cwd: str,
+    ) -> CommandResult:
+        """Execute a single (non-compound) argv array through srt."""
+        env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
+        _setup_cache_env(self.workspace_dir, env)
+
+        is_git_command = _is_git_command_argv(argv)
+
+        if is_git_command:
+            env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
+            env["GIT_TEMPLATE_DIR"] = "/dev/null"
+            token = self.github_token or os.environ.get("GITHUB_TOKEN")
+            if token:
+                env["GIT_CONFIG_COUNT"] = "2"
+                env["GIT_CONFIG_KEY_0"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
+                env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+                env["GIT_CONFIG_KEY_1"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
+                env["GIT_CONFIG_VALUE_1"] = "git@github.com:"
+                env["GIT_TERMINAL_PROMPT"] = "0"
 
         active_config_path = self.config_path
         git_config_temp_path = None
@@ -1447,18 +1570,18 @@ class SandboxedCommandRunner:
                     git_config_temp_path = temp_f.name
                     active_config_path = git_config_temp_path
             except (OSError, TypeError, ValueError) as e:
-                return f"Error: Failed to create temporary config for Git: {e}"
+                return CommandResult(f"Error: Failed to create temporary config for Git: {e}", -1)
 
         try:
             if not active_config_path:
-                return "Error: Sandbox configuration was not initialized."
+                return CommandResult("Error: Sandbox configuration was not initialized.", -1)
 
             process = await asyncio.create_subprocess_exec(
                 "srt",
                 "--settings",
                 active_config_path,
-                "-c",
-                command_line,
+                "--",
+                *argv,
                 cwd=target_cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1472,12 +1595,9 @@ class SandboxedCommandRunner:
                 with contextlib.suppress(Exception):
                     process.kill()
                 await process.wait()
-                return "Error: Command timed out after 300 seconds."
-            return _format_command_result(
-                stdout,
-                stderr,
-                process.returncode if process.returncode is not None else -1,
-            )
+                return CommandResult("Error: Command timed out after 300 seconds.", -1)
+            rc = process.returncode if process.returncode is not None else -1
+            return CommandResult(_format_command_result(stdout, stderr, rc), rc)
         finally:
             if git_config_temp_path:
                 with contextlib.suppress(Exception):

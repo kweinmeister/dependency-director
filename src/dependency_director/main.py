@@ -185,6 +185,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
         rebase_bot_pr,
         wait_for_reviews,
         get_pr_status,
+        wait_for_ci,
         get_pr_workflow_run_logs,
         list_bot_prs,
         get_pr_diff,
@@ -201,6 +202,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
     )
 
     workspace_tmp: str | None = None
+    run_command: Any | None = None
     try:
         workspace_tmp, policies, run_command = await _prepare_agent_environment(
             repo,
@@ -219,11 +221,9 @@ async def run_agent_for_repo(  # noqa: PLR0913
         # Get agent system instructions
         system_instructions = get_system_instructions(
             max_attempts=max_attempts,
-            owner=owner,
             verify_all=verify_all,
             auto_merge=auto_merge,
             dry_run=dry_run,
-            workspace_dir=workspace_tmp,
             standalone_fix=standalone_fix,
             review_wait=review_wait,
             bots=settings.bots,
@@ -247,6 +247,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
             rebase_bot_pr,
             wait_for_reviews,
             get_pr_status,
+            wait_for_ci,
             get_pr_workflow_run_logs,
             get_pr_diff,
             get_pr_files,
@@ -284,6 +285,9 @@ async def run_agent_for_repo(  # noqa: PLR0913
             bot_names = ", ".join(b.author for b in settings.bots)
             prompt = f"Process all open dependency update PRs (authored by {bot_names}) for '{owner}/{repo_name}'."
 
+            if not settings.no_sandbox:
+                prompt += f" Workspace directory: {workspace_tmp}"
+
             if dry_run:
                 prompt += " Perform this run in DRY-RUN mode (simulate all merge and push actions)."
 
@@ -306,12 +310,16 @@ async def run_agent_for_repo(  # noqa: PLR0913
             )
 
             usage = agent.conversation.total_usage
+            cached = usage.cached_content_token_count or 0
+            input_tokens = usage.prompt_token_count or 0
+            output_tokens = usage.candidates_token_count or 0
+            thinking = usage.thoughts_token_count or 0
+            total = usage.total_token_count or (input_tokens + output_tokens)
             console.print(
                 Panel(
-                    f"Prompt: {usage.prompt_token_count:,}  |  "
-                    f"Output: {usage.candidates_token_count:,}  |  "
-                    f"Thinking: {usage.thoughts_token_count:,}  |  "
-                    f"Total: {usage.total_token_count:,}",
+                    f"Input: {input_tokens:,} (Cached: {cached:,})  |  "
+                    f"Output: {output_tokens:,} (Thinking: {thinking:,})"
+                    f"  |  Total: {total:,}",
                     title=f"Token Usage — {repo}",
                     style="dim cyan",
                 ),
@@ -546,8 +554,7 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
 
     # Clean target string (remove .git suffix)
     s = target.strip()
-    if s.endswith(".git"):
-        s = s[:-4]
+    s = s.removesuffix(".git")
 
     # Normalize trailing slash for URL-like formats only
     is_url = "://" in s or "git@" in s or s.startswith("github.com/")

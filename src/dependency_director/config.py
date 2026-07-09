@@ -98,10 +98,11 @@ class Settings(BaseSettings):
         validation_alias="depdirector_max_fix_attempts",
     )
     owner: str = Field(default="", validation_alias="depdirector_owner")
-    concurrency: int = Field(default=1, validation_alias="depdirector_concurrency")
+    concurrency: int = Field(default=1, ge=1, validation_alias="depdirector_concurrency")
     review_wait: int = Field(default=0, validation_alias="depdirector_review_wait")
     bots: list[BotConfig] = Field(
         default=DEFAULT_BOTS,
+        min_length=1,
         validation_alias="depdirector_bots",
     )
     vertex: bool = Field(default=False, validation_alias="google_genai_use_vertexai")
