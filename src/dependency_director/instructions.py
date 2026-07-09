@@ -1,33 +1,32 @@
 """System instruction generation for the dependency-director agent."""
 
-import re
-import tempfile
-from pathlib import Path
-
 from google.antigravity import types
 
 from dependency_director.config import DEFAULT_BOTS, BotConfig
 
-DEFAULT_WORKSPACE_DIR = str(Path(tempfile.gettempdir()) / "dependency-director")
-
 
 def get_system_instructions(  # noqa: PLR0913
     max_attempts: int,
-    owner: str = "",
     *,
     verify_all: bool = False,
     auto_merge: bool = False,
     dry_run: bool = False,
-    workspace_dir: str = DEFAULT_WORKSPACE_DIR,
     standalone_fix: bool = False,
     review_wait: int = 0,
     bots: list[BotConfig] = DEFAULT_BOTS,
     no_sandbox: bool = False,
 ) -> types.TemplatedSystemInstructions:
-    """Generate system instructions for the dependency-director agent."""
+    """Generate system instructions for the dependency-director agent.
+
+    System instructions are structured for optimal implicit caching:
+    stable sections appear first, flag-dependent sections next, and
+    mode-specific sections (guardrails/workflow) last. Repo-specific
+    details (workspace_dir, owner) are passed via the user prompt
+    rather than system instructions so the instruction prefix stays
+    identical across repos in multi-repo runs.
+    """
     bot_authors = [b.author for b in bots]
     bot_authors_quoted = ", ".join(f"'{a}'" for a in bot_authors)
-    bot_grep_pattern = "|".join(re.escape(a) for a in bot_authors)
 
     if standalone_fix:
         fix_strategy = (
@@ -68,8 +67,11 @@ def get_system_instructions(  # noqa: PLR0913
     else:
         guardrails_content = (
             f"- Only process PRs authored by {bot_authors_quoted}.\n"
-            f"- Clone only under subdirectories of {workspace_dir}. Always specify working_dir.\n"
+            "- Clone only under subdirectories of the workspace directory (provided in the prompt). "
+            "Always specify working_dir.\n"
             "- Use 'run_command_sandboxed' for all shell commands (built-in 'run_command' is disabled).\n"
+            "- To set environment variables for a command, use 'env KEY=val cmd args...', "
+            "not 'KEY=val cmd args...' (the latter is shell syntax that srt's argv mode does not support).\n"
             "- Network is restricted to package registries (PyPI, npm, crates.io) and GitHub.\n"
             "- Trust tool outputs (e.g. 'list_bot_prs'). Do NOT search, browse, or inspect "
             "the host environment, files, or directories (e.g. tests, conftest.py, .env)."
@@ -86,42 +88,31 @@ def get_system_instructions(  # noqa: PLR0913
             "3. Process PRs strictly oldest-to-newest (do NOT reorder to fast-track green PRs):\n"
             "   - GREEN: Call merge_bot_pr immediately (no cloning needed). Stop on failure.\n"
             "   - CONFLICT: If edited only by bot, call rebase_bot_pr then skip to the next PR "
-            f"(Dependabot processes rebases asynchronously). Else clone to {workspace_dir}/<repo_name>, merge main, "
+            "(Dependabot processes rebases asynchronously). Else clone to <workspace_dir>/<repo_name>, merge main, "
             "resolve conflicts, test, push.\n"
             "   - RED: Retrieve logs via 'get_pr_workflow_run_logs'. "
-            f"Clone (only if not already cloned) into a subdirectory: 'git clone <url> {workspace_dir}/<repo_name>' "
-            "then checkout the PR branch using: "
-            "'git fetch origin pull/<pr_number>/head:pr-<pr_number> && git checkout pr-<pr_number>'. "
-            "Find the remote branch name for pushing via: "
-            f"'git branch -r | grep -E \"{bot_grep_pattern}\"' (strip 'origin/' prefix for the push target). "
+            "Then call 'get_pr_diff(owner, repo, pr_number)' and 'get_pr_files(owner, repo, pr_number)' "
+            "to identify changed files and understand the scope of the update before cloning. "
+            "Clone (only if not already cloned) into a subdirectory: 'git clone <url> <workspace_dir>/<repo_name>' "
+            "then checkout the PR branch using two separate run_command_sandboxed calls: "
+            "first 'git fetch origin pull/<pr_number>/head:pr-<pr_number>', "
+            "then 'git checkout pr-<pr_number>'. "
+            "Find the remote branch name for pushing by calling 'list_branches(owner, repo)' "
+            f"and matching against the configured bot authors ({bot_authors_quoted}), "
+            "then strip 'origin/' prefix for the push target. "
             "If dependency installation fails with a network error or 401, "
             "skip the PR and log: '✗ #<n> skipped: dependency registry unavailable in sandbox'. "
             f"Otherwise install deps, test, fix, verify, and: {fix_strategy}\n"
             f"4. Max {max_attempts} fix attempts per RED PR before skipping.\n"
-            "5. Run 'code-review-and-quality' self-review before committing."
+            "5. Before committing, briefly self-review: no suppressed errors (type: ignore, noqa), "
+            "no debug artifacts, no unrelated changes, commit message is concise and descriptive."
         )
 
+    # Sections are ordered for optimal implicit caching: stable content first,
+    # then flag-dependent sections, then parameter/mode-specific sections last.
+    # This maximizes the common prefix across different repo runs.
     sections = [
-        types.SystemInstructionSection(
-            title="guardrails",
-            content=guardrails_content,
-        ),
-        types.SystemInstructionSection(
-            title="workflow",
-            content=workflow_content,
-        ),
-        types.SystemInstructionSection(
-            title="post_action_checks",
-            content=(
-                "- Re-list PRs and re-check mergeability after merging or pushing to main "
-                "(due to potential new conflicts).\n"
-                "- GitHub may return mergeable_state: 'unknown' briefly after a push — re-check once "
-                "and proceed (not a CONFLICT).\n"
-                "- After pushing a fix, verify CI with 'get_pr_status'. If PENDING or NONE (GitHub hasn't "
-                "registered the new run yet), poll every 30s (max 10 retries). "
-                "If still pending, report 'fix pushed, CI pending' and proceed."
-            ),
-        ),
+        # --- Stable sections (identical across all runs) ---
         types.SystemInstructionSection(
             title="code_quality",
             content=(
@@ -131,22 +122,19 @@ def get_system_instructions(  # noqa: PLR0913
             ),
         ),
         types.SystemInstructionSection(
-            title="output_format",
+            title="post_action_checks",
             content=(
-                "- Do NOT announce actions before execution. State reasons if halting early.\n"
-                "- Minimize conversational output. Do not describe your reasoning, internal state, or plans; "
-                "only output the sequential CLI logs and final summary.\n"
-                "- Emit output sequentially as you work (not as one block at the end). Format CLI output as:\n"
-                "  1. Initial list of open PRs with statuses (GREEN/RED/CONFLICT).\n"
-                "  2. Execution prefix: '→ Merging #12 (green)' or '→ Fixing #14 (failing CI)'.\n"
-                "  3. Completion prefix: '✓ #12 merged', '⏭ #23 skipped (rebase requested)', or "
-                "'✗ #14 failed after N attempts'.\n"
-                "  4. Final markdown summary list of all processed PRs.\n"
-                f"- Log '✗ #<n> could not be fixed after {max_attempts} attempts' if RED PR fixes fail."
+                "- After merging a PR or pushing a fix, use 'wait_for_ci(owner, repo, pr_number)' "
+                "on the next PR to verify its CI status before acting on it. "
+                "This tool polls automatically with backoff — do NOT use 'sleep', "
+                "do NOT call 'get_pr_status' in a loop, and do NOT poll manually.\n"
+                "- If wait_for_ci reports CONFLICT after a merge, rebase or fix as appropriate.\n"
+                "- If still pending after timeout, report 'CI pending' and proceed to the next PR."
             ),
         ),
     ]
 
+    # --- Flag-dependent sections (same across repos within a single run) ---
     if verify_all:
         sections.append(
             types.SystemInstructionSection(
@@ -160,8 +148,9 @@ def get_system_instructions(  # noqa: PLR0913
                 title="merging_green_prs",
                 content=(
                     "When a PR is GREEN, merge it directly via 'merge_bot_pr' without cloning or testing. "
-                    "Re-check mergeability via 'get_pr_status' between sequential merges (a prior merge can "
-                    "introduce conflicts). Stop immediately if merge fails for any reason other than a conflict."
+                    "Between sequential merges, call 'wait_for_ci(owner, repo, next_pr_number)' on the next PR "
+                    "to re-check its status (a prior merge can introduce conflicts or reset CI). "
+                    "Stop immediately if merge fails for any reason other than a conflict."
                 ),
             ),
         )
@@ -209,7 +198,40 @@ def get_system_instructions(  # noqa: PLR0913
             ),
         )
 
+    # --- Parameter-dependent sections (output_format embeds max_attempts) ---
+    sections.append(
+        types.SystemInstructionSection(
+            title="output_format",
+            content=(
+                "- Do NOT announce actions before execution. State reasons if halting early.\n"
+                "- Minimize conversational output. Do not describe your reasoning, internal state, or plans; "
+                "only output the sequential CLI logs and final summary.\n"
+                "- Emit output sequentially as you work (not as one block at the end). Format CLI output as:\n"
+                "  1. Initial list of open PRs with statuses (GREEN/RED/CONFLICT).\n"
+                "  2. Execution prefix: '→ Merging #12 (green)' or '→ Fixing #14 (failing CI)'.\n"
+                "  3. Completion prefix: '✓ #12 merged', '⏭ #23 skipped (rebase requested)', or "
+                "'✗ #14 failed after N attempts'.\n"
+                "  4. Final markdown summary list of all processed PRs.\n"
+                f"- Log '✗ #<n> could not be fixed after {max_attempts} attempts' if RED PR fixes fail."
+            ),
+        ),
+    )
+
+    # --- Mode-specific sections (guardrails and workflow go last) ---
+    sections.append(
+        types.SystemInstructionSection(
+            title="guardrails",
+            content=guardrails_content,
+        ),
+    )
+    sections.append(
+        types.SystemInstructionSection(
+            title="workflow",
+            content=workflow_content,
+        ),
+    )
+
     return types.TemplatedSystemInstructions(
-        identity=f"dependency-director — autonomous dependency triage for github.com/{owner}",
+        identity="dependency-director — autonomous dependency triage agent",
         sections=sections,
     )

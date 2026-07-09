@@ -185,9 +185,9 @@ def get_pr_status(tools: tuple[ToolFn, ...]) -> ToolFn:
 @pytest.fixture
 def get_pr_workflow_run_logs(tools: tuple[ToolFn, ...]) -> ToolFn:
     """Fixture to retrieve the PR workflow run log fetching tool."""
-    fn = tools[4]
+    fn = tools[5]
     fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_workflow_run_logs", f"Unexpected tool at index 4: {fn_name!r}"
+    assert fn_name == "get_pr_workflow_run_logs", f"Unexpected tool at index 5: {fn_name!r}"
     return fn
 
 

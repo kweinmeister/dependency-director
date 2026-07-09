@@ -89,6 +89,7 @@ def mock_agent_class() -> Generator[MagicMock]:
         # Default mock usage metrics
         mock_usage = MagicMock()
         mock_usage.prompt_token_count = 0
+        mock_usage.cached_content_token_count = 0
         mock_usage.candidates_token_count = 0
         mock_usage.thoughts_token_count = 0
         mock_usage.total_token_count = 0
