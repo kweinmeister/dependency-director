@@ -32,6 +32,19 @@ class CompoundPart(NamedTuple):
     operator: str | None
 
 
+class CommandResult(NamedTuple):
+    """Result from executing a single sandboxed command.
+
+    Attributes:
+        output: The formatted command output string.
+        returncode: The process exit code (-1 for errors before execution).
+
+    """
+
+    output: str
+    returncode: int
+
+
 OWNER_RE = re.compile(r"^[a-zA-Z0-9-]{1,39}$")
 REPO_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
 _ENV_FLAGS_WITH_ARG = {"-u", "--unset"}
@@ -721,69 +734,8 @@ def _make_get_pr_status(client: GitHubClient) -> ToolFn:
 
         Returns a JSON string detailing PR status, mergeable state, and CI results.
         """
-        pr_details = await client.get_pr_details(owner, repo, pr_number)
-        head_sha = pr_details.get("head", {}).get("sha", "")
-        mergeable = pr_details.get("mergeable")
-        mergeable_state = pr_details.get("mergeable_state")
-
-        checks_summary: list[dict[str, Any]] = []
-        ci_status = "NONE"
-
-        if head_sha:
-            check_runs_data, commit_status_data = await asyncio.gather(
-                client.get_commit_check_runs(owner, repo, head_sha),
-                client.get_commit_status(owner, repo, head_sha),
-            )
-            check_runs = check_runs_data.get("check_runs", [])
-            checks_summary.extend(
-                {
-                    "name": run.get("name"),
-                    "status": run.get("status"),
-                    "conclusion": run.get("conclusion"),
-                }
-                for run in check_runs
-            )
-
-            legacy_statuses = commit_status_data.get("statuses", [])
-            legacy_state = commit_status_data.get("state") if legacy_statuses else None
-            checks_summary.extend(
-                {
-                    "name": status.get("context"),
-                    "status": "completed",
-                    "conclusion": "success"
-                    if status.get("state") == "success"
-                    else ("failure" if status.get("state") == "failure" else None),
-                }
-                for status in legacy_statuses
-            )
-
-            # Determine CI outcome
-            has_failures = any(
-                r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
-            )
-            has_pending = any(
-                r.get("status") not in ("completed", "success") or r.get("conclusion") is None for r in checks_summary
-            )
-
-            if has_failures or legacy_state == "failure":
-                ci_status = "RED"
-            elif has_pending or legacy_state == "pending":
-                ci_status = "PENDING"
-            elif checks_summary or legacy_state == "success":
-                ci_status = "GREEN"
-
-        if mergeable is False or mergeable_state in ("dirty", "conflict"):
-            ci_status = "CONFLICT"
-
-        summary = {
-            "pr_number": pr_number,
-            "title": pr_details.get("title"),
-            "mergeable": mergeable,
-            "mergeable_state": mergeable_state,
-            "ci_status": ci_status,
-            "checks": checks_summary,
-        }
-        return json.dumps(summary, indent=2)
+        _ci_status, result_json = await _check_ci(client, owner, repo, pr_number)
+        return result_json
 
     return get_pr_status
 
@@ -826,7 +778,7 @@ async def _check_ci(
                 "status": "completed",
                 "conclusion": "success"
                 if status.get("state") == "success"
-                else ("failure" if status.get("state") == "failure" else None),
+                else ("failure" if status.get("state") in ("failure", "error") else None),
             }
             for status in legacy_statuses
         )
@@ -838,7 +790,7 @@ async def _check_ci(
             r.get("status") not in ("completed", "success") or r.get("conclusion") is None for r in checks_summary
         )
 
-        if has_failures or legacy_state == "failure":
+        if has_failures or legacy_state in ("failure", "error"):
             ci_status = "RED"
         elif has_pending or legacy_state == "pending":
             ci_status = "PENDING"
@@ -1560,7 +1512,7 @@ class SandboxedCommandRunner:
 
         # Simple case: no compound operators
         if len(parts) == 1:
-            return await self._run_single_argv(parts[0].argv, target_cwd)
+            return (await self._run_single_argv(parts[0].argv, target_cwd)).output
 
         # Compound: run each sub-command with && / || semantics
         all_outputs: list[str] = []
@@ -1572,15 +1524,8 @@ class SandboxedCommandRunner:
                 continue  # short-circuit: previous succeeded
 
             result = await self._run_single_argv(part.argv, target_cwd)
-            all_outputs.append(result)
-
-            # Extract exit code from formatted result
-            if "EXIT CODE: 0" in result:
-                last_returncode = 0
-            elif "EXIT CODE:" in result:
-                last_returncode = 1
-            else:
-                last_returncode = 0
+            all_outputs.append(result.output)
+            last_returncode = result.returncode
 
         return "\n".join(all_outputs)
 
@@ -1588,7 +1533,7 @@ class SandboxedCommandRunner:
         self,
         argv: list[str],
         target_cwd: str,
-    ) -> str:
+    ) -> CommandResult:
         """Execute a single (non-compound) argv array through srt."""
         env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
         _setup_cache_env(self.workspace_dir, env)
@@ -1625,11 +1570,11 @@ class SandboxedCommandRunner:
                     git_config_temp_path = temp_f.name
                     active_config_path = git_config_temp_path
             except (OSError, TypeError, ValueError) as e:
-                return f"Error: Failed to create temporary config for Git: {e}"
+                return CommandResult(f"Error: Failed to create temporary config for Git: {e}", -1)
 
         try:
             if not active_config_path:
-                return "Error: Sandbox configuration was not initialized."
+                return CommandResult("Error: Sandbox configuration was not initialized.", -1)
 
             process = await asyncio.create_subprocess_exec(
                 "srt",
@@ -1650,12 +1595,9 @@ class SandboxedCommandRunner:
                 with contextlib.suppress(Exception):
                     process.kill()
                 await process.wait()
-                return "Error: Command timed out after 300 seconds."
-            return _format_command_result(
-                stdout,
-                stderr,
-                process.returncode if process.returncode is not None else -1,
-            )
+                return CommandResult("Error: Command timed out after 300 seconds.", -1)
+            rc = process.returncode if process.returncode is not None else -1
+            return CommandResult(_format_command_result(stdout, stderr, rc), rc)
         finally:
             if git_config_temp_path:
                 with contextlib.suppress(Exception):

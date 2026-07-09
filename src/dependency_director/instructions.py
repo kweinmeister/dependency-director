@@ -27,6 +27,9 @@ def get_system_instructions(  # noqa: PLR0913
     """
     bot_authors = [b.author for b in bots]
     bot_authors_quoted = ", ".join(f"'{a}'" for a in bot_authors)
+    # Branch names use the author prefix without [bot] (e.g. 'dependabot/pip/...')
+    bot_branch_prefixes = [a.replace("[bot]", "") + "/" for a in bot_authors]
+    bot_prefixes_quoted = ", ".join(f"'{p}'" for p in bot_branch_prefixes)
 
     if standalone_fix:
         fix_strategy = (
@@ -98,7 +101,7 @@ def get_system_instructions(  # noqa: PLR0913
             "first 'git fetch origin pull/<pr_number>/head:pr-<pr_number>', "
             "then 'git checkout pr-<pr_number>'. "
             "Find the remote branch name for pushing by calling 'list_branches(owner, repo)' "
-            f"and matching against the configured bot authors ({bot_authors_quoted}), "
+            f"and matching branches that start with one of the bot prefixes ({bot_prefixes_quoted}), "
             "then strip 'origin/' prefix for the push target. "
             "If dependency installation fails with a network error or 401, "
             "skip the PR and log: '✗ #<n> skipped: dependency registry unavailable in sandbox'. "

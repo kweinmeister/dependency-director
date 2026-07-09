@@ -11,6 +11,7 @@ from dependency_director.tools import (
     GitHubClient,
     GitHubNotFoundError,
     ToolFn,
+    _check_ci,
     create_agent_tools,
 )
 
@@ -349,3 +350,36 @@ async def test_tool_get_pr_workflow_run_logs_api_error_on_logs(
     result = await get_pr_workflow_run_logs("owner", "repo", 22)
     assert "--- FAILED JOB: build (ID: 111) ---" in result
     assert "Failed to retrieve log: GitHub API error 404" in result
+
+
+@pytest.mark.asyncio
+async def test_check_ci_legacy_error_state_is_red() -> None:
+    """Legacy commit status with state='error' must produce ci_status='RED'.
+
+    GitHub uses 'error' for checks that fail structurally (e.g. infrastructure
+    issues). This must not be classified as PENDING.
+    """
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "chore(deps): bump something",
+            "head": {"sha": "abc123"},
+            "mergeable": True,
+            "mergeable_state": "clean",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={"check_runs": []},
+    )
+    mock_client.get_commit_status = AsyncMock(
+        return_value={
+            "state": "error",
+            "statuses": [{"context": "ci/deploy", "state": "error"}],
+        },
+    )
+
+    ci_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
+    result = json.loads(result_json)
+    assert ci_status == "RED", f"Expected RED but got {ci_status}"
+    assert result["ci_status"] == "RED"

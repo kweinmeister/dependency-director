@@ -314,7 +314,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
             input_tokens = usage.prompt_token_count or 0
             output_tokens = usage.candidates_token_count or 0
             thinking = usage.thoughts_token_count or 0
-            total = input_tokens + output_tokens
+            total = usage.total_token_count or (input_tokens + output_tokens)
             console.print(
                 Panel(
                     f"Input: {input_tokens:,} (Cached: {cached:,})  |  "

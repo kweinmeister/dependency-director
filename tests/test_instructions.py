@@ -497,15 +497,31 @@ def test_red_pr_branch_lookup_uses_list_branches() -> None:
     workflow = _section_content(inst, "workflow")
     # Must reference list_branches host tool
     assert "list_branches" in workflow
-    # Bot authors must still appear (for matching directive)
-    assert "custom-bot[bot]" in workflow
-    assert "another-bot[bot]" in workflow
-    # Default bot names must NOT appear when overridden
-    assert "dependabot[bot]" not in workflow
-    assert "renovate[bot]" not in workflow
+    # Bot branch prefixes must appear (for matching directive)
+    assert "custom-bot/" in workflow
+    assert "another-bot/" in workflow
+    # Default bot prefixes must NOT appear when overridden
+    assert "dependabot/" not in workflow
+    assert "renovate/" not in workflow
     # Must NOT use grep pipe pattern
     assert "grep -E" not in workflow
     assert "git branch -r" not in workflow
+
+
+def test_red_pr_branch_lookup_uses_branch_prefixes() -> None:
+    """Branch-lookup instruction must use branch-name prefixes, not [bot] author strings.
+
+    Branch names look like 'dependabot/pip/urllib3-2.0', never 'dependabot[bot]/...'.
+    The instruction must tell the agent to match on the prefix (e.g. 'dependabot/')
+    derived from the bot author, not the full author string with [bot] suffix.
+    """
+    inst = _get_instructions()
+    workflow = _section_content(inst, "workflow")
+    # Must reference branch prefixes like 'dependabot/' and 'renovate/'
+    assert "dependabot/" in workflow
+    assert "renovate/" in workflow
+    # Must NOT tell agent to match branches against '[bot]' strings
+    assert "[bot]" not in workflow.split("list_branches")[1].split(".")[0]
 
 
 def test_sandbox_workflow_no_shell_operators() -> None:

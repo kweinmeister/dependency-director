@@ -3,9 +3,11 @@
 import contextlib
 import inspect
 import json
+import os
 import shlex
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +15,8 @@ from google.antigravity import LocalAgentConfig
 
 from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH
 from dependency_director.tools import (
+    CommandResult,
+    SandboxedCommandRunner,
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
@@ -1006,3 +1010,35 @@ async def test_compound_runner_stops_on_failure(tmp_path: Path, async_fs: type[A
     result = await run_command('python3 -c "import sys; sys.exit(1)" && echo should_not_appear')
     assert "should_not_appear" not in result
     assert "EXIT CODE: 1" in result
+
+
+@pytest.mark.asyncio
+async def test_compound_runner_error_string_is_failure(tmp_path: Path) -> None:
+    """Error strings (no EXIT CODE marker) must be treated as failure in && chains.
+
+    _run_single_argv can return strings like "Error: Command timed out..." or
+    "Error: Failed to create temporary config..." that lack an EXIT CODE marker.
+    These must short-circuit && chains, not be treated as success.
+    """
+    call_count = 0
+    call_args: list[list[str]] = []
+
+    async def mock_run(_self: Any, argv: list[str], _cwd: str) -> CommandResult:
+        nonlocal call_count
+        call_count += 1
+        call_args.append(argv)
+        if call_count == 1:
+            return CommandResult("Error: Command timed out after 300 seconds.", -1)
+        return CommandResult("--- STDOUT ---\nsecond\n--- EXIT CODE: 0 ---", 0)
+
+    workspace = str(tmp_path / "workspace")
+    os.makedirs(workspace)
+
+    with patch.object(SandboxedCommandRunner, "_run_single_argv", mock_run):
+        run_command = create_run_command_tool(workspace)
+        result = await run_command("echo first && echo second")
+
+    assert "Error: Command timed out" in result
+    assert "echo second" not in result  # second command output must not appear
+    assert call_count == 1  # second command was never called
+    assert call_args == [["echo", "first"]]
