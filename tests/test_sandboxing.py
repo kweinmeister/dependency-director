@@ -3,7 +3,6 @@
 import contextlib
 import inspect
 import json
-import os
 import shlex
 import tempfile
 from pathlib import Path
@@ -347,6 +346,7 @@ async def test_sandbox_sensitive_env_stripped(
     monkeypatch.setenv("GEMINI_API_KEY", "secret_gemini")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret_aws")
     monkeypatch.setenv("STRIPE_API_KEY", "secret_stripe")
+    monkeypatch.setenv("VIRTUAL_ENV", "/some/host/project/.venv")
     monkeypatch.setenv("LANG", "custom_lang")
     run_command = create_run_command_tool(workspace)
     mock_process = AsyncMock()
@@ -361,6 +361,7 @@ async def test_sandbox_sensitive_env_stripped(
         assert "GEMINI_API_KEY" not in called_env
         assert "AWS_SECRET_ACCESS_KEY" not in called_env
         assert "STRIPE_API_KEY" not in called_env
+        assert "VIRTUAL_ENV" not in called_env
         assert called_env.get("LANG") == "custom_lang"
 
 
@@ -509,6 +510,27 @@ async def test_sandbox_timeout_sandboxed(tmp_path: Path, async_fs: type[AsyncFSH
         mock_process.kill.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_sandbox_timeout_custom(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
+    """Verify that a custom command_timeout is respected."""
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), command_timeout=600)
+    mock_process = AsyncMock()
+    mock_process.kill = MagicMock()
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_process),
+        patch("asyncio.wait_for", side_effect=TimeoutError("Mocked timeout")) as mock_wait,
+    ):
+        res = await run_command("echo test")
+        assert "Error: Command timed out after 600 seconds." in res
+        # Verify the actual timeout value passed to wait_for
+        mock_wait.assert_called_once()
+        assert mock_wait.call_args[1]["timeout"] == 600
+
+
 def test_ripgrep_and_srt_availability() -> None:
     """Verify that ripgrep and srt are available in the current environment."""
     with patch("subprocess.run") as mock_run:
@@ -597,7 +619,7 @@ def test_validate_sandboxed_command_rules(command_line: str, expected_error: str
 )
 def test_validate_argv_exec_pivots(argv: list[str], expected_error: str) -> None:
     """Verify find -exec/-execdir/-ok pivots are blocked."""
-    res = validate_argv(argv, "/tmp")
+    res = validate_argv(argv, "/tmp")  # noqa: S108
     assert res is not None
     assert expected_error in res
 
@@ -1013,7 +1035,7 @@ async def test_compound_runner_stops_on_failure(tmp_path: Path, async_fs: type[A
 
 
 @pytest.mark.asyncio
-async def test_compound_runner_error_string_is_failure(tmp_path: Path) -> None:
+async def test_compound_runner_error_string_is_failure(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
     """Error strings (no EXIT CODE marker) must be treated as failure in && chains.
 
     _run_single_argv can return strings like "Error: Command timed out..." or
@@ -1032,7 +1054,7 @@ async def test_compound_runner_error_string_is_failure(tmp_path: Path) -> None:
         return CommandResult("--- STDOUT ---\nsecond\n--- EXIT CODE: 0 ---", 0)
 
     workspace = str(tmp_path / "workspace")
-    os.makedirs(workspace)
+    await async_fs.mkdir(workspace)
 
     with patch.object(SandboxedCommandRunner, "_run_single_argv", mock_run):
         run_command = create_run_command_tool(workspace)

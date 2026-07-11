@@ -287,7 +287,8 @@ async def test_tool_get_pr_status_conflict(mock_client: MagicMock, get_pr_status
     result = json.loads(result_str)
     assert result["mergeable"] is False
     assert result["mergeable_state"] == "dirty"
-    assert result["ci_status"] == "CONFLICT"
+    assert result["merge_status"] == "CONFLICT"
+    assert result["ci_status"] == "NONE"  # No checks ran, CI is unknown
 
 
 @pytest.mark.asyncio
@@ -379,7 +380,139 @@ async def test_check_ci_legacy_error_state_is_red() -> None:
         },
     )
 
-    ci_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
+    ci_status, merge_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
     result = json.loads(result_json)
     assert ci_status == "RED", f"Expected RED but got {ci_status}"
     assert result["ci_status"] == "RED"
+    assert merge_status == "CLEAN"
+
+
+# --- Issue #1: CONFLICT must not overwrite ci_status ---
+
+
+@pytest.mark.asyncio
+async def test_check_ci_conflict_preserves_green_ci() -> None:
+    """When PR has merge conflict but CI is green, ci_status must remain GREEN.
+
+    Previously, CONFLICT unconditionally overwrote ci_status. Now ci_status
+    and merge_status are separate: ci_status reflects CI pass/fail while
+    merge_status reflects mergeability.
+    """
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "bump something",
+            "head": {"sha": "abc123"},
+            "mergeable": False,
+            "mergeable_state": "dirty",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={
+            "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+        },
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    ci_status, merge_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
+    result = json.loads(result_json)
+    assert ci_status == "GREEN", f"Expected GREEN but got {ci_status}"
+    assert merge_status == "CONFLICT"
+    assert result["ci_status"] == "GREEN"
+    assert result["merge_status"] == "CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_check_ci_conflict_preserves_red_ci() -> None:
+    """When PR has merge conflict AND CI is red, both statuses must reflect their state."""
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "bump something",
+            "head": {"sha": "abc123"},
+            "mergeable": False,
+            "mergeable_state": "dirty",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={
+            "check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}],
+        },
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    ci_status, merge_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
+    result = json.loads(result_json)
+    assert ci_status == "RED"
+    assert merge_status == "CONFLICT"
+    assert result["ci_status"] == "RED"
+    assert result["merge_status"] == "CONFLICT"
+
+
+# --- Issue #2: completed + null conclusion must NOT be PENDING ---
+
+
+@pytest.mark.asyncio
+async def test_check_ci_completed_null_conclusion_not_pending() -> None:
+    """A check run with status=completed and conclusion=None must not be PENDING.
+
+    GitHub returns this for skipped/neutral checks. Previously, the
+    'or conclusion is None' clause classified these as pending, causing
+    wait_for_ci to poll all 10 retries pointlessly.
+    """
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "bump something",
+            "head": {"sha": "abc123"},
+            "mergeable": True,
+            "mergeable_state": "clean",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={
+            "check_runs": [
+                {"name": "ci", "status": "completed", "conclusion": "success"},
+                {"name": "skipped-check", "status": "completed", "conclusion": None},
+            ],
+        },
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    ci_status, merge_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
+    result = json.loads(result_json)
+    assert ci_status == "GREEN", f"Expected GREEN but got {ci_status} (null conclusion treated as pending)"
+    assert merge_status == "CLEAN"
+    assert result["ci_status"] == "GREEN"
+
+
+# --- Issue #6: head_sha must be included in _check_ci response ---
+
+
+@pytest.mark.asyncio
+async def test_check_ci_includes_head_sha() -> None:
+    """The _check_ci JSON response must include head_sha for debugging."""
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "bump something",
+            "head": {"sha": "deadbeef123"},
+            "mergeable": True,
+            "mergeable_state": "clean",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={
+            "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+        },
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    _ci_status, _merge_status, result_json = await _check_ci(mock_client, "owner", "repo", 42)
+    result = json.loads(result_json)
+    assert "head_sha" in result, "head_sha must be present in _check_ci response"
+    assert result["head_sha"] == "deadbeef123"

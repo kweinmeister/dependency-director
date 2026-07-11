@@ -9,6 +9,7 @@ import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import click
 import httpx
@@ -20,6 +21,7 @@ from rich.panel import Panel
 from rich.theme import Theme
 
 from dependency_director.config import (
+    BotConfig,
     Settings,
     get_dry_run_policies,
     get_safety_policies,
@@ -88,15 +90,15 @@ def _cleanup_workspace(workspace_dir: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-async def _check_open_bot_prs(repo: str, settings: Settings) -> list[dict[str, Any]]:
-    owner, repo_name = repo.split("/", 1)
-    client = GitHubClient(token=settings.github_token)
-    try:
-        open_prs = await client.list_open_prs(owner, repo_name)
-        allowed_authors = {b.author for b in settings.bots}
-        return [pr for pr in open_prs if pr.get("author") in allowed_authors]
-    finally:
-        await client.close()
+async def _check_open_bot_prs(
+    owner: str,
+    repo_name: str,
+    client: GitHubClient,
+    bots: list[BotConfig],
+) -> list[dict[str, Any]]:
+    open_prs = await client.list_open_prs(owner, repo_name)
+    allowed_authors = {b.author for b in bots}
+    return [pr for pr in open_prs if pr.get("author") in allowed_authors]
 
 
 async def _render_agent_response(response: types.ChatResponse) -> None:
@@ -162,8 +164,30 @@ async def _prepare_agent_environment(
             workspace_tmp,
             srt_settings_path=settings.srt_settings,
             github_token=settings.github_token,
+            command_timeout=settings.command_timeout,
         )
     return workspace_tmp, policies, run_command
+
+
+def _build_agent_prompt(  # noqa: PLR0913
+    owner: str,
+    repo_name: str,
+    settings: Settings,
+    workspace_tmp: str,
+    *,
+    dry_run: bool,
+    hint: str | None,
+) -> str:
+    """Build the prompt string to send to the agent."""
+    bot_names = ", ".join(b.author for b in settings.bots)
+    prompt = f"Process all open dependency update PRs (authored by {bot_names}) for '{owner}/{repo_name}'."
+    if not settings.no_sandbox:
+        prompt += f" Workspace directory: {workspace_tmp}"
+    if dry_run:
+        prompt += " Perform this run in DRY-RUN mode (simulate all merge and push actions)."
+    if hint:
+        prompt += f" Additional context: {hint}"
+    return prompt
 
 
 async def run_agent_for_repo(  # noqa: PLR0913
@@ -211,7 +235,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
         )
 
         owner, repo_name = repo.split("/", 1)
-        bot_prs = await _check_open_bot_prs(repo, settings)
+        bot_prs = await _check_open_bot_prs(owner, repo_name, client, settings.bots)
 
         if not bot_prs:
             click.echo("Open Pull Requests (Initial List)\n")
@@ -282,18 +306,14 @@ async def run_agent_for_repo(  # noqa: PLR0913
             bold=True,
         )
         async with Agent(config=config) as agent:
-            bot_names = ", ".join(b.author for b in settings.bots)
-            prompt = f"Process all open dependency update PRs (authored by {bot_names}) for '{owner}/{repo_name}'."
-
-            if not settings.no_sandbox:
-                prompt += f" Workspace directory: {workspace_tmp}"
-
-            if dry_run:
-                prompt += " Perform this run in DRY-RUN mode (simulate all merge and push actions)."
-
-            if hint:
-                prompt += f" Additional context: {hint}"
-
+            prompt = _build_agent_prompt(
+                owner,
+                repo_name,
+                settings,
+                workspace_tmp,
+                dry_run=dry_run,
+                hint=hint,
+            )
             wrapped_prompt = textwrap.fill(
                 prompt,
                 width=100,
@@ -302,8 +322,15 @@ async def run_agent_for_repo(  # noqa: PLR0913
             )
             click.secho(wrapped_prompt, fg="blue")
 
-            response = await agent.chat(prompt)
-            await _render_agent_response(response)
+            try:
+                response = await agent.chat(prompt)
+                await _render_agent_response(response)
+            except Exception:
+                logger.exception("Agent execution failed for %s", repo)
+                console.print(
+                    f"\n[bold red]❌ Agent execution failed for {repo} (see log above).[/bold red]",
+                )
+                return
 
             console.print(
                 f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
@@ -541,6 +568,44 @@ def _check_sandbox_requirements(*, verify_all: bool, no_sandbox: bool) -> None:
         )
 
 
+def _parse_target_string(s: str, target: str) -> tuple[str, str | None]:
+    """Parse a cleaned target string into (owner, full_repo | None).
+
+    Handles SSH (git@), URL (https://), bare github.com/, and plain owner/repo formats.
+    Raises click.UsageError on invalid input.
+    """
+    if "git@" in s and ":" in s:
+        # e.g., git@github.com:owner/repo
+        _, path = s.split(":", 1)
+        target_path = path
+    elif "://" in s:
+        # e.g., https://github.com/owner/repo
+        parsed = urlparse(s)
+        target_path = parsed.path.lstrip("/")
+    elif s.startswith("github.com/"):
+        target_path = s[len("github.com/") :]
+    else:
+        target_path = s
+
+    if "/" in target_path:
+        owner, repo_part = target_path.split("/", 1)
+        if not repo_part:
+            msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
+            raise click.UsageError(msg)
+        # Strip trailing slash but reject further nested paths
+        repo_part = repo_part.rstrip("/")
+        if not repo_part or "/" in repo_part:
+            msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
+            raise click.UsageError(msg)
+        return owner, f"{owner}/{repo_part}"
+
+    if not target_path:
+        msg = f"Invalid target '{target}'."
+        raise click.UsageError(msg)
+
+    return target_path, None
+
+
 def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str, str | None]:
     """Resolve the owner and repository targets from the input string."""
     if not target:
@@ -561,40 +626,7 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     if is_url:
         s = s.rstrip("/")
 
-    # Parse scheme/URL or SSH formats to get target_path
-    if "git@" in s and ":" in s:
-        # e.g., git@github.com:owner/repo
-        _, path = s.split(":", 1)
-        target_path = path
-    elif "://" in s:
-        # e.g., https://github.com/owner/repo
-        from urllib.parse import urlparse
-
-        parsed = urlparse(s)
-        target_path = parsed.path.lstrip("/")
-    elif s.startswith("github.com/"):
-        target_path = s[len("github.com/") :]
-    else:
-        target_path = s
-
-    # Validate and split target_path
-    if "/" in target_path:
-        owner, repo_part = target_path.split("/", 1)
-        if not repo_part:
-            msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
-            raise click.UsageError(msg)
-        # Ensure we don't have further nested directories, but strip trailing slash first
-        repo_part = repo_part.rstrip("/")
-        if not repo_part or "/" in repo_part:
-            msg = f"Invalid target '{target}'. Use 'owner/repo' format or just 'owner' to scan all repos."
-            raise click.UsageError(msg)
-        return owner, f"{owner}/{repo_part}"
-
-    if not target_path:
-        msg = f"Invalid target '{target}'."
-        raise click.UsageError(msg)
-
-    return target_path, None
+    return _parse_target_string(s, target)
 
 
 @click.command()

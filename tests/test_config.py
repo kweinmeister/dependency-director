@@ -14,8 +14,9 @@ from google.antigravity.hooks import hooks, policy
 from google.antigravity.types import BuiltinTools
 from pydantic import ValidationError
 
-from dependency_director.config import DEFAULT_BOTS, Settings, get_dry_run_policies, get_safety_policies
-from dependency_director.main import run_agent_for_repo
+from dependency_director.config import DEFAULT_BOTS, BotConfig, Settings, get_dry_run_policies, get_safety_policies
+from dependency_director.main import _check_open_bot_prs, run_agent_for_repo
+from dependency_director.tools import GitHubClient
 
 from .conftest import AsyncFSHelper
 
@@ -549,3 +550,80 @@ async def test_run_agent_for_repo_early_halt(
         assert "No open dependency update PRs were found for test-owner/test-repo" in captured.out
         assert "Final Summary" not in captured.out
         assert "No dependency update PRs were processed." not in captured.out
+
+
+# --- Issue #7: _check_open_bot_prs uses provided client ---
+
+
+@pytest.mark.asyncio
+async def test_check_open_bot_prs_uses_provided_client() -> None:
+    """_check_open_bot_prs must use the provided GitHubClient, not create its own.
+
+    This eliminates the redundant client creation that happened on every repo.
+    """
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.list_open_prs = AsyncMock(
+        return_value=[
+            {"number": 1, "title": "bump foo", "author": "dependabot[bot]", "created_at": "2026-01-01"},
+            {"number": 2, "title": "bump bar", "author": "human-user", "created_at": "2026-01-02"},
+            {"number": 3, "title": "bump baz", "author": "renovate[bot]", "created_at": "2026-01-03"},
+        ],
+    )
+
+    result = await _check_open_bot_prs("owner", "repo", mock_client, DEFAULT_BOTS)
+
+    mock_client.list_open_prs.assert_called_once_with("owner", "repo")
+    assert len(result) == 2
+    assert result[0]["number"] == 1
+    assert result[1]["number"] == 3
+
+
+@pytest.mark.asyncio
+async def test_check_open_bot_prs_filters_by_custom_bots() -> None:
+    """_check_open_bot_prs must respect the provided bots list for filtering."""
+    mock_client = MagicMock(spec=GitHubClient)
+    mock_client.list_open_prs = AsyncMock(
+        return_value=[
+            {"number": 1, "title": "bump foo", "author": "dependabot[bot]", "created_at": "2026-01-01"},
+            {"number": 2, "title": "bump bar", "author": "custom[bot]", "created_at": "2026-01-02"},
+        ],
+    )
+    custom_bots = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
+
+    result = await _check_open_bot_prs("owner", "repo", mock_client, custom_bots)
+
+    assert len(result) == 1
+    assert result[0]["number"] == 2
+
+
+# --- Issue #3: agent.chat error does not crash multi-repo sweep ---
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_chat_error_does_not_crash(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """A transient error from agent.chat() must not crash the entire run.
+
+    It should log the error and complete gracefully so multi-repo sweeps
+    continue processing the remaining repositories.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    mock_agent_instance = mock_agent_class.return_value
+    mock_agent_instance.chat = AsyncMock(side_effect=RuntimeError("Model produced invalid output"))
+
+    # Must not raise — the error should be caught and logged
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )

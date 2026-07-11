@@ -24,6 +24,7 @@ DEFAULT_BOTS: list[BotConfig] = [
     BotConfig(author="dependabot[bot]", rebase_command="@dependabot rebase"),
     BotConfig(author="renovate[bot]", rebase_command="@renovatebot rebase"),
 ]
+DEFAULT_COMMAND_TIMEOUT = 300
 DEFAULT_SRT_SETTINGS_PATH: str = str(
     importlib.resources.files("dependency_director") / "srt-settings.json",
 )
@@ -80,7 +81,6 @@ SAFE_ENV_ALLOWLIST: set[str] = {
     "USER",
     "UV_EXTRA_INDEX_URL",
     "UV_INDEX_URL",
-    "VIRTUAL_ENV",
     "XDG_RUNTIME_DIR",
 }
 
@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     srt_settings: str = Field(
         default="",
         validation_alias="depdirector_srt_settings",
+    )
+    command_timeout: int = Field(
+        default=DEFAULT_COMMAND_TIMEOUT,
+        ge=10,
+        validation_alias="depdirector_command_timeout",
     )
 
     model_config = SettingsConfigDict(

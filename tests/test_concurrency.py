@@ -420,7 +420,7 @@ async def test_get_repositories_authenticated_owner(github_token: str) -> None:
     mock_repos_empty = MagicMock()
     mock_repos_empty.status_code = 200
     mock_repos_empty.json.return_value = []
-    calls = []
+    calls: list[Any] = []
 
     def side_effect(url: Any, *_args: Any, **_kwargs: Any) -> Any:
         calls.append(url)
@@ -454,7 +454,7 @@ async def test_get_repositories_other_owner(github_token: str) -> None:
     mock_repos_empty = MagicMock()
     mock_repos_empty.status_code = 200
     mock_repos_empty.json.return_value = []
-    calls = []
+    calls: list[Any] = []
 
     def side_effect(url: Any, *_args: Any, **_kwargs: Any) -> Any:
         calls.append(url)
@@ -487,7 +487,7 @@ async def test_get_repositories_user_endpoint_fails(github_token: str) -> None:
     mock_repos_empty = MagicMock()
     mock_repos_empty.status_code = 200
     mock_repos_empty.json.return_value = []
-    calls = []
+    calls: list[Any] = []
 
     def side_effect(url: Any, *_args: Any, **_kwargs: Any) -> Any:
         calls.append(url)
@@ -545,7 +545,7 @@ async def test_get_repositories_user_repos_404_fallback(github_token: str) -> No
     mock_empty = MagicMock()
     mock_empty.status_code = 200
     mock_empty.json.return_value = []
-    calls = []
+    calls: list[Any] = []
 
     def side_effect(url: Any, *_args: Any, **_kwargs: Any) -> Any:
         calls.append(str(url))
@@ -582,7 +582,7 @@ async def test_get_repositories_token_caching(github_token: str) -> None:
     mock_empty = MagicMock()
     mock_empty.status_code = 200
     mock_empty.json.return_value = []
-    calls = []
+    calls: list[Any] = []
 
     def side_effect(url: Any, *_args: Any, **_kwargs: Any) -> Any:
         calls.append(str(url))
