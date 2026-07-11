@@ -50,6 +50,7 @@ def get_system_instructions(  # noqa: PLR0913
             f"- Only process PRs authored by {bot_authors_quoted}.\n"
             "- NO-SANDBOX mode: No shell access. MUST NOT clone repositories or edit code. "
             "Only merge green PRs or rebase via host tools.\n"
+            "- Do NOT read or view any skill files — no code fixing is performed in this mode.\n"
             "- Trust tool outputs (e.g. 'list_bot_prs'). Do NOT search, browse, or inspect "
             "the host environment, files, or directories (e.g. tests, conftest.py, .env)."
         )
@@ -57,15 +58,18 @@ def get_system_instructions(  # noqa: PLR0913
             "1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs. "
             "If none are found, halt immediately and exit.\n"
             "2. Check status via 'get_pr_status(owner, repo, pr_number)'.\n"
-            "   - GREEN: ci_status='GREEN', mergeable=True, mergeable_state='clean'.\n"
-            "   - CONFLICT: ci_status='CONFLICT' or mergeable=False.\n"
+            "   - GREEN: ci_status='GREEN', merge_status='CLEAN'.\n"
+            "   - CONFLICT: merge_status='CONFLICT' (regardless of ci_status).\n"
             "   - RED: ci_status='RED'.\n"
             "   - PENDING: Poll status every 30s (max 10x). Skip if still pending.\n"
             "3. Process PRs oldest-to-newest:\n"
             "   - GREEN: Call merge_bot_pr(owner, repo, pr_number). Stop on failure (Do NOT clone).\n"
             "   - CONFLICT: Call rebase_bot_pr if edited only by bot, then skip to the next PR "
             "(Dependabot processes rebases asynchronously). Else skip.\n"
-            "   - RED: Skip, log '✗ #<pr> cannot be fixed in non-sandboxed mode'."
+            "   - RED: Skip, log '✗ #<pr> cannot be fixed in non-sandboxed mode'.\n"
+            "4. Rebase re-check: after all PRs are processed, for each PR that was rebased "
+            "in step 3, call 'get_pr_status' once. If ci_status='GREEN' and merge_status='CLEAN', "
+            "merge via 'merge_bot_pr'. Otherwise leave as-is (rebase may still be in progress)."
         )
     else:
         guardrails_content = (
@@ -76,39 +80,41 @@ def get_system_instructions(  # noqa: PLR0913
             "- To set environment variables for a command, use 'env KEY=val cmd args...', "
             "not 'KEY=val cmd args...' (the latter is shell syntax that srt's argv mode does not support).\n"
             "- Network is restricted to package registries (PyPI, npm, crates.io) and GitHub.\n"
+            "- Do NOT read skill files until you encounter a RED PR that requires code changes. "
+            "For GREEN and CONFLICT PRs, skills are not needed.\n"
             "- Trust tool outputs (e.g. 'list_bot_prs'). Do NOT search, browse, or inspect "
             "the host environment, files, or directories (e.g. tests, conftest.py, .env)."
         )
         workflow_content = (
-            "1. Call 'list_bot_prs(owner, repo)' to list open dependency-bot PRs. "
-            "If none are found, halt immediately and exit.\n"
-            "2. Check status via 'get_pr_status(owner, repo, pr_number)'. Do NOT retrieve logs here "
-            "(only for RED PRs).\n"
-            "   - GREEN: ci_status='GREEN', mergeable=True, mergeable_state='clean'.\n"
-            "   - CONFLICT: ci_status='CONFLICT' or mergeable=False.\n"
+            "1. Call 'list_bot_prs(owner, repo)'. If none, halt and exit.\n"
+            "2. Check status via 'get_pr_status(owner, repo, pr_number)'. "
+            "Do NOT retrieve logs here (only for RED PRs).\n"
+            "   - GREEN: ci_status='GREEN', merge_status='CLEAN'.\n"
+            "   - CONFLICT: merge_status='CONFLICT' (regardless of ci_status).\n"
             "   - RED: ci_status='RED'.\n"
             "   - PENDING: Poll status every 30s (max 10x). Skip if still pending.\n"
-            "3. Process PRs strictly oldest-to-newest (do NOT reorder to fast-track green PRs):\n"
-            "   - GREEN: Call merge_bot_pr immediately (no cloning needed). Stop on failure.\n"
+            "3. Process PRs oldest-to-newest (do NOT reorder):\n"
+            "   - GREEN: Call merge_bot_pr (no cloning needed). Stop on failure.\n"
             "   - CONFLICT: If edited only by bot, call rebase_bot_pr then skip to the next PR "
             "(Dependabot processes rebases asynchronously). Else clone to <workspace_dir>/<repo_name>, merge main, "
             "resolve conflicts, test, push.\n"
-            "   - RED: Retrieve logs via 'get_pr_workflow_run_logs'. "
-            "Then call 'get_pr_diff(owner, repo, pr_number)' and 'get_pr_files(owner, repo, pr_number)' "
-            "to identify changed files and understand the scope of the update before cloning. "
-            "Clone (only if not already cloned) into a subdirectory: 'git clone <url> <workspace_dir>/<repo_name>' "
-            "then checkout the PR branch using two separate run_command_sandboxed calls: "
-            "first 'git fetch origin pull/<pr_number>/head:pr-<pr_number>', "
-            "then 'git checkout pr-<pr_number>'. "
-            "Find the remote branch name for pushing by calling 'list_branches(owner, repo)' "
-            f"and matching branches that start with one of the bot prefixes ({bot_prefixes_quoted}), "
-            "then strip 'origin/' prefix for the push target. "
-            "If dependency installation fails with a network error or 401, "
-            "skip the PR and log: '✗ #<n> skipped: dependency registry unavailable in sandbox'. "
-            f"Otherwise install deps, test, fix, verify, and: {fix_strategy}\n"
+            "   - RED: Get logs via 'get_pr_workflow_run_logs', "
+            "then 'get_pr_diff' and 'get_pr_files' to understand scope before cloning. "
+            "Clone (if not already) to '<workspace_dir>/<repo_name>', "
+            "then 'git fetch origin pull/<pr_number>/head:pr-<pr_number>' "
+            "and 'git checkout pr-<pr_number>' (two separate calls). "
+            "Find remote branch name via 'list_branches(owner, repo)', "
+            f"match prefixes ({bot_prefixes_quoted}), strip 'origin/' for push target. "
+            "Run 'uv sync' as a separate step (avoids hidden timeouts inside 'uv run'). "
+            "If sync times out or fails with network error/401, "
+            "skip and log: '✗ #<n> skipped: dependency registry unavailable in sandbox'. "
+            f"Then test, fix, verify, and: {fix_strategy}\n"
             f"4. Max {max_attempts} fix attempts per RED PR before skipping.\n"
-            "5. Before committing, briefly self-review: no suppressed errors (type: ignore, noqa), "
-            "no debug artifacts, no unrelated changes, commit message is concise and descriptive."
+            "5. self-review before commit: no suppressed errors (type: ignore, noqa), "
+            "no debug artifacts, no unrelated changes, concise commit message.\n"
+            "6. Rebase re-check: after all PRs are processed, for each PR that was rebased "
+            "in step 3, call 'get_pr_status' once. If ci_status='GREEN' and merge_status='CLEAN', "
+            "merge via 'merge_bot_pr'. Otherwise leave as-is (rebase may still be in progress)."
         )
 
     # Sections are ordered for optimal implicit caching: stable content first,
@@ -127,12 +133,10 @@ def get_system_instructions(  # noqa: PLR0913
         types.SystemInstructionSection(
             title="post_action_checks",
             content=(
-                "- After merging a PR or pushing a fix, use 'wait_for_ci(owner, repo, pr_number)' "
-                "on the next PR to verify its CI status before acting on it. "
-                "This tool polls automatically with backoff — do NOT use 'sleep', "
-                "do NOT call 'get_pr_status' in a loop, and do NOT poll manually.\n"
-                "- If wait_for_ci reports CONFLICT after a merge, rebase or fix as appropriate.\n"
-                "- If still pending after timeout, report 'CI pending' and proceed to the next PR."
+                "- After merging or pushing a fix, call 'wait_for_ci(owner, repo, pr_number)' "
+                "on the next PR. Do NOT call it on the first PR — status already known from get_pr_status.\n"
+                "- Polls automatically with backoff — do NOT use 'sleep' or poll manually.\n"
+                "- CONFLICT after merge: rebase or fix. Still pending after timeout: log 'CI pending', proceed."
             ),
         ),
     ]
@@ -150,10 +154,10 @@ def get_system_instructions(  # noqa: PLR0913
             types.SystemInstructionSection(
                 title="merging_green_prs",
                 content=(
-                    "When a PR is GREEN, merge it directly via 'merge_bot_pr' without cloning or testing. "
-                    "Between sequential merges, call 'wait_for_ci(owner, repo, next_pr_number)' on the next PR "
-                    "to re-check its status (a prior merge can introduce conflicts or reset CI). "
-                    "Stop immediately if merge fails for any reason other than a conflict."
+                    "GREEN PRs: merge via 'merge_bot_pr' without cloning or testing. "
+                    "Between merges, call 'wait_for_ci' on the next PR "
+                    "(prior merge can introduce conflicts or reset CI). "
+                    "Stop if merge fails for any reason other than a conflict."
                 ),
             ),
         )
@@ -162,7 +166,13 @@ def get_system_instructions(  # noqa: PLR0913
         sections.append(
             types.SystemInstructionSection(
                 title="auto_merge_mode",
-                content="Merge fix PRs using 'merge_bot_pr' once CI turns green.",
+                content=(
+                    "Merge fix PRs using 'merge_bot_pr' once CI turns green.\n"
+                    "After fixing and merging a RED PR, rebase all remaining RED PRs "
+                    "using 'rebase_bot_pr' before continuing with individual fixes. "
+                    "This propagates the fix via main — re-check each with 'get_pr_status' "
+                    "and merge any that turned GREEN. Only clone and fix those still RED."
+                ),
             ),
         )
     else:
@@ -181,11 +191,10 @@ def get_system_instructions(  # noqa: PLR0913
             types.SystemInstructionSection(
                 title="dry_run_mode",
                 content=(
-                    "Dry-run mode: Call all tools normally — the safety policies enforce simulation "
-                    "automatically and no real changes will occur. Do not skip, avoid, or work around tool calls. "
-                    "Treat tool responses marked [DRY-RUN] as if the action succeeded for the purpose of deciding "
-                    "what to do next. Since no real merges occur, do NOT re-check PR status between merges — "
-                    "proceed directly to the next PR."
+                    "Dry-run mode: Call all tools normally — safety policies enforce simulation automatically. "
+                    "Do not skip or avoid tool calls. "
+                    "Treat [DRY-RUN] responses as success when deciding next steps. "
+                    "No real merges occur, so do NOT re-check PR status between merges."
                 ),
             ),
         )
@@ -206,9 +215,9 @@ def get_system_instructions(  # noqa: PLR0913
         types.SystemInstructionSection(
             title="output_format",
             content=(
-                "- Do NOT announce actions before execution. State reasons if halting early.\n"
-                "- Minimize conversational output. Do not describe your reasoning, internal state, or plans; "
-                "only output the sequential CLI logs and final summary.\n"
+                "- Do NOT announce actions before execution. State reasons only if halting early.\n"
+                "- Minimize output. No reasoning, internal state, or plans — only CLI logs and final summary.\n"
+                "- Do NOT create artifact files (e.g. processing_summary.md). All output goes to stdout only.\n"
                 "- Emit output sequentially as you work (not as one block at the end). Format CLI output as:\n"
                 "  1. Initial list of open PRs with statuses (GREEN/RED/CONFLICT).\n"
                 "  2. Execution prefix: '→ Merging #12 (green)' or '→ Fixing #14 (failing CI)'.\n"

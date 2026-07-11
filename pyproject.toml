@@ -14,6 +14,9 @@ dependencies = [
     "rich>=15.0.0",
 ]
 
+[project.scripts]
+depdirector = "dependency_director.main:cli"
+
 [dependency-groups]
 dev = [
     "mypy>=1.12.0",
@@ -24,12 +27,12 @@ dev = [
     "ty>=0.0.56",
 ]
 
-[tool.pyrefly.errors]
-bad-override-mutable-attribute = "ignore"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.pytest.ini_options]
-addopts = "--cov=dependency_director --cov-report=term-missing --durations=10"
-asyncio_mode = "auto"
+[tool.hatch.build.targets.wheel]
+packages = ["src/dependency_director"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -38,29 +41,28 @@ strict = true
 disallow_untyped_decorators = false
 python_executable = ".venv/bin/python"
 
+[tool.pyrefly]
+python-version = "3.13.0"
+ignore-missing-imports = ["*"]
 
+[tool.pyrefly.errors]
+bad-override-mutable-attribute = "ignore"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
 
-[project.scripts]
-depdirector = "dependency_director.main:cli"
+[tool.pytest.ini_options]
+addopts = "--cov=dependency_director --cov-report=term-missing --durations=10"
+asyncio_mode = "auto"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/dependency_director"]
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "SLF001", "PLR", "ANN401"]
 
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "PLR2004", "SLF001", "PLR", "ANN401"]
-[tool.ruff]
-line-length = 120
-
-[tool.pyrefly]
-python-version = "3.13.0"
-ignore-missing-imports = ["*"]
-
