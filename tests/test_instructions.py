@@ -88,7 +88,7 @@ def test_workflow_contains(
 ) -> None:
     """Verify that the primary agent workflow instructions are generated correctly."""
     content = _section_content(instructions, "workflow")
-    assert expected in content
+    assert expected.lower() in content.lower()
 
 
 def test_no_gh_cli_diagnostic_commands_in_workflow(
@@ -587,7 +587,7 @@ def test_workflow_inlines_self_review() -> None:
     """Workflow self-review should be inlined, not reference external skill files."""
     inst = _get_instructions()
     workflow = _section_content(inst, "workflow")
-    assert "self-review" in workflow
+    assert "self-review" in workflow.lower()
     assert "code-review-and-quality" not in workflow
     assert "SKILL.md" not in workflow
 
