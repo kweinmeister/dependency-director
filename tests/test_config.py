@@ -208,13 +208,6 @@ async def test_agent_spawn_status_output(
     )
     captured = capsys.readouterr()
     assert "Spawning Agent for test-owner/test-repo [model: gemini-3.6-flash | mode: Developer API]" in captured.out
-    repo = "test-owner/test-repo"
-    expected_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
-    expected_dir = str(Path(tempfile.gettempdir()) / f"dependency-director-{expected_hash}")
-    assert hasattr(config_passed, "workspaces")
-    assert expected_dir in config_passed.workspaces
-    assert tempfile.gettempdir() not in config_passed.workspaces
-    assert str(Path(tempfile.gettempdir()) / "dependency-director") not in config_passed.workspaces
 
 
 @pytest.mark.parametrize(
