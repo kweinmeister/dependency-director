@@ -843,7 +843,7 @@ async def test_create_run_command_tool_agent_registration(tmp_path: Path, async_
     run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
 
     config = LocalAgentConfig(
-        model="gemini-3.5-flash",
+        model="gemini-3.6-flash",
         tools=[run_command],
         workspaces=[workspace],
     )

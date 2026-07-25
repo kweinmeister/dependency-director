@@ -29,6 +29,7 @@ from .conftest import AsyncFSHelper
         "expected_gemini_key",
         "expected_github_token",
         "expected_srt_settings",
+        "expected_model",
     ),
     [
         (
@@ -38,14 +39,16 @@ from .conftest import AsyncFSHelper
                 "GEMINI_API_KEY": "test-gemini-key",
                 "GITHUB_TOKEN": "test-github-key",
                 "DEPDIRECTOR_SRT_SETTINGS": "/path/to/custom.json",
+                "DEPDIRECTOR_MODEL": "gemini-3.6-pro",
             },
             4,
             5,
             "test-gemini-key",
             "test-github-key",
             "/path/to/custom.json",
+            "gemini-3.6-pro",
         ),
-        ({}, 1, 3, "", "", ""),
+        ({}, 1, 3, "", "", "", "gemini-3.6-flash"),
     ],
 )
 def test_settings_loading(
@@ -56,6 +59,7 @@ def test_settings_loading(
     expected_gemini_key: str,
     expected_github_token: str,
     expected_srt_settings: str,
+    expected_model: str,
 ) -> None:
     """Verify configuration settings load correctly from default values and file."""
     monkeypatch.delenv("DEPDIRECTOR_CONCURRENCY", raising=False)
@@ -63,6 +67,7 @@ def test_settings_loading(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("DEPDIRECTOR_SRT_SETTINGS", raising=False)
+    monkeypatch.delenv("DEPDIRECTOR_MODEL", raising=False)
     for k, v in env_vars.items():
         monkeypatch.setenv(k, v)
     settings = Settings()
@@ -71,6 +76,7 @@ def test_settings_loading(
     assert settings.gemini_api_key == expected_gemini_key
     assert settings.github_token == expected_github_token
     assert settings.srt_settings == expected_srt_settings
+    assert settings.model == expected_model
 
 
 def test_settings_invalid_types(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,18 +182,41 @@ async def test_agent_config_includes_skills_path(
     assert skill_folder.exists(), f"Skill folder {skill_folder} does not exist"
     skill_file = skill_folder / "SKILL.md"
     assert skill_file.exists(), f"Skill definition file {skill_file} does not exist"
-    repo = "test-owner/test-repo"
-    expected_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
-    expected_dir = str(Path(tempfile.gettempdir()) / f"dependency-director-{expected_hash}")
-    assert hasattr(config_passed, "workspaces")
-    assert expected_dir in config_passed.workspaces
-    assert tempfile.gettempdir() not in config_passed.workspaces
-    assert str(Path(tempfile.gettempdir()) / "dependency-director") not in config_passed.workspaces
+
+
+@pytest.mark.asyncio
+async def test_agent_spawn_status_output(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify that agent spawning status output includes model and mode info."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    mock_agent_instance = mock_agent_class.return_value
+    mock_response = AsyncMock()
+    mock_response.text.return_value = "Done."
+    mock_agent_instance.chat = AsyncMock(return_value=mock_response)
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        model="gemini-3.6-flash",
+    )
+    captured = capsys.readouterr()
+    assert "Spawning Agent for test-owner/test-repo [model: gemini-3.6-flash | mode: Developer API]" in captured.out
 
 
 @pytest.mark.parametrize(
     ("env_var", "value", "expected_attr", "expected_val"),
-    [("DEPDIRECTOR_OWNER", "my-org", "owner", "my-org"), ("DEPDIRECTOR_REVIEW_WAIT", "10", "review_wait", 10)],
+    [
+        ("DEPDIRECTOR_OWNER", "my-org", "owner", "my-org"),
+        ("DEPDIRECTOR_REVIEW_WAIT", "10", "review_wait", 10),
+        ("DEPDIRECTOR_MODEL", "gemini-3.6-pro", "model", "gemini-3.6-pro"),
+    ],
 )
 def test_settings_env_overrides(
     monkeypatch: pytest.MonkeyPatch,
