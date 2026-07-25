@@ -301,8 +301,10 @@ async def run_agent_for_repo(  # noqa: PLR0913
             ),
         )
 
+        effective_model = model or settings.model
+        mode_str = "Vertex AI" if settings.vertex else "Developer API"
         click.secho(
-            f"🚀 Spawning Antigravity Agent for {repo}...",
+            f"🚀 Spawning Agent for {repo} [model: {effective_model} | mode: {mode_str}]...",
             fg="cyan",
             bold=True,
         )

@@ -182,6 +182,32 @@ async def test_agent_config_includes_skills_path(
     assert skill_folder.exists(), f"Skill folder {skill_folder} does not exist"
     skill_file = skill_folder / "SKILL.md"
     assert skill_file.exists(), f"Skill definition file {skill_file} does not exist"
+
+
+@pytest.mark.asyncio
+async def test_agent_spawn_status_output(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify that agent spawning status output includes model and mode info."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    mock_agent_instance = mock_agent_class.return_value
+    mock_response = AsyncMock()
+    mock_response.text.return_value = "Done."
+    mock_agent_instance.chat = AsyncMock(return_value=mock_response)
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        model="gemini-3.6-flash",
+    )
+    captured = capsys.readouterr()
+    assert "Spawning Agent for test-owner/test-repo [model: gemini-3.6-flash | mode: Developer API]" in captured.out
     repo = "test-owner/test-repo"
     expected_hash = hashlib.sha256(repo.encode()).hexdigest()[:8]
     expected_dir = str(Path(tempfile.gettempdir()) / f"dependency-director-{expected_hash}")
