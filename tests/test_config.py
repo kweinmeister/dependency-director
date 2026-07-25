@@ -29,6 +29,7 @@ from .conftest import AsyncFSHelper
         "expected_gemini_key",
         "expected_github_token",
         "expected_srt_settings",
+        "expected_model",
     ),
     [
         (
@@ -38,14 +39,16 @@ from .conftest import AsyncFSHelper
                 "GEMINI_API_KEY": "test-gemini-key",
                 "GITHUB_TOKEN": "test-github-key",
                 "DEPDIRECTOR_SRT_SETTINGS": "/path/to/custom.json",
+                "DEPDIRECTOR_MODEL": "gemini-3.6-pro",
             },
             4,
             5,
             "test-gemini-key",
             "test-github-key",
             "/path/to/custom.json",
+            "gemini-3.6-pro",
         ),
-        ({}, 1, 3, "", "", ""),
+        ({}, 1, 3, "", "", "", "gemini-3.6-flash"),
     ],
 )
 def test_settings_loading(
@@ -56,6 +59,7 @@ def test_settings_loading(
     expected_gemini_key: str,
     expected_github_token: str,
     expected_srt_settings: str,
+    expected_model: str,
 ) -> None:
     """Verify configuration settings load correctly from default values and file."""
     monkeypatch.delenv("DEPDIRECTOR_CONCURRENCY", raising=False)
@@ -63,6 +67,7 @@ def test_settings_loading(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("DEPDIRECTOR_SRT_SETTINGS", raising=False)
+    monkeypatch.delenv("DEPDIRECTOR_MODEL", raising=False)
     for k, v in env_vars.items():
         monkeypatch.setenv(k, v)
     settings = Settings()
@@ -71,6 +76,7 @@ def test_settings_loading(
     assert settings.gemini_api_key == expected_gemini_key
     assert settings.github_token == expected_github_token
     assert settings.srt_settings == expected_srt_settings
+    assert settings.model == expected_model
 
 
 def test_settings_invalid_types(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,7 +193,11 @@ async def test_agent_config_includes_skills_path(
 
 @pytest.mark.parametrize(
     ("env_var", "value", "expected_attr", "expected_val"),
-    [("DEPDIRECTOR_OWNER", "my-org", "owner", "my-org"), ("DEPDIRECTOR_REVIEW_WAIT", "10", "review_wait", 10)],
+    [
+        ("DEPDIRECTOR_OWNER", "my-org", "owner", "my-org"),
+        ("DEPDIRECTOR_REVIEW_WAIT", "10", "review_wait", 10),
+        ("DEPDIRECTOR_MODEL", "gemini-3.6-pro", "model", "gemini-3.6-pro"),
+    ],
 )
 def test_settings_env_overrides(
     monkeypatch: pytest.MonkeyPatch,

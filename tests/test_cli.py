@@ -54,6 +54,37 @@ def test_cli_target_owner_repo(mock_run_agent: MagicMock) -> None:
 
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
+def test_cli_model_option(mock_run_agent: MagicMock) -> None:
+    """Verify CLI execution with explicit --model flag."""
+    runner = CliRunner()
+    with patch("dependency_director.main.Settings") as mock_settings_cls:
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.concurrency = 1
+        mock_settings.max_fix_attempts = 3
+        mock_settings.review_wait = 0
+        mock_settings.no_sandbox = False
+        mock_settings.model = "gemini-3.6-flash"
+
+        result = runner.invoke(cli, ["test-owner/some-repo", "--model", "gemini-3.6-pro"])
+
+        assert result.exit_code == 0
+        mock_run_agent.assert_called_once_with(
+            "test-owner",
+            1,
+            3,
+            "test-owner/some-repo",
+            dry_run=False,
+            auto_merge=False,
+            verify_all=False,
+            standalone_fix=False,
+            review_wait=0,
+            hint=None,
+            no_sandbox=False,
+            model="gemini-3.6-pro",
+        )
+
+
+@patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_target_owner_only(mock_run_agent: MagicMock) -> None:
     """Verify CLI execution when provided with an owner-only target."""
     runner = CliRunner()

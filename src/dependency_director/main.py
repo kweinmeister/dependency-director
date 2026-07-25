@@ -201,6 +201,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
     standalone_fix: bool = False,
     review_wait: int = 0,
     hint: str | None = None,
+    model: str | None = None,
 ) -> None:
     """Run the triage agent for a single GitHub repository."""
     client = GitHubClient(token=settings.github_token)
@@ -284,7 +285,7 @@ async def run_agent_for_repo(  # noqa: PLR0913
             agent_tools.append(run_command)
 
         config = LocalAgentConfig(
-            model="gemini-3.5-flash",
+            model=model or settings.model,
             vertex=settings.vertex or None,
             project=(settings.google_cloud_project or None) if settings.vertex else None,
             location=(settings.google_cloud_location or None) if settings.vertex else None,
@@ -415,6 +416,7 @@ async def run_agent(  # noqa: PLR0913
     review_wait: int = 0,
     hint: str | None = None,
     no_sandbox: bool = False,
+    model: str | None = None,
 ) -> None:
     """Run dependency-director triage and patch execution across repositories."""
     click.secho("⚙️  Initializing dependency-director configuration...", fg="cyan")
@@ -440,16 +442,22 @@ async def run_agent(  # noqa: PLR0913
         )
         await _validate_repo_accessibility(repo, settings.github_token)
 
+        repo_kwargs: dict[str, Any] = {
+            "dry_run": dry_run,
+            "auto_merge": auto_merge,
+            "verify_all": verify_all,
+            "standalone_fix": standalone_fix,
+            "review_wait": review_wait,
+            "hint": hint,
+        }
+        if model is not None:
+            repo_kwargs["model"] = model
+
         await run_agent_for_repo(
             repo,
             settings,
             max_attempts,
-            dry_run=dry_run,
-            auto_merge=auto_merge,
-            verify_all=verify_all,
-            standalone_fix=standalone_fix,
-            review_wait=review_wait,
-            hint=hint,
+            **repo_kwargs,
         )
     else:
         click.secho(f"🔍 Fetching repositories for owner '{owner}'...", fg="cyan")
@@ -481,16 +489,22 @@ async def run_agent(  # noqa: PLR0913
             async with semaphore:
                 click.secho(f"▶️  Starting processing for repository: {r}", fg="yellow")
                 try:
+                    r_kwargs: dict[str, Any] = {
+                        "dry_run": dry_run,
+                        "auto_merge": auto_merge,
+                        "verify_all": verify_all,
+                        "standalone_fix": standalone_fix,
+                        "review_wait": review_wait,
+                        "hint": hint,
+                    }
+                    if model is not None:
+                        r_kwargs["model"] = model
+
                     await run_agent_for_repo(
                         r,
                         settings,
                         max_attempts,
-                        dry_run=dry_run,
-                        auto_merge=auto_merge,
-                        verify_all=verify_all,
-                        standalone_fix=standalone_fix,
-                        review_wait=review_wait,
-                        hint=hint,
+                        **r_kwargs,
                     )
                     click.secho(
                         f"✅ Finished processing for repository: {r}",
@@ -687,6 +701,12 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     is_flag=True,
     help="Disable sandbox-runtime (srt) sandboxing (runs with host privileges).",
 )
+@click.option(
+    "--model",
+    type=str,
+    default=None,
+    help="Gemini model identifier (defaults to gemini-3.6-flash).",
+)
 def cli(  # noqa: PLR0913
     target: str | None,
     concurrency: int | None,
@@ -699,6 +719,7 @@ def cli(  # noqa: PLR0913
     review_wait: int | None,
     hint: str | None,
     no_sandbox: bool,
+    model: str | None = None,
 ) -> None:
     """dependency-director: Autonomous dependency triage and patching agent.
 
@@ -717,19 +738,25 @@ def cli(  # noqa: PLR0913
     review_wait_val = review_wait if review_wait is not None else settings.review_wait
 
     try:
+        run_kwargs: dict[str, Any] = {
+            "dry_run": dry_run,
+            "auto_merge": auto_merge,
+            "verify_all": verify_all,
+            "standalone_fix": standalone_fix,
+            "review_wait": review_wait_val,
+            "hint": hint,
+            "no_sandbox": no_sandbox_val,
+        }
+        if model is not None:
+            run_kwargs["model"] = model
+
         asyncio.run(
             run_agent(
                 owner,
                 concurrency_val,
                 max_attempts_val,
                 repo,
-                dry_run=dry_run,
-                auto_merge=auto_merge,
-                verify_all=verify_all,
-                standalone_fix=standalone_fix,
-                review_wait=review_wait_val,
-                hint=hint,
-                no_sandbox=no_sandbox_val,
+                **run_kwargs,
             ),
         )
     except* KeyboardInterrupt:

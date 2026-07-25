@@ -127,6 +127,10 @@ class Settings(BaseSettings):
         ge=10,
         validation_alias="depdirector_command_timeout",
     )
+    model: str = Field(
+        default="gemini-3.6-flash",
+        validation_alias="depdirector_model",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
