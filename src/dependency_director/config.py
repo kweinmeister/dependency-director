@@ -128,7 +128,7 @@ class Settings(BaseSettings):
         validation_alias="depdirector_command_timeout",
     )
     model: str = Field(
-        default="gemini-3.6-flash",
+        default="gemini-3.7-flash",
         validation_alias="depdirector_model",
     )
 

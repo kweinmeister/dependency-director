@@ -48,7 +48,7 @@ from .conftest import AsyncFSHelper
             "/path/to/custom.json",
             "gemini-3.6-pro",
         ),
-        ({}, 1, 3, "", "", "", "gemini-3.6-flash"),
+        ({}, 1, 3, "", "", "", "gemini-3.7-flash"),
     ],
 )
 def test_settings_loading(
@@ -204,10 +204,10 @@ async def test_agent_spawn_status_output(
         settings=settings,
         max_attempts=3,
         dry_run=True,
-        model="gemini-3.6-flash",
+        model="gemini-3.7-flash",
     )
     captured = capsys.readouterr()
-    assert "Spawning Agent for test-owner/test-repo [model: gemini-3.6-flash | mode: Developer API]" in captured.out
+    assert "Spawning Agent for test-owner/test-repo [model: gemini-3.7-flash | mode: Developer API]" in captured.out
 
 
 @pytest.mark.parametrize(
