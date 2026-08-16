@@ -619,7 +619,7 @@ def test_validate_sandboxed_command_rules(command_line: str, expected_error: str
 )
 def test_validate_argv_exec_pivots(argv: list[str], expected_error: str) -> None:
     """Verify find -exec/-execdir/-ok pivots are blocked."""
-    res = validate_argv(argv, "/tmp")  # noqa: S108
+    res = validate_argv(argv, "/tmp")
     assert res is not None
     assert expected_error in res
 
@@ -843,7 +843,7 @@ async def test_create_run_command_tool_agent_registration(tmp_path: Path, async_
     run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
 
     config = LocalAgentConfig(
-        model="gemini-3.6-flash",
+        model="gemini-3.7-flash",
         tools=[run_command],
         workspaces=[workspace],
     )

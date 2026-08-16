@@ -198,7 +198,7 @@ file. A template is provided in [`.env.template`](.env.template).
 | `DEPDIRECTOR_CONCURRENCY`       | Maximum concurrent repository operations (1 = sequential).                                  | `1`                                                                       |
 | `DEPDIRECTOR_REVIEW_WAIT`       | Minutes to poll for review bot comments after pushing a fix (0 = disabled).                 | `0`                                                                       |
 | `DEPDIRECTOR_BOTS`              | JSON array of bot configs (`[{"author":"...","rebase_command":"..."}]`).                    | Default bots (automated dependency update tools like Renovate/Dependabot) |
-| `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.6-flash`).                                  | `gemini-3.6-flash`                                                        |
+| `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.7-flash`).                                  | `gemini-3.7-flash`                                                        |
 | `GOOGLE_GENAI_USE_VERTEXAI`     | Set to `true` to use Google Cloud Vertex AI instead of Gemini Developer API.                | `false`                                                                   |
 | `GOOGLE_CLOUD_PROJECT`          | Google Cloud project ID (required if using Vertex AI).                                      | _(Optional)_                                                              |
 | `GOOGLE_CLOUD_LOCATION`         | Google Cloud region/location (required if using Vertex AI).                                 | _(Optional)_                                                              |

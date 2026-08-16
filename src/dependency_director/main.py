@@ -169,7 +169,7 @@ async def _prepare_agent_environment(
     return workspace_tmp, policies, run_command
 
 
-def _build_agent_prompt(  # noqa: PLR0913
+def _build_agent_prompt(
     owner: str,
     repo_name: str,
     settings: Settings,
@@ -190,7 +190,7 @@ def _build_agent_prompt(  # noqa: PLR0913
     return prompt
 
 
-async def run_agent_for_repo(  # noqa: PLR0913
+async def run_agent_for_repo(
     repo: str,
     settings: Settings,
     max_attempts: int,
@@ -405,7 +405,7 @@ async def _validate_repo_accessibility(repo: str, token: str | None) -> None:
         await client.close()
 
 
-async def run_agent(  # noqa: PLR0913
+async def run_agent(
     owner: str,
     concurrency: int,
     max_attempts: int,
@@ -475,7 +475,7 @@ async def run_agent(  # noqa: PLR0913
 
         if not repos:
             click.secho(
-                f"ℹ️  No active repositories found for owner '{owner}'.",  # noqa: RUF001
+                f"ℹ️  No active repositories found for owner '{owner}'.",
                 fg="yellow",
             )
             return
@@ -707,9 +707,9 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     "--model",
     type=str,
     default=None,
-    help="Gemini model identifier (defaults to gemini-3.6-flash).",
+    help="Gemini model identifier (defaults to gemini-3.7-flash).",
 )
-def cli(  # noqa: PLR0913
+def cli(
     target: str | None,
     concurrency: int | None,
     max_attempts: int | None,

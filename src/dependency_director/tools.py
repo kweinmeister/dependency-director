@@ -111,7 +111,7 @@ class GitHubClient:
 
         self.client = httpx.AsyncClient(event_hooks={"response": [check_api_errors]})
 
-    async def _request(  # noqa: PLR0913
+    async def _request(
         self,
         method: str,
         path: str,
@@ -120,7 +120,7 @@ class GitHubClient:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
-        json_data: Any = None,  # noqa: ANN401
+        json_data: Any = None,
         follow_redirects: bool = False,
     ) -> httpx.Response:
         _validate_repo_params(owner, repo)
@@ -153,7 +153,7 @@ class GitHubClient:
         response.raise_for_status()
         return response
 
-    async def _get(  # noqa: PLR0913
+    async def _get(
         self,
         path: str,
         owner: str,
@@ -178,7 +178,7 @@ class GitHubClient:
         path: str,
         owner: str,
         repo: str,
-        json_data: Any = None,  # noqa: ANN401
+        json_data: Any = None,
     ) -> httpx.Response:
         return await self._request(
             "PUT",
@@ -193,7 +193,7 @@ class GitHubClient:
         path: str,
         owner: str,
         repo: str,
-        json_data: Any = None,  # noqa: ANN401
+        json_data: Any = None,
     ) -> httpx.Response:
         return await self._request(
             "POST",
@@ -1521,7 +1521,7 @@ class SandboxedCommandRunner:
         command_line: str,
         working_dir: str | None = None,
         cwd: str | None = None,
-        **kwargs: Any,  # noqa: ANN401
+        **kwargs: Any,
     ) -> str:
         """Execute a shell command. Sandboxed on macOS by default.
 
@@ -1703,7 +1703,7 @@ def create_run_command_tool(
         command_line: str,
         working_dir: str | None = None,
         cwd: str | None = None,
-        **kwargs: Any,  # noqa: ANN401
+        **kwargs: Any,
     ) -> str:
         """Execute a shell command. Sandboxed on macOS by default.
 
@@ -1725,7 +1725,7 @@ def is_srt_available() -> bool:
     """Check if sandbox-runtime (srt) is available and functional."""
     try:
         res = subprocess.run(
-            ["srt", "true"],  # noqa: S607
+            ["srt", "true"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -1742,7 +1742,7 @@ def is_ripgrep_available() -> bool:
     """Check if ripgrep (rg) is installed and available in PATH."""
     try:
         res = subprocess.run(
-            ["rg", "--version"],  # noqa: S607
+            ["rg", "--version"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,

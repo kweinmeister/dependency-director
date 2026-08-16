@@ -63,7 +63,7 @@ def test_cli_model_option(mock_run_agent: MagicMock) -> None:
         mock_settings.max_fix_attempts = 3
         mock_settings.review_wait = 0
         mock_settings.no_sandbox = False
-        mock_settings.model = "gemini-3.6-flash"
+        mock_settings.model = "gemini-3.7-flash"
 
         result = runner.invoke(cli, ["test-owner/some-repo", "--model", "gemini-3.6-pro"])
 
@@ -385,7 +385,7 @@ def test_cli_review_wait_default_from_env(mock_run_agent: MagicMock) -> None:
 
 
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
-def test_cli_print_banner(_mock_run_agent: MagicMock) -> None:  # noqa: PT019
+def test_cli_print_banner(_mock_run_agent: MagicMock) -> None:
     """Verify CLI prints the startup banner as part of its execution."""
     runner = CliRunner()
     with patch("dependency_director.main.Settings") as mock_settings_cls:
