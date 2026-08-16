@@ -619,7 +619,7 @@ def test_validate_sandboxed_command_rules(command_line: str, expected_error: str
 )
 def test_validate_argv_exec_pivots(argv: list[str], expected_error: str) -> None:
     """Verify find -exec/-execdir/-ok pivots are blocked."""
-    res = validate_argv(argv, "/tmp")  # noqa: S108
+    res = validate_argv(argv, "/tmp")
     assert res is not None
     assert expected_error in res
 

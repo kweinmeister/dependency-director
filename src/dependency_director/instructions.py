@@ -5,7 +5,7 @@ from google.antigravity import types
 from dependency_director.config import DEFAULT_BOTS, BotConfig
 
 
-def get_system_instructions(  # noqa: PLR0913
+def get_system_instructions(
     max_attempts: int,
     *,
     verify_all: bool = False,

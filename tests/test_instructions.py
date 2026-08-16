@@ -202,7 +202,7 @@ def test_workspace_dir_not_hardcoded() -> None:
     """Verify no hardcoded temp paths appear in system instructions."""
     inst = get_system_instructions(max_attempts=3)
     all_content = " ".join(_section_content(inst, s.title) for s in inst.sections)
-    assert "/tmp/" not in all_content  # noqa: S108
+    assert "/tmp/" not in all_content
     assert "dependency-director-" not in all_content
 
 
