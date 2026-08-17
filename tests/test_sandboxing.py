@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.antigravity import LocalAgentConfig
 
+from dependency_director.argv import split_compound_argv
 from dependency_director.config import DEFAULT_CACHE_DIR, DEFAULT_SRT_SETTINGS_PATH, OutputLimits
 from dependency_director.tools import (
     CommandResult,
@@ -23,7 +24,6 @@ from dependency_director.tools import (
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
-    split_compound_argv,
     validate_argv,
 )
 

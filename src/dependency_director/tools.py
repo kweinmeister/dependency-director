@@ -1536,8 +1536,21 @@ def _check_shell_operators(argv: list[str]) -> str | None:
     return None
 
 
-def _resolve_exe(argv: list[str]) -> tuple[int, str] | str:
-    """Return (exe_idx, exe_name) or an error string.
+class CheckedExe(NamedTuple):
+    """The executable a command runs, once its env assignments have passed.
+
+    Attributes:
+        idx: Index of the executable token in the argv list.
+        name: Basename of that executable, lowercased.
+
+    """
+
+    idx: int
+    name: str
+
+
+def _resolve_exe(argv: list[str]) -> CheckedExe | str:
+    """Return the executable a command runs, or an error string.
 
     Identify the executable index and normalized name, then validate every
     ``KEY=val`` assignment attached to it — whether written bare or passed
@@ -1557,7 +1570,7 @@ def _resolve_exe(argv: list[str]) -> tuple[int, str] | str:
             if token in ("-S", "--split-string"):
                 return "Security Error: 'env -S/--split-string' is blocked."
 
-    return resolved.wrapper_idx, resolved.name
+    return CheckedExe(idx=resolved.wrapper_idx, name=resolved.name)
 
 
 def _check_exec_pivots(exe_name: str, argv: list[str], exe_idx: int) -> str | None:
@@ -1592,15 +1605,15 @@ def _check_git_extended(argv: list[str], exe_idx: int) -> str | None:
     return None
 
 
-def _check_per_exe(exe_name: str, argv: list[str], exe_idx: int, workspace_dir: str) -> str | None:
+def _check_per_exe(exe: CheckedExe, argv: list[str], workspace_dir: str) -> str | None:
     """Dispatch per-executable security checks (pivots, denylist, rm, git)."""
-    err = _check_exec_pivots(exe_name, argv, exe_idx) or _check_blocked_executables(exe_name)
+    err = _check_exec_pivots(exe.name, argv, exe.idx) or _check_blocked_executables(exe.name)
     if err:
         return err
-    if exe_name == "rm":
-        return _check_rm_command(argv, exe_idx, workspace_dir, set())
-    if exe_name == "git":
-        return _check_git_command(argv, exe_idx, set()) or _check_git_extended(argv, exe_idx)
+    if exe.name == "rm":
+        return _check_rm_command(argv, exe.idx, workspace_dir, set())
+    if exe.name == "git":
+        return _check_git_command(argv, exe.idx, set()) or _check_git_extended(argv, exe.idx)
     return None
 
 
@@ -1616,19 +1629,18 @@ def _validate_single_argv(argv: list[str], workspace_dir: str) -> str | None:
         return err
 
     # Find the executable (skip leading FOO=bar env assignments)
-    result = _resolve_exe(argv)
-    if isinstance(result, str):
-        return result
-    exe_idx, exe_name = result
+    exe = _resolve_exe(argv)
+    if isinstance(exe, str):
+        return exe
 
     # Block SHELL interpreters only (no legitimate use after Phase 2).
     # Language runtimes (python3, node, ruby, etc.) are allowed —
     # agent needs them for test execution; srt OS sandbox is the boundary.
     blocked_shells = {"bash", "sh", "dash", "zsh", "ksh"}
-    if exe_name in blocked_shells:
-        return f"Security Error: Shell interpreter '{exe_name}' is blocked."
+    if exe.name in blocked_shells:
+        return f"Security Error: Shell interpreter '{exe.name}' is blocked."
 
-    return _check_per_exe(exe_name, argv, exe_idx, workspace_dir)
+    return _check_per_exe(exe, argv, workspace_dir)
 
 
 def validate_argv(argv: list[str], workspace_dir: str) -> str | None:
