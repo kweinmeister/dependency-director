@@ -165,6 +165,7 @@ async def _prepare_agent_environment(
             srt_settings_path=settings.srt_settings,
             github_token=settings.github_token,
             command_timeout=settings.command_timeout,
+            output_limits=settings.output_limits,
         )
     return workspace_tmp, policies, run_command
 

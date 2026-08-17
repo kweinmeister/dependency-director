@@ -2,7 +2,7 @@
 
 import importlib.resources
 import shlex
-from typing import Any
+from typing import Any, NamedTuple
 
 from google.antigravity.hooks import policy
 from pydantic import BaseModel, Field
@@ -26,6 +26,33 @@ DEFAULT_BOTS: list[BotConfig] = [
     BotConfig(author="renovate[bot]", rebase_command="@renovatebot rebase"),
 ]
 DEFAULT_COMMAND_TIMEOUT = 300
+
+# Caps on the command output handed back to the model. A dependency install
+# can emit tens of thousands of lines whose middle says nothing; the head names
+# what ran and the tail carries the failure. Either cap may be set to 0 to
+# disable it.
+DEFAULT_MAX_OUTPUT_LINES = 200
+DEFAULT_MAX_OUTPUT_CHARS = 24000
+
+# Share of each cap spent on the head. The tail gets the rest, because that is
+# where errors land.
+OUTPUT_HEAD_FRACTION = 0.2
+
+
+class OutputLimits(NamedTuple):
+    """Caps applied to a single command's stdout and stderr.
+
+    Attributes:
+        max_lines: Maximum lines kept per stream; 0 disables the line cap.
+        max_chars: Maximum characters kept per stream; 0 disables the char cap.
+
+    """
+
+    max_lines: int = DEFAULT_MAX_OUTPUT_LINES
+    max_chars: int = DEFAULT_MAX_OUTPUT_CHARS
+
+
+DEFAULT_OUTPUT_LIMITS = OutputLimits()
 
 # Failed CI jobs whose logs are returned for a single PR. Several workflows can
 # fail on one commit, and they usually fail for the same underlying reason, so
@@ -147,6 +174,21 @@ class Settings(BaseSettings):
         default="gemini-3.7-flash",
         validation_alias="depdirector_model",
     )
+    max_output_lines: int = Field(
+        default=DEFAULT_MAX_OUTPUT_LINES,
+        ge=0,
+        validation_alias="depdirector_max_output_lines",
+    )
+    max_output_chars: int = Field(
+        default=DEFAULT_MAX_OUTPUT_CHARS,
+        ge=0,
+        validation_alias="depdirector_max_output_chars",
+    )
+
+    @property
+    def output_limits(self) -> OutputLimits:
+        """Return the configured command output caps."""
+        return OutputLimits(max_lines=self.max_output_lines, max_chars=self.max_output_chars)
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -13,10 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.antigravity import LocalAgentConfig
 
-from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH
+from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH, OutputLimits
 from dependency_director.tools import (
     CommandResult,
     SandboxedCommandRunner,
+    _format_command_result,
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
@@ -1144,3 +1145,75 @@ async def test_compound_runner_error_string_is_failure(tmp_path: Path, async_fs:
     assert "echo second" not in result  # second command output must not appear
     assert call_count == 1  # second command was never called
     assert call_args == [["echo", "first"]]
+
+
+# --- Command output caps ---
+
+
+def _lines(n: int, prefix: str = "line") -> bytes:
+    """Build n newline-separated numbered lines as bytes."""
+    return "\n".join(f"{prefix}{i}" for i in range(n)).encode()
+
+
+def test_command_output_under_the_cap_is_untouched() -> None:
+    """Verify short output passes through with no truncation marker."""
+    out = _format_command_result(_lines(10), b"", 0, OutputLimits(max_lines=200, max_chars=24000))
+    assert "line0" in out
+    assert "line9" in out
+    assert "omitted" not in out
+
+
+def test_command_output_line_cap_keeps_head_and_tail() -> None:
+    """Verify a long log is trimmed from the middle, not the end.
+
+    The head carries the command being run and the tail carries the failure;
+    a plain tail loses the former and a plain head loses the latter.
+    """
+    out = _format_command_result(_lines(1000), b"", 0, OutputLimits(max_lines=200, max_chars=0))
+    assert "line0" in out
+    assert "line999" in out
+    assert "line500" not in out
+    assert "800 lines omitted" in out
+
+
+def test_command_output_char_cap_bounds_a_single_long_line() -> None:
+    """Verify one enormous line is capped, which the line cap alone cannot do."""
+    out = _format_command_result(b"x" * 100_000, b"", 0, OutputLimits(max_lines=200, max_chars=24_000))
+    assert len(out) < 30_000
+    assert "characters omitted" in out
+
+
+@pytest.mark.parametrize(
+    ("limits", "marker_expected"),
+    [
+        (OutputLimits(max_lines=0, max_chars=0), False),
+        (OutputLimits(max_lines=0, max_chars=24_000), False),
+        (OutputLimits(max_lines=200, max_chars=0), True),
+    ],
+)
+def test_command_output_cap_of_zero_disables_it(limits: OutputLimits, *, marker_expected: bool) -> None:
+    """Verify a limit of 0 turns that cap off, so a user can opt out."""
+    out = _format_command_result(_lines(1000), b"", 0, limits)
+    assert ("omitted" in out) is marker_expected
+
+
+def test_command_output_truncation_preserves_sandbox_diagnostics() -> None:
+    """Verify a sandbox violation buried mid-output still raises its diagnostic.
+
+    The network-block marker appears wherever the failing request happened,
+    which for a long dependency install is nowhere near either end. Reading
+    diagnostics off the truncated text would hide exactly the failures the
+    agent most needs explained.
+    """
+    noisy = _lines(500, "before") + b"\nConnection blocked by network allowlist\n" + _lines(500, "after")
+    out = _format_command_result(noisy, b"", 1, OutputLimits(max_lines=50, max_chars=0))
+    assert "Connection blocked by network allowlist" not in out.split("[Sandbox Violation]")[0]
+    assert "[Sandbox Violation]" in out
+
+
+def test_command_output_caps_stdout_and_stderr_separately() -> None:
+    """Verify a flood on one stream cannot crowd the other out entirely."""
+    out = _format_command_result(_lines(1000, "out"), _lines(1000, "err"), 1, OutputLimits(max_lines=100, max_chars=0))
+    assert "out0" in out
+    assert "err0" in out
+    assert "err999" in out

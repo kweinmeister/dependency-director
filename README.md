@@ -239,6 +239,9 @@ file. A template is provided in [`.env.template`](.env.template).
 | `GOOGLE_CLOUD_LOCATION`         | Google Cloud region/location (required if using Vertex AI).                                 | _(Optional)_                                                              |
 | `DEPDIRECTOR_NO_SANDBOX`        | Set to `true` to disable sandbox-runtime (srt) sandboxing.                                  | `false`                                                                   |
 | `DEPDIRECTOR_SRT_SETTINGS`      | Custom settings JSON path for sandbox-runtime (srt).                                        | Bundled `srt-settings.json`                                               |
+| `DEPDIRECTOR_COMMAND_TIMEOUT`   | Seconds allowed per sandboxed command before it is killed (minimum 10).                     | `300`                                                                     |
+| `DEPDIRECTOR_MAX_OUTPUT_LINES`  | Lines kept per stream from each command's output; the middle is dropped (0 = unlimited).    | `200`                                                                     |
+| `DEPDIRECTOR_MAX_OUTPUT_CHARS`  | Characters kept per stream from each command's output (0 = unlimited).                      | `24000`                                                                   |
 
 <!-- markdownlint-enable MD013 MD060 -->
 

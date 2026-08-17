@@ -714,7 +714,10 @@ async def test_rebase_proceeds_on_untouched_bot_branch(mock_client: MagicMock, t
 
 
 @pytest.mark.asyncio
-async def test_rebase_dry_run_still_reports_the_clobber(mock_client: MagicMock, dry_run_tools: tuple[ToolFn, ...]) -> None:
+async def test_rebase_dry_run_still_reports_the_clobber(
+    mock_client: MagicMock,
+    dry_run_tools: tuple[ToolFn, ...],
+) -> None:
     """Verify dry-run surfaces the refusal rather than promising a rebase it would not do."""
     _, rebase, _ = dry_run_tools
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")

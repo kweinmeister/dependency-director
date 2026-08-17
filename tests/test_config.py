@@ -14,7 +14,14 @@ from google.antigravity.hooks import hooks, policy
 from google.antigravity.types import BuiltinTools
 from pydantic import ValidationError
 
-from dependency_director.config import DEFAULT_BOTS, BotConfig, Settings, get_dry_run_policies, get_safety_policies
+from dependency_director.config import (
+    DEFAULT_BOTS,
+    BotConfig,
+    OutputLimits,
+    Settings,
+    get_dry_run_policies,
+    get_safety_policies,
+)
 from dependency_director.main import _check_open_bot_prs, run_agent_for_repo
 from dependency_director.tools import GitHubClient
 
@@ -104,6 +111,26 @@ def test_settings_concurrency_accepts_one(monkeypatch: pytest.MonkeyPatch) -> No
 def test_settings_empty_bots_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty bots list silently disables all PR processing; reject it early."""
     monkeypatch.setenv("DEPDIRECTOR_BOTS", "[]")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_output_limits_default_to_the_documented_values() -> None:
+    """Verify the output caps default to what the README and .env.template state."""
+    assert Settings().output_limits == OutputLimits(max_lines=200, max_chars=24000)
+
+
+def test_settings_output_limits_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify both caps can be overridden from the environment, including to 0."""
+    monkeypatch.setenv("DEPDIRECTOR_MAX_OUTPUT_LINES", "0")
+    monkeypatch.setenv("DEPDIRECTOR_MAX_OUTPUT_CHARS", "5000")
+    assert Settings().output_limits == OutputLimits(max_lines=0, max_chars=5000)
+
+
+@pytest.mark.parametrize("var", ["DEPDIRECTOR_MAX_OUTPUT_LINES", "DEPDIRECTOR_MAX_OUTPUT_CHARS"])
+def test_settings_output_limits_reject_negative(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+    """Verify a negative cap is rejected rather than silently slicing backwards."""
+    monkeypatch.setenv(var, "-1")
     with pytest.raises(ValidationError):
         Settings()
 

@@ -24,11 +24,14 @@ from dependency_director.argv import (
 from dependency_director.config import (
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_MAX_FAILED_JOBS,
+    DEFAULT_OUTPUT_LIMITS,
     DEFAULT_SRT_SETTINGS_PATH,
+    OUTPUT_HEAD_FRACTION,
     PASSING_RUN_CONCLUSIONS,
     SAFE_ENV_ALLOWLIST,
     WORKFLOW_LOG_TAIL_LINES,
     BotConfig,
+    OutputLimits,
 )
 
 __all__ = ["CompoundPart", "split_compound_argv"]
@@ -1501,15 +1504,45 @@ def validate_argv(argv: list[str], workspace_dir: str) -> str | None:
     return None
 
 
+def _truncate_middle(text: str, limits: OutputLimits) -> str:
+    """Trim the middle out of ``text`` to fit within ``limits``.
+
+    Keeps a head and a tail because each answers a different question: the
+    head shows what ran, the tail shows how it ended. The line cap runs first
+    so ordinary logs are trimmed on line boundaries; the character cap then
+    catches output that is short on lines but enormous on one of them.
+    """
+    if limits.max_lines > 0:
+        lines = text.splitlines()
+        if len(lines) > limits.max_lines:
+            head_n = int(limits.max_lines * OUTPUT_HEAD_FRACTION)
+            tail_n = limits.max_lines - head_n
+            omitted = len(lines) - limits.max_lines
+            text = "\n".join(
+                [*lines[:head_n], f"... [{omitted} lines omitted] ...", *lines[-tail_n:]],
+            )
+
+    if limits.max_chars > 0 and len(text) > limits.max_chars:
+        head_n = int(limits.max_chars * OUTPUT_HEAD_FRACTION)
+        tail_n = limits.max_chars - head_n
+        omitted = len(text) - limits.max_chars
+        text = f"{text[:head_n]}\n... [{omitted} characters omitted] ...\n{text[-tail_n:]}"
+
+    return text
+
+
 def _format_command_result(
     stdout: bytes,
     stderr: bytes,
     returncode: int,
+    limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
 ) -> str:
     stdout_str = stdout.decode(errors="replace")
     stderr_str = stderr.decode(errors="replace")
 
     diagnostics = []
+    # Read diagnostics off the full text: a blocked request lands wherever it
+    # happened, which for a long install is nowhere near either end.
     combined = stdout_str + stderr_str
     if returncode != 0:
         if "Connection blocked by network allowlist" in combined or "X-Proxy-Error: blocked-by-allowlist" in combined:
@@ -1526,9 +1559,9 @@ def _format_command_result(
 
     parts = [
         "--- STDOUT ---",
-        stdout_str,
+        _truncate_middle(stdout_str, limits),
         "--- STDERR ---",
-        stderr_str,
+        _truncate_middle(stderr_str, limits),
         f"--- EXIT CODE: {returncode} ---",
     ]
     if diagnostics:
@@ -1590,6 +1623,7 @@ class SandboxConfig(NamedTuple):
         srt_config: Parsed srt settings dict (filesystem, network rules).
         github_token: Token for authenticated git operations.
         command_timeout: Max seconds per sandboxed command.
+        output_limits: Caps on the output returned to the model.
 
     """
 
@@ -1597,6 +1631,7 @@ class SandboxConfig(NamedTuple):
     srt_config: dict[str, Any]
     github_token: str | None = None
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT
+    output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS
 
 
 class SandboxedCommandRunner:
@@ -1752,7 +1787,7 @@ class SandboxedCommandRunner:
                 await process.wait()
                 return CommandResult(f"Error: Command timed out after {self.cfg.command_timeout} seconds.", -1)
             rc = process.returncode if process.returncode is not None else -1
-            return CommandResult(_format_command_result(stdout, stderr, rc), rc)
+            return CommandResult(_format_command_result(stdout, stderr, rc, self.cfg.output_limits), rc)
         finally:
             if git_config_temp_path:
                 with contextlib.suppress(Exception):
@@ -1764,6 +1799,7 @@ def create_run_command_tool(
     srt_settings_path: str | Path = "",
     github_token: str | None = None,
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
 ) -> Callable[..., Awaitable[str]]:
     """Create a sandboxed run_command tool bound to a workspace."""
     config_path = None
@@ -1805,6 +1841,7 @@ def create_run_command_tool(
             srt_config=srt_config,
             github_token=github_token,
             command_timeout=command_timeout,
+            output_limits=output_limits,
         ),
         config_path=config_path,
         init_error=init_error,
