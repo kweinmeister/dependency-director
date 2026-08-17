@@ -112,6 +112,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
         )
         mock_get_repos.assert_called_once_with("test-owner", "placeholder")
@@ -124,6 +125,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
         )
@@ -135,6 +137,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
         )
@@ -146,6 +149,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
         )
@@ -257,6 +261,7 @@ async def test_run_agent_worker_error_isolates(
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
         assert mock_run_agent_for_repo.call_count == 2
@@ -280,6 +285,7 @@ async def test_run_agent_no_repos_found(mock_get_repos: MagicMock, github_token:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
 
@@ -344,6 +350,7 @@ async def test_run_agent_vertex_no_api_key_succeeds(
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
         mock_run_agent_for_repo.assert_called_once()
@@ -367,6 +374,7 @@ async def test_run_agent_no_api_key_no_vertex_exits(github_token: str) -> None:
                 auto_merge=False,
                 verify_all=False,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
             )
 
@@ -391,6 +399,7 @@ async def test_run_agent_vertex_missing_project_exits(github_token: str) -> None
                 auto_merge=False,
                 verify_all=False,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
             )
 
@@ -416,6 +425,7 @@ async def test_run_agent_no_github_token_warns(mock_get_repos: MagicMock, mock_r
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
         mock_run_agent_for_repo.assert_called_once()
@@ -441,6 +451,7 @@ async def test_run_agent_get_repos_exception(mock_get_repos: MagicMock, github_t
                 auto_merge=False,
                 verify_all=False,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
             )
         assert exc_info.value.code == 1
@@ -465,6 +476,7 @@ async def test_run_agent_verify_all_no_sandbox_incompatible(github_token: str) -
                 auto_merge=False,
                 verify_all=True,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
                 no_sandbox=True,
             )

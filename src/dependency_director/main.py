@@ -228,6 +228,7 @@ async def run_agent_for_repo(
     auto_merge: bool = False,
     verify_all: bool = False,
     standalone_fix: bool = False,
+    fix_base: bool = False,
     review_wait: int = 0,
     hint: str | None = None,
     model: str | None = None,
@@ -283,6 +284,7 @@ async def run_agent_for_repo(
             auto_merge=auto_merge,
             dry_run=dry_run,
             standalone_fix=standalone_fix,
+            fix_base=fix_base,
             review_wait=review_wait,
             bots=settings.bots,
             no_sandbox=settings.no_sandbox,
@@ -465,6 +467,7 @@ async def run_agent(
     auto_merge: bool = False,
     verify_all: bool = False,
     standalone_fix: bool = False,
+    fix_base: bool = False,
     review_wait: int = 0,
     hint: str | None = None,
     no_sandbox: bool = False,
@@ -499,6 +502,7 @@ async def run_agent(
             "auto_merge": auto_merge,
             "verify_all": verify_all,
             "standalone_fix": standalone_fix,
+            "fix_base": fix_base,
             "review_wait": review_wait,
             "hint": hint,
         }
@@ -546,6 +550,7 @@ async def run_agent(
                         "auto_merge": auto_merge,
                         "verify_all": verify_all,
                         "standalone_fix": standalone_fix,
+                        "fix_base": fix_base,
                         "review_wait": review_wait,
                         "hint": hint,
                     }
@@ -735,6 +740,14 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     help="Run in standalone fix mode (bypasses dependency checker and attempts directly).",
 )
 @click.option(
+    "--fix-base",
+    is_flag=True,
+    help=(
+        "When the base branch is already failing CI, fix it in a separate PR "
+        "against the base instead of only reporting it. Never merged automatically."
+    ),
+)
+@click.option(
     "--review-wait",
     "-w",
     type=int,
@@ -768,6 +781,7 @@ def cli(
     auto_merge: bool,
     verify_all: bool,
     standalone_fix: bool,
+    fix_base: bool,
     review_wait: int | None,
     hint: str | None,
     no_sandbox: bool,
@@ -795,6 +809,7 @@ def cli(
             "auto_merge": auto_merge,
             "verify_all": verify_all,
             "standalone_fix": standalone_fix,
+            "fix_base": fix_base,
             "review_wait": review_wait_val,
             "hint": hint,
             "no_sandbox": no_sandbox_val,

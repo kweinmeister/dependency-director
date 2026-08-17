@@ -758,3 +758,58 @@ def test_sandbox_workflow_uv_sync_first() -> None:
     inst = _get_instructions()
     workflow = _section_content(inst, "workflow")
     assert "uv sync" in workflow
+
+
+# --- Base branch health ---
+
+
+def test_workflow_checks_base_health_before_cloning() -> None:
+    """The base check must be instructed, and must come before the clone.
+
+    On fast-diff-mcp the model happened to run 'git checkout main && ruff check'
+    on its own, which is luck rather than behaviour. Nothing in the workflow
+    asked for it, so on another repo it may clone and grind through every PR
+    before noticing the base was already red.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert "get_branch_ci_status" in content
+    assert content.index("get_branch_ci_status") < content.index("Clone (if not already)")
+
+
+def test_workflow_reports_a_broken_base_once_not_per_pr() -> None:
+    """Five PRs blocked on one cause should be diagnosed once, then skipped."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "ONCE per run" in content
+    assert "do NOT re-check it per PR" in content
+    assert "every remaining RED PR" in content
+
+
+def test_base_fix_section_absent_by_default() -> None:
+    """Opening unrelated PRs is a surprise, so it must be opt-in."""
+    assert "fix_base_branch" not in _section_titles(_get_instructions())
+
+
+def test_base_fix_section_opens_a_separate_pr_against_the_base() -> None:
+    """A base fix must never land on a dependency branch.
+
+    Pushing repo-wide changes to 'dependabot/...' is bad review hygiene and
+    makes Dependabot stop managing the PR.
+    """
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    assert "create_pr" in content
+    assert "MUST NOT" in content
+    assert "dependency" in content.lower()
+
+
+def test_base_fix_scope_is_bounded_to_what_ci_fails_on() -> None:
+    """'Fix the base' must not become 'clean up the whole repo'."""
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    lowered = content.lower()
+    assert "only" in lowered
+    assert "unrelated" in lowered
+
+
+def test_base_fix_is_excluded_from_auto_merge() -> None:
+    """Merging the agent's own change to main is a bigger deal than a dep bump."""
+    content = _section_content(_get_instructions(fix_base=True, auto_merge=True), "fix_base_branch")
+    assert "MUST NOT merge" in content

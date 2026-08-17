@@ -96,6 +96,29 @@ flowchart TD
     verify -- Fail --> escalate["Log & Escalate"]:::red
 ```
 
+### Broken base branches
+
+A dependency PR fails CI for one of two reasons: the bump broke
+something, or the base branch was already red before the bump
+landed. These need opposite responses, so before cloning for a RED
+PR the agent calls `get_branch_ci_status` once per run to tell them
+apart.
+
+When the base is red, no dependency PR in that repository can go
+green on its own. By default the agent reports the cause once and
+skips the remaining RED PRs rather than attempting fixes that cannot
+succeed — a repo-wide fix does not belong in a
+`dependabot/*` branch, where it would be poor review hygiene and
+would make Dependabot stop managing the PR.
+
+Passing `--fix-base` lets the agent repair the base instead. The fix
+goes into its own PR against the base branch, scoped to only what
+the failing checks complain about, and is never merged
+automatically — not even under `--auto-merge`, since merging the
+agent's own change to a default branch is a larger step than merging
+a dependency bump. The dependency PRs stay blocked until that PR is
+reviewed, merged, and the bots rebase.
+
 ---
 
 ## Safety Guardrails
@@ -364,6 +387,7 @@ depdirector --help
 | `-a, --auto-merge`   | Squash-merge fix PRs via the GitHub API once CI is green, instead of leaving them for manual review.         |
 | `-v, --verify-all`   | Force local test verification of all PRs (including green ones) before merging.                               |
 | `--standalone-fix`   | Create fixes on a new branch with a separate PR instead of pushing to the original dependency update branch.  |
+| `--fix-base`         | When the base branch is already failing CI, repair it in a separate PR against the base (see [Broken base branches](#broken-base-branches)). |
 | `-c, --concurrency`  | Override the maximum concurrent repository scans.                                                            |
 | `-m, --max-attempts` | Override the maximum fix-and-test attempts per failing PR.                                                    |
 | `-w, --review-wait`  | Minutes to wait for review comments after pushing a fix (overrides env).                                     |
@@ -396,6 +420,12 @@ depdirector your-org --verify-all
 
 ```bash
 depdirector your-org --concurrency 4
+```
+
+**Unblock dependency PRs stuck behind a red base branch:**
+
+```bash
+depdirector your-org/your-repo --fix-base
 ```
 
 ---

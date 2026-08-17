@@ -12,6 +12,7 @@ def get_system_instructions(
     auto_merge: bool = False,
     dry_run: bool = False,
     standalone_fix: bool = False,
+    fix_base: bool = False,
     review_wait: int = 0,
     bots: list[BotConfig] = DEFAULT_BOTS,
     no_sandbox: bool = False,
@@ -46,6 +47,26 @@ def get_system_instructions(
             "using 'git push origin pr-<pr-number>:<remote-pr-branch>'. "
             "Do NOT create new branch/PR."
         )
+
+    if fix_base:
+        base_red_action = (
+            "the base is broken: follow the 'fix_base_branch' section, then log "
+            "'⚠ #<n> not fixed: blocked on base branch fix PR' for this and every "
+            "remaining RED PR."
+        )
+    else:
+        base_red_action = (
+            "the dependency PRs cannot go green on their own: do NOT clone, and log "
+            "'⚠ #<n> not fixed: base branch <branch> is already failing CI (<failing checks>)' "
+            "for this and every remaining RED PR."
+        )
+
+    base_health_check = (
+        "Before cloning, call 'get_branch_ci_status(owner, repo)' ONCE per run to "
+        f"check the PR's base branch. Reuse that one result for every RED PR — do NOT "
+        f"re-check it per PR. If it reports ci_status='RED', {base_red_action} "
+        "If the base is GREEN, the failure belongs to the PR: continue. "
+    )
 
     if no_sandbox:
         guardrails_content = (
@@ -102,6 +123,7 @@ def get_system_instructions(
             "resolve conflicts, test, push.\n"
             "   - RED: Get logs via 'get_pr_workflow_run_logs', "
             "then 'get_pr_diff' and 'get_pr_files' to understand scope before cloning. "
+            f"{base_health_check}"
             "Clone (if not already) to '<workspace_dir>/<repo_name>', "
             "then 'git fetch origin pull/<pr_number>/head:pr-<pr_number>' "
             "and 'git checkout pr-<pr_number>' (two separate calls). "
@@ -188,6 +210,30 @@ def get_system_instructions(
                 content=(
                     "MUST NOT merge fix PRs. Leave fix PRs open for manual review. "
                     "Green PRs can still be merged using 'merge_bot_pr'."
+                ),
+            ),
+        )
+
+    if fix_base:
+        sections.append(
+            types.SystemInstructionSection(
+                title="fix_base_branch",
+                content=(
+                    "When 'get_branch_ci_status' reports the base branch RED, repair the "
+                    "base before skipping the dependency PRs:\n"
+                    "- Clone, check out the base branch, and reproduce the failing checks.\n"
+                    "- Fix ONLY what those checks fail on. No unrelated changes, refactors, "
+                    "reformatting, or drive-by cleanups, even if you notice other problems.\n"
+                    "- If the failure does not reproduce on the base branch, make no changes "
+                    "and report it — do not guess at a fix.\n"
+                    "- Push to 'dependency-director/fix-base-<branch>' and call 'create_pr' "
+                    "targeting the base branch, with a body listing the failing checks.\n"
+                    "- MUST NOT push base fixes to a dependency PR branch, and MUST NOT mix "
+                    "them into a dependency update commit.\n"
+                    "- MUST NOT merge the base fix PR, even in auto-merge mode. Leave it for "
+                    "human review.\n"
+                    "- Open at most one base fix PR per run. Afterwards the RED dependency PRs "
+                    "stay blocked until it merges and they rebase, so do not attempt them."
                 ),
             ),
         )

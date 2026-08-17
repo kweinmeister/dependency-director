@@ -54,6 +54,7 @@ def test_cli_target_owner_repo(mock_run_agent: MagicMock) -> None:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
             hint=None,
             no_sandbox=False,
@@ -84,6 +85,7 @@ def test_cli_model_option(mock_run_agent: MagicMock) -> None:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
             hint=None,
             no_sandbox=False,
@@ -114,6 +116,7 @@ def test_cli_target_owner_only(mock_run_agent: MagicMock) -> None:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
             hint=None,
             no_sandbox=False,
@@ -162,6 +165,7 @@ def test_cli_target_formats(
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
             hint=None,
             no_sandbox=False,
@@ -222,6 +226,7 @@ def test_cli_no_target_uses_env(mock_run_agent: MagicMock) -> None:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
             hint=None,
             no_sandbox=False,
@@ -283,6 +288,7 @@ def test_cli_all_overrides(mock_run_agent: MagicMock) -> None:
             auto_merge=True,
             verify_all=True,
             standalone_fix=True,
+            fix_base=False,
             review_wait=5,
             hint=None,
             no_sandbox=False,
@@ -326,6 +332,7 @@ def test_cli_short_flags_overrides(mock_run_agent: MagicMock) -> None:
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
             no_sandbox=False,
@@ -385,6 +392,7 @@ def test_cli_review_wait_default_from_env(mock_run_agent: MagicMock) -> None:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=7,
             hint=None,
             no_sandbox=False,
@@ -566,3 +574,24 @@ def test_cli_verify_all_with_no_sandbox_rejected(mock_run_agent: MagicMock) -> N
         assert result.exit_code != 0
         assert "verify-all is not allowed in --no-sandbox mode" in result.output.lower()
         mock_run_agent.assert_not_called()
+
+
+def test_cli_exposes_fix_base_flag() -> None:
+    """--fix-base must be discoverable and describe its blast radius."""
+    result = CliRunner().invoke(cli, ["--help"])
+    assert "--fix-base" in result.output
+    assert "separate PR" in result.output
+
+
+def test_cli_fix_base_defaults_to_off() -> None:
+    """An agent opening PRs unrelated to any dependency update must be opted into."""
+    with patch("dependency_director.main.run_agent", new_callable=AsyncMock) as mock_run:
+        CliRunner().invoke(cli, ["owner/repo", "--dry-run"])
+    assert mock_run.call_args.kwargs["fix_base"] is False
+
+
+def test_cli_fix_base_reaches_run_agent() -> None:
+    """The flag must actually thread through, not just exist in --help."""
+    with patch("dependency_director.main.run_agent", new_callable=AsyncMock) as mock_run:
+        CliRunner().invoke(cli, ["owner/repo", "--dry-run", "--fix-base"])
+    assert mock_run.call_args.kwargs["fix_base"] is True
