@@ -1,6 +1,7 @@
 """dependency-director: Autonomous dependency triage and patching agent."""
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import shutil
@@ -102,6 +103,12 @@ async def _check_open_bot_prs(
     return [pr for pr in open_prs if pr.author in allowed_authors]
 
 
+# The repository whose run the current task belongs to. Each repo runs in its
+# own asyncio task, which copies the context, so a set() inside one run is
+# invisible to the others and needs no locking.
+_current_repo: contextvars.ContextVar[str] = contextvars.ContextVar("current_repo", default="")
+
+
 class _SdkIssueCollector(logging.Handler):
     """Collect warning-or-worse log records emitted by anything but us.
 
@@ -110,16 +117,27 @@ class _SdkIssueCollector(logging.Handler):
     'System step error (HTTP 0): ...' on the root logger. The turn then ends
     quietly with truncated output, and the caller has no way to tell it apart
     from a clean run.
+
+    The root logger is process-wide, so with concurrency > 1 several collectors
+    are attached at once. Each keeps only the records raised while its own
+    repository was the one in context.
     """
 
-    def __init__(self) -> None:
-        """Collect at WARNING and above."""
+    def __init__(self, repo: str) -> None:
+        """Collect at WARNING and above, for one repository's run."""
         super().__init__(level=logging.WARNING)
+        self.repo = repo
         self.messages: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Record the message unless we logged it ourselves."""
+        """Record the message unless we logged it or another repo caused it."""
         if record.name.startswith("dependency_director"):
+            return
+        emitting_repo = _current_repo.get()
+        # A record from a thread or callback that never inherited the context
+        # reaches every collector. Duplicating a warning is better than
+        # dropping one, which is the failure this handler exists to prevent.
+        if emitting_repo and emitting_repo != self.repo:
             return
         self.messages.append(record.getMessage())
 
@@ -235,6 +253,8 @@ async def run_agent_for_repo(
     model: str | None = None,
 ) -> None:
     """Run the triage agent for a single GitHub repository."""
+    # Claims the root-logger records raised by this run; see _SdkIssueCollector.
+    _current_repo.set(repo)
     client = GitHubClient(token=settings.github_token)
     (
         create_pr,
@@ -366,7 +386,7 @@ async def run_agent_for_repo(
             )
             click.secho(wrapped_prompt, fg="blue")
 
-            issues = _SdkIssueCollector()
+            issues = _SdkIssueCollector(repo)
             root_logger = logging.getLogger()
             root_logger.addHandler(issues)
             try:
