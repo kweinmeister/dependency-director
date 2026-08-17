@@ -779,9 +779,40 @@ def test_workflow_checks_base_health_before_cloning() -> None:
 def test_workflow_reports_a_broken_base_once_not_per_pr() -> None:
     """Five PRs blocked on one cause should be diagnosed once, then skipped."""
     content = _section_content(_get_instructions(), "workflow")
-    assert "ONCE per run" in content
-    assert "do NOT re-check it per PR" in content
+    assert "ONCE per distinct base_ref" in content
+    assert "do NOT re-check the same base" in content
     assert "every remaining RED PR" in content
+
+
+def test_base_check_uses_the_prs_own_base_ref() -> None:
+    """The branch checked must be the one the PR targets, not the repo default.
+
+    'get_branch_ci_status' falls back to the default branch when no branch is
+    passed, so an instruction that omits the argument silently diagnoses the
+    wrong branch for any PR aimed at 'develop' or a release line.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert "base_ref" in content
+    assert "list_bot_prs" in content
+    assert content.index("get_branch_ci_status(owner, repo, branch)") < content.index("Clone (if not already)")
+
+
+def test_base_check_is_reused_per_base_not_across_unrelated_bases() -> None:
+    """Two PRs on different bases need two checks; two on one base need one."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "distinct base_ref" in content
+    assert "sharing that base" in content
+
+
+def test_base_fix_pr_targets_the_base_that_was_diagnosed() -> None:
+    """The fix must land on the branch that is actually broken.
+
+    Opening the fix against the repository default when the diagnosed base was
+    'develop' repairs a branch nobody reported as failing and leaves the
+    dependency PRs just as blocked.
+    """
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    assert "base_ref" in content
 
 
 def test_base_blame_requires_the_same_checks_to_be_failing() -> None:

@@ -757,7 +757,10 @@ def _make_create_pr(client: GitHubClient, *, dry_run: bool) -> ToolFn:
             title: The pull request title.
             head_branch: The branch holding the fix, already pushed to origin.
             body: The pull request description. Reference the original PR here.
-            base_branch: Target branch. Defaults to the repository's default branch.
+            base_branch: Target branch. When fixing a branch on behalf of a bot
+                PR, pass that PR's 'base_ref' — the fix must land on the branch
+                the PR actually targets. Only defaults to the repository's
+                default branch when omitted.
 
         """
         _validate_repo_params(owner, repo)

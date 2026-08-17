@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from dependency_director.schemas import PullRequest
+
 
 def check_runs(*names_and_conclusions: tuple[str, str]) -> dict[str, Any]:
     """Build a check-runs payload in the shape the GitHub API returns."""
@@ -68,16 +70,24 @@ class FakeGitHub:
 
     # --- Reads the agent's decision depends on ---
 
-    async def list_open_prs(self, owner: str, repo: str) -> list[dict[str, Any]]:
+    def _base_ref(self, pr: dict[str, Any]) -> str:
+        """Return the branch a scripted PR targets, defaulting to the repo default."""
+        return str(pr.get("base_ref") or self._default_branch)
+
+    async def list_open_prs(self, owner: str, repo: str) -> list[PullRequest]:
         """Return the scripted open pull requests."""
         self._record("list_open_prs", owner, repo)
         return [
-            {
-                "number": pr["number"],
-                "title": pr["title"],
-                "author": pr["author"],
-                "created_at": "2026-08-01T00:00:00Z",
-            }
+            PullRequest.model_validate(
+                {
+                    "number": pr["number"],
+                    "title": pr["title"],
+                    "user": {"login": pr["author"]},
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "head": {"sha": pr["head_sha"], "ref": pr["head_ref"]},
+                    "base": {"ref": self._base_ref(pr)},
+                },
+            )
             for pr in self._prs
         ]
 
@@ -89,7 +99,7 @@ class FakeGitHub:
             "number": pr_number,
             "title": pr["title"],
             "head": {"sha": pr["head_sha"], "ref": pr["head_ref"]},
-            "base": {"ref": self._default_branch},
+            "base": {"ref": self._base_ref(pr)},
             "mergeable": True,
             "mergeable_state": "unstable",
         }

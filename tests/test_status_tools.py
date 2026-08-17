@@ -7,6 +7,7 @@ import httpx as httpx_mod
 import pytest
 
 from dependency_director.config import DEFAULT_BOTS, DEFAULT_MAX_FAILED_JOBS
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
     GitHubClient,
     GitHubNotFoundError,
@@ -734,3 +735,65 @@ async def test_tool_get_branch_ci_status_reports_which_checks_failed(
     assert result["ci_status"] == "RED"
     failed = [c["name"] for c in result["checks"] if c["conclusion"] == "failure"]
     assert failed == ["lint"]
+
+
+# --- The base branch the agent is told about must be the PR's own ---
+
+
+@pytest.fixture
+def list_bot_prs(tools: tuple[ToolFn, ...]) -> ToolFn:
+    """Fixture to retrieve the bot PR listing tool."""
+    fn = tools[8]
+    fn_name = getattr(fn, "__name__", "")
+    assert fn_name == "list_bot_prs", f"Unexpected tool at index 8: {fn_name!r}"
+    return fn
+
+
+@pytest.mark.asyncio
+async def test_list_bot_prs_reports_the_branch_each_pr_targets(
+    mock_client: MagicMock,
+    list_bot_prs: ToolFn,
+) -> None:
+    """The listing must name each PR's base, so the agent can check the right branch.
+
+    Without it the agent has nothing to pass to 'get_branch_ci_status' and
+    silently falls back to the repository default, diagnosing a branch the PR
+    does not target.
+    """
+    mock_client.list_open_prs = AsyncMock(
+        return_value=[
+            PullRequest.model_validate(
+                {
+                    "number": 5,
+                    "title": "bump lib",
+                    "user": {"login": DEFAULT_BOTS[0].author},
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "base": {"ref": "develop"},
+                },
+            ),
+        ],
+    )
+    result = json.loads(await list_bot_prs("owner", "repo"))
+    assert result["bot_prs"][0]["base_ref"] == "develop"
+
+
+@pytest.mark.asyncio
+async def test_pr_status_reports_the_branch_the_pr_targets(
+    mock_client: MagicMock,
+    get_pr_status: ToolFn,
+) -> None:
+    """A PR's status must carry its base, so a RED verdict can be attributed."""
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "bump",
+            "head": {"sha": "sha123"},
+            "base": {"ref": "release/2.0"},
+            "mergeable": True,
+            "mergeable_state": "clean",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_pr_status("owner", "repo", 42))
+    assert result["base_ref"] == "release/2.0"

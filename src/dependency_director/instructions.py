@@ -52,19 +52,22 @@ def get_system_instructions(
         base_red_action = (
             "the base is broken: follow the 'fix_base_branch' section, then log "
             "'⚠ #<n> not fixed: blocked on base branch fix PR' for this and every "
-            "remaining RED PR."
+            "remaining RED PR on that base."
         )
     else:
         base_red_action = (
             "the dependency PRs cannot go green on their own: do NOT clone, and log "
             "'⚠ #<n> not fixed: base branch <branch> is already failing CI (<failing checks>)' "
-            "for this and every remaining RED PR."
+            "for this and every remaining RED PR on that base."
         )
 
     base_health_check = (
-        "Before cloning, call 'get_branch_ci_status(owner, repo)' ONCE per run to "
-        "check the PR's base branch. Reuse that one result for every RED PR — do NOT "
-        "re-check it per PR. If the base is GREEN, the failure belongs to the PR: continue. "
+        "Before cloning, call 'get_branch_ci_status(owner, repo, branch)' with branch set to "
+        "the 'base_ref' that 'list_bot_prs' reported for this PR — never omit it, since the "
+        "tool then falls back to the repository default, which is the wrong branch for any PR "
+        "targeting elsewhere. Call it ONCE per distinct base_ref and reuse that one result for "
+        "every RED PR sharing that base — do NOT re-check the same base per PR. "
+        "If the base is GREEN, the failure belongs to the PR: continue. "
         "If it reports ci_status='RED', compare check names: a base failure only excuses "
         "the PR for the same check. If every check failing on the PR is also failing on "
         f"the base, {base_red_action} "
@@ -223,15 +226,17 @@ def get_system_instructions(
             types.SystemInstructionSection(
                 title="fix_base_branch",
                 content=(
-                    "When 'get_branch_ci_status' reports the base branch RED, repair the "
-                    "base before skipping the dependency PRs:\n"
-                    "- Clone, check out the base branch, and reproduce the failing checks.\n"
+                    "When 'get_branch_ci_status' reports a base branch RED, repair that "
+                    "base — the PR's 'base_ref', not the repository default — before "
+                    "skipping the dependency PRs on it:\n"
+                    "- Clone, check out that base_ref, and reproduce the failing checks.\n"
                     "- Fix ONLY what those checks fail on. No unrelated changes, refactors, "
                     "reformatting, or drive-by cleanups, even if you notice other problems.\n"
-                    "- If the failure does not reproduce on the base branch, make no changes "
+                    "- If the failure does not reproduce on that branch, make no changes "
                     "and report it — do not guess at a fix.\n"
-                    "- Push to 'dependency-director/fix-base-<branch>' and call 'create_pr' "
-                    "targeting the base branch, with a body listing the failing checks.\n"
+                    "- Push to 'dependency-director/fix-base-<base_ref>' and call "
+                    "'create_pr(..., base_branch=<base_ref>)' so the fix targets the branch "
+                    "that is actually broken, with a body listing the failing checks.\n"
                     "- MUST NOT push base fixes to a dependency PR branch, and MUST NOT mix "
                     "them into a dependency update commit.\n"
                     "- MUST NOT merge the base fix PR, even in auto-merge mode. Leave it for "
