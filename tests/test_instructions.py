@@ -165,6 +165,38 @@ def test_output_format(instructions: types.TemplatedSystemInstructions) -> None:
     assert str(3) in content
 
 
+def test_output_format_has_a_state_for_no_fix_attempted(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Verify there is a terminal state for a RED PR nobody tried to fix.
+
+    With only 'merged', 'skipped' and 'failed after N attempts' available, a
+    PR whose failure never reproduced gets reported as N exhausted attempts —
+    a claim about work that did not happen.
+    """
+    content = _section_content(instructions, "output_format")
+    assert "⚠" in content
+    assert "not fixed" in content.lower()
+
+
+def test_output_format_reports_attempts_actually_made(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Verify the failure line reports real attempt counts rather than always the maximum."""
+    content = _section_content(instructions, "output_format")
+    assert "actually made" in content.lower()
+
+
+def test_workflow_handles_a_failure_that_does_not_reproduce() -> None:
+    """Verify the agent is told what to do when local tests pass on a RED PR.
+
+    Without a branch for this case the agent invents one, which is how a PR
+    that passed locally on the first try was reported as three failed fixes.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert "reproduce" in content.lower()
+
+
 # --- max_attempts ---
 
 
