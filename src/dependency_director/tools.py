@@ -21,7 +21,15 @@ from dependency_director.argv import (
     resolve_exe,
     split_compound_argv,
 )
-from dependency_director.config import DEFAULT_COMMAND_TIMEOUT, DEFAULT_SRT_SETTINGS_PATH, SAFE_ENV_ALLOWLIST, BotConfig
+from dependency_director.config import (
+    DEFAULT_COMMAND_TIMEOUT,
+    DEFAULT_MAX_FAILED_JOBS,
+    DEFAULT_SRT_SETTINGS_PATH,
+    PASSING_RUN_CONCLUSIONS,
+    SAFE_ENV_ALLOWLIST,
+    WORKFLOW_LOG_TAIL_LINES,
+    BotConfig,
+)
 
 __all__ = ["CompoundPart", "split_compound_argv"]
 
@@ -843,11 +851,37 @@ def _make_wait_for_ci(client: GitHubClient) -> ToolFn:
     return wait_for_ci
 
 
+def _select_candidate_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pick the newest non-passing run for each distinct workflow.
+
+    A commit usually triggers several workflows, and re-running one adds
+    another run with the same name on the same SHA. Keep one run per workflow
+    name so every failing workflow is represented exactly once, by its most
+    recent attempt.
+    """
+    ordered = sorted(runs, key=lambda r: str(r.get("created_at") or ""), reverse=True)
+
+    selected: list[dict[str, Any]] = []
+    seen_workflows: set[str] = set()
+    for run in ordered:
+        # Fall back to the run id so unnamed runs are never merged together.
+        workflow = str(run.get("name") or run.get("id"))
+        if workflow in seen_workflows:
+            continue
+        seen_workflows.add(workflow)
+        if str(run.get("conclusion") or "").lower() in PASSING_RUN_CONCLUSIONS:
+            continue
+        selected.append(run)
+    return selected
+
+
 def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
     async def get_pr_workflow_run_logs(owner: str, repo: str, pr_number: int) -> str:
         """Fetch raw logs for failed GitHub Actions workflow runs on a pull request.
 
-        Returns log text for failed jobs, keeping only the last 50 lines of logs per job.
+        Covers every failing workflow on the PR's head commit, not just one.
+        Returns the tail of each failed job's log, capped at a few jobs; the
+        cap is stated in the output when it is reached.
         """
         pr_details = await client.get_pr_details(owner, repo, pr_number)
         head_sha = pr_details.get("head", {}).get("sha", "")
@@ -859,35 +893,52 @@ def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
         if not runs:
             return f"No workflow runs found for commit {head_sha}."
 
-        latest_run = runs[0]
-        run_id = latest_run["id"]
+        failed_jobs_logs: list[str] = []
+        total_failed = 0
 
-        jobs_data = await client.get_workflow_run_jobs(owner, repo, run_id)
-        jobs = jobs_data.get("jobs", [])
-
-        failed_jobs_logs = []
-        for job in jobs:
-            if job.get("conclusion") == "failure":
-                job_id = job["id"]
-                job_name = job["name"]
-                try:
-                    log_text = await client.get_job_logs(owner, repo, job_id)
-                    lines = log_text.splitlines()
-                    truncated_log = "\n".join(lines[-50:])
-                    failed_jobs_logs.append(
-                        f"--- FAILED JOB: {job_name} (ID: {job_id}) ---\n{truncated_log}\n",
-                    )
-                except (httpx.HTTPError, GitHubClientError) as e:
-                    failed_jobs_logs.append(
-                        f"--- FAILED JOB: {job_name} (ID: {job_id}) ---\nFailed to retrieve log: {e}\n",
-                    )
+        for run in _select_candidate_runs(runs):
+            workflow = str(run.get("name") or f"run {run['id']}")
+            jobs_data = await client.get_workflow_run_jobs(owner, repo, run["id"])
+            for job in jobs_data.get("jobs", []):
+                if job.get("conclusion") != "failure":
+                    continue
+                total_failed += 1
+                if len(failed_jobs_logs) >= DEFAULT_MAX_FAILED_JOBS:
+                    continue
+                failed_jobs_logs.append(await _format_failed_job(client, owner, repo, workflow, job))
 
         if not failed_jobs_logs:
-            return "No failed jobs found for the latest workflow run."
+            return f"No failed jobs found across {len(runs)} workflow run(s) for commit {head_sha}."
 
-        return "\n".join(failed_jobs_logs)
+        output = "\n".join(failed_jobs_logs)
+        omitted = total_failed - len(failed_jobs_logs)
+        if omitted:
+            output += f"\n--- {omitted} more failed job(s) omitted (cap: {DEFAULT_MAX_FAILED_JOBS}) ---\n"
+        return output
 
     return get_pr_workflow_run_logs
+
+
+async def _format_failed_job(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    workflow: str,
+    job: dict[str, Any],
+) -> str:
+    """Render one failed job as a labelled tail of its log.
+
+    The workflow name is part of the label because job names collide across
+    workflows ("build" in CI and in Release are different failures).
+    """
+    job_id = job["id"]
+    header = f"--- FAILED JOB: {workflow} / {job['name']} (ID: {job_id}) ---"
+    try:
+        log_text = await client.get_job_logs(owner, repo, job_id)
+    except (httpx.HTTPError, GitHubClientError) as e:
+        return f"{header}\nFailed to retrieve log: {e}\n"
+    tail = "\n".join(log_text.splitlines()[-WORKFLOW_LOG_TAIL_LINES:])
+    return f"{header}\n{tail}\n"
 
 
 def _make_list_bot_prs(client: GitHubClient, bots: list[BotConfig]) -> ToolFn:

@@ -26,6 +26,21 @@ DEFAULT_BOTS: list[BotConfig] = [
     BotConfig(author="renovate[bot]", rebase_command="@renovatebot rebase"),
 ]
 DEFAULT_COMMAND_TIMEOUT = 300
+
+# Failed CI jobs whose logs are returned for a single PR. Several workflows can
+# fail on one commit, and they usually fail for the same underlying reason, so
+# a handful of tails is enough to diagnose without flooding the context window.
+DEFAULT_MAX_FAILED_JOBS = 3
+
+# Lines kept from the end of each failed job's log. Failures report at the
+# bottom; the setup output above it is noise.
+WORKFLOW_LOG_TAIL_LINES = 50
+
+# Workflow run conclusions that cannot contain a failed job, so the run's jobs
+# are never fetched. Everything else — including an unset conclusion on a run
+# still in progress — is examined, since the per-job conclusion is the real
+# filter and an extra API call is cheaper than a missed failure.
+PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 DEFAULT_SRT_SETTINGS_PATH: str = str(
     importlib.resources.files("dependency_director") / "srt-settings.json",
 )
