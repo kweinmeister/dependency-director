@@ -112,12 +112,10 @@ The agent operates under two modes of programmatic safety:
      the active workspace. Sensitive files like `.env`,
      `.git/hooks`, and `.git/config` are always protected.
    - **Network restriction** — All inbound and outbound traffic
-     is blocked except for allowlisted VCS hosts
-     (`github.com`, `api.github.com`,
-     `raw.githubusercontent.com`, `codeload.github.com`,
-     `objects.githubusercontent.com`, `gitlab.com`,
-     `bitbucket.org`). Known exfiltration endpoints are
-     explicitly denied.
+     is blocked except for an allowlist of VCS hosts and package
+     registries (see
+     [Network allowlist](#network-allowlist) below). Known
+     exfiltration endpoints are explicitly denied.
    - **Argv-mode invocation** — Commands are parsed via
      `shlex.split` and passed to srt as an argv array (`srt
      -- *argv`). srt's POSIX quoter ensures each argument is
@@ -169,6 +167,43 @@ See
 and
 [`src/dependency_director/tools.py`](src/dependency_director/tools.py)
 for the full policy and validation implementation.
+
+### Network allowlist
+
+Verifying a dependency bump means installing it, so the sandbox has
+to reach the registry the bumped package lives in. Anything not on
+this list is blocked outbound. The list lives in
+[`srt-settings.json`](src/dependency_director/srt-settings.json);
+point `DEPDIRECTOR_SRT_SETTINGS` at your own copy to change it.
+
+<!-- markdownlint-disable MD013 MD060 -->
+
+| Purpose            | Hosts                                                                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git hosting        | `github.com`, `api.github.com`, `codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, `gitlab.com`, `api.gitlab.com`, `bitbucket.org`, `api.bitbucket.org`, `ssh.dev.azure.com` |
+| Python             | `pypi.org`, `files.pythonhosted.org`                                                                                                        |
+| JavaScript         | `registry.npmjs.org`, `registry.yarnpkg.com`                                                                                                |
+| Rust               | `*.crates.io` (covers the `index.crates.io` sparse index and `static.crates.io` downloads), `crates.io`                                     |
+| Go                 | `proxy.golang.org`                                                                                                                          |
+| Container images   | `*.docker.io`, `production.cloudflare.docker.com`, `ghcr.io`, `pkg-containers.githubusercontent.com`, `quay.io`, `mcr.microsoft.com`, `public.ecr.aws`, `*.pkg.dev` |
+
+<!-- markdownlint-enable MD013 MD060 -->
+
+Two entries are worth calling out:
+
+- **`*.crates.io`** — Cargo's sparse protocol (the default since
+  Rust 1.70) resolves the index at `index.crates.io`, which is a
+  different host from `crates.io`. Without it, any repository with
+  a compiled Rust extension fails at dependency resolution before a
+  single crate is fetched.
+- **Container registries** — Dependabot's `docker` ecosystem bumps
+  base-image tags, and the only way to verify such a PR is to pull
+  the new image. Each registry serves manifests and layer blobs from
+  different hosts (Docker Hub authenticates at `auth.docker.io` and
+  serves blobs from `production.cloudflare.docker.com`; GHCR serves
+  blobs from `pkg-containers.githubusercontent.com`), so both are
+  needed for a pull to complete. If you do not review Docker PRs,
+  removing these tightens the sandbox at no cost.
 
 > [!TIP]
 > **DependencyDirector works best on repositories with good test

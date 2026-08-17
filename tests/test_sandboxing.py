@@ -1,6 +1,7 @@
 """Tests for command and filesystem sandboxing in dependency-director."""
 
 import contextlib
+import fnmatch
 import inspect
 import json
 import shlex
@@ -939,6 +940,48 @@ def test_srt_settings_policy_assertions() -> None:
     expected_exfil_patterns = ["*.ngrok.io", "*.pipedream.com", "*.webhook.site", "*.requestbin.com"]
     for pattern in expected_exfil_patterns:
         assert pattern in denied_domains, f"network.deniedDomains missing exfil pattern: {pattern}"
+
+
+@pytest.mark.parametrize(
+    ("host", "why"),
+    [
+        # Cargo's sparse protocol (default since Rust 1.70) resolves the index
+        # here, not at crates.io. Without it every `uv sync` for a project with
+        # a Rust extension fails before a single crate is downloaded.
+        ("index.crates.io", "cargo sparse registry index"),
+        ("static.crates.io", "cargo crate downloads"),
+        ("crates.io", "cargo registry API"),
+        # Dependabot's docker ecosystem bumps base-image tags; verifying such a
+        # PR means pulling the new image.
+        ("registry-1.docker.io", "docker hub registry API"),
+        ("auth.docker.io", "docker hub token auth"),
+        ("index.docker.io", "docker hub index"),
+        ("production.cloudflare.docker.com", "docker hub layer blobs"),
+        ("ghcr.io", "github container registry"),
+        ("pkg-containers.githubusercontent.com", "ghcr layer blobs"),
+        ("quay.io", "quay registry"),
+        ("mcr.microsoft.com", "microsoft container registry"),
+        ("public.ecr.aws", "aws public ecr"),
+        # Pre-existing entries, asserted so a future edit cannot silently drop
+        # them while reshaping the list.
+        ("pypi.org", "python package index"),
+        ("files.pythonhosted.org", "python wheel downloads"),
+        ("registry.npmjs.org", "npm registry"),
+        ("proxy.golang.org", "go module proxy"),
+        ("api.github.com", "github api"),
+    ],
+)
+def test_srt_settings_allows_package_registries(host: str, why: str) -> None:
+    """Verify each registry host the agent must reach is covered by the allowlist.
+
+    Matches with fnmatch so a wildcard entry counts, which is how a single
+    ``*.crates.io`` covers both the index and the download host.
+    """
+    with Path(DEFAULT_SRT_SETTINGS_PATH).open() as f:
+        config = json.load(f)
+
+    patterns = config.get("network", {}).get("allowedDomains", [])
+    assert any(fnmatch.fnmatch(host, p) for p in patterns), f"network.allowedDomains does not cover {host} ({why})"
 
 
 # --- Compound && / || support (TDD) ---
