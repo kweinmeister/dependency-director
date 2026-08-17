@@ -447,6 +447,28 @@ configuration, agent prompt generation, and tool safety policies:
 uv run pytest
 ```
 
+### Live harness
+
+Some behaviour is decided by the model rather than by code — whether a
+red base branch excuses a red PR, for instance. Unit tests can only
+assert that the instructions say the right thing, not that the agent
+acts on it.
+
+The live harness closes that gap. It runs the real model, the real
+sandbox, and a real git repository built on disk, and substitutes only
+GitHub itself: a fake client serves scripted check results, so a
+scenario can put a base branch and a PR in any combination of red and
+green. The agent clones, edits, commits, and pushes for real, and
+assertions read back what landed on the remote.
+
+These tests are slow, consume tokens, and are not deterministic, so
+they are excluded from the default run and skipped without model
+credentials:
+
+```bash
+uv run pytest -m live
+```
+
 ### Static Analysis & Linting
 
 Type checking is performed using `ty`:
