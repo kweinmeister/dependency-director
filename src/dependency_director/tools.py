@@ -17,7 +17,6 @@ from typing import Any, NamedTuple, cast
 import httpx
 
 from dependency_director.argv import (
-    CompoundPart,
     resolve_exe,
     split_compound_argv,
 )
@@ -34,8 +33,27 @@ from dependency_director.config import (
     BotConfig,
     OutputLimits,
 )
-
-__all__ = ["CompoundPart", "split_compound_argv"]
+from dependency_director.schemas import (
+    BotPrList,
+    BotPrSummary,
+    BranchCiStatus,
+    ChangedFile,
+    CheckRunsResponse,
+    CheckSummary,
+    CommitDetails,
+    CommitStatusResponse,
+    CommitSummary,
+    FileContents,
+    PatchedFile,
+    PrStatus,
+    PullRequest,
+    WorkflowJob,
+    WorkflowJobsResponse,
+    WorkflowRun,
+    WorkflowRunsResponse,
+    json_payload,
+    summarize_checks,
+)
 
 
 class CommandResult(NamedTuple):
@@ -233,12 +251,7 @@ class GitHubClient:
     async def get_pr_author(self, owner: str, repo: str, pr_number: int) -> str:
         """Get the GitHub username/login of a pull request author."""
         data = await self.get_pr_details(owner, repo, pr_number)
-        user = data.get("user")
-        if isinstance(user, dict):
-            login = user.get("login")
-            if isinstance(login, str):
-                return login
-        return ""
+        return PullRequest.model_validate(data).author
 
     async def merge_pr(self, owner: str, repo: str, pr_number: int) -> dict[str, Any]:
         """Merge a pull request using the squash-and-merge method."""
@@ -380,12 +393,13 @@ class GitHubClient:
         self,
         owner: str,
         repo: str,
-    ) -> list[dict[str, Any]]:
-        """Fetch all open pull requests with minimal fields.
+    ) -> list[PullRequest]:
+        """Fetch all open pull requests, parsed into the slice we read.
 
-        Returns a compact list of dicts with only number, title, author, and
-        created_at. This avoids pulling in the huge body/changelog payloads
-        that dependency bots typically produce.
+        Validating here rather than passing raw dicts on keeps the fields this
+        project depends on — the base ref above all — declared in one place
+        instead of re-derived at every call site. The huge body/changelog
+        payloads dependency bots produce are dropped by the model.
         """
         params = {
             "state": "open",
@@ -393,13 +407,7 @@ class GitHubClient:
             "direction": "asc",
         }
         return [
-            {
-                "number": pr["number"],
-                "title": pr.get("title", ""),
-                "author": pr.get("user", {}).get("login", ""),
-                "created_at": pr.get("created_at", ""),
-            }
-            async for pr in self._list_paginated("pulls", owner, repo, params=params)
+            PullRequest.model_validate(pr) async for pr in self._list_paginated("pulls", owner, repo, params=params)
         ]
 
     async def get_pr_diff(
@@ -422,15 +430,15 @@ class GitHubClient:
         owner: str,
         repo: str,
         pr_number: int,
-    ) -> list[dict[str, Any]]:
+    ) -> list[ChangedFile]:
         """Fetch the list of files changed in a pull request."""
         return [
-            {
-                "filename": f["filename"],
-                "status": f.get("status", ""),
-                "additions": f.get("additions", 0),
-                "deletions": f.get("deletions", 0),
-            }
+            ChangedFile(
+                filename=f["filename"],
+                status=f.get("status", ""),
+                additions=f.get("additions", 0),
+                deletions=f.get("deletions", 0),
+            )
             async for f in self._list_paginated(f"pulls/{pr_number}/files", owner, repo)
         ]
 
@@ -455,7 +463,7 @@ class GitHubClient:
         repo: str,
         sha: str | None = None,
         per_page: int = 30,
-    ) -> list[dict[str, Any]]:
+    ) -> list[CommitSummary]:
         """Fetch recent commits for a repository or branch."""
         params: dict[str, Any] = {"per_page": per_page}
         if sha:
@@ -463,12 +471,12 @@ class GitHubClient:
         response = await self._get("commits", owner, repo, params=params)
         data = response.json()
         return [
-            {
-                "sha": c["sha"][:7],
-                "message": c.get("commit", {}).get("message", "").split("\n")[0],
-                "author": c.get("commit", {}).get("author", {}).get("name", ""),
-                "date": c.get("commit", {}).get("author", {}).get("date", ""),
-            }
+            CommitSummary(
+                sha=c["sha"][:7],
+                message=c.get("commit", {}).get("message", "").split("\n")[0],
+                author=c.get("commit", {}).get("author", {}).get("name", ""),
+                date=c.get("commit", {}).get("author", {}).get("date", ""),
+            )
             for c in data
         ]
 
@@ -477,24 +485,24 @@ class GitHubClient:
         owner: str,
         repo: str,
         sha: str,
-    ) -> dict[str, Any]:
+    ) -> CommitDetails:
         """Fetch details of a specific commit."""
         response = await self._get(f"commits/{sha}", owner, repo)
         data = response.json()
-        return {
-            "sha": data["sha"],
-            "message": data.get("commit", {}).get("message", ""),
-            "author": data.get("commit", {}).get("author", {}).get("name", ""),
-            "date": data.get("commit", {}).get("author", {}).get("date", ""),
-            "files": [
-                {
-                    "filename": f["filename"],
-                    "status": f.get("status", ""),
-                    "patch": f.get("patch", ""),
-                }
+        return CommitDetails(
+            sha=data["sha"],
+            message=data.get("commit", {}).get("message", ""),
+            author=data.get("commit", {}).get("author", {}).get("name", ""),
+            date=data.get("commit", {}).get("author", {}).get("date", ""),
+            files=[
+                PatchedFile(
+                    filename=f["filename"],
+                    status=f.get("status", ""),
+                    patch=f.get("patch", ""),
+                )
                 for f in data.get("files", [])
             ],
-        }
+        )
 
     async def list_branches(
         self,
@@ -862,52 +870,16 @@ def _make_get_pr_status(client: GitHubClient) -> ToolFn:
     return get_pr_status
 
 
-def _summarize_checks(
-    check_runs_data: dict[str, Any],
-    commit_status_data: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Reduce check runs and legacy statuses for a ref to (ci_status, checks).
-
-    ci_status is GREEN, RED, PENDING, or NONE. Modern check runs and the legacy
-    commit-status API are folded into one list because a repository may report
-    through either.
-    """
-    checks_summary: list[dict[str, Any]] = [
-        {
-            "name": run.get("name"),
-            "status": run.get("status"),
-            "conclusion": run.get("conclusion"),
-        }
-        for run in check_runs_data.get("check_runs", [])
-    ]
-
-    legacy_statuses = commit_status_data.get("statuses", [])
-    legacy_state = commit_status_data.get("state") if legacy_statuses else None
-    checks_summary.extend(
-        {
-            "name": status.get("context"),
-            "status": "completed",
-            "conclusion": "success"
-            if status.get("state") == "success"
-            else ("failure" if status.get("state") in ("failure", "error") else None),
-        }
-        for status in legacy_statuses
+async def _checks_for_ref(client: GitHubClient, owner: str, repo: str, ref: str) -> tuple[str, list[CheckSummary]]:
+    """Fetch and reduce both check APIs for one commit ref."""
+    check_runs_data, commit_status_data = await asyncio.gather(
+        client.get_commit_check_runs(owner, repo, ref),
+        client.get_commit_status(owner, repo, ref),
     )
-
-    has_failures = any(
-        r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
+    return summarize_checks(
+        CheckRunsResponse.model_validate(check_runs_data),
+        CommitStatusResponse.model_validate(commit_status_data),
     )
-    has_pending = any(r.get("status") not in ("completed", "success") for r in checks_summary)
-
-    ci_status = "NONE"
-    if has_failures or legacy_state in ("failure", "error"):
-        ci_status = "RED"
-    elif has_pending or legacy_state == "pending":
-        ci_status = "PENDING"
-    elif checks_summary or legacy_state == "success":
-        ci_status = "GREEN"
-
-    return ci_status, checks_summary
 
 
 def _make_get_branch_ci_status(client: GitHubClient) -> ToolFn:
@@ -920,20 +892,17 @@ def _make_get_branch_ci_status(client: GitHubClient) -> ToolFn:
         Args:
             owner: The owner of the repository.
             repo: The repository name.
-            branch: Branch to check. Defaults to the repository's default branch.
+            branch: Branch to check. Pass the PR's 'base_ref' — the branch it
+                actually targets, reported by 'list_bot_prs' and
+                'get_pr_status'. Only defaults to the repository's default
+                branch when omitted, which is the wrong branch for any PR
+                aimed elsewhere.
 
         """
         target = branch or await client.get_default_branch(owner, repo)
         # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
-        check_runs_data, commit_status_data = await asyncio.gather(
-            client.get_commit_check_runs(owner, repo, target),
-            client.get_commit_status(owner, repo, target),
-        )
-        ci_status, checks = _summarize_checks(check_runs_data, commit_status_data)
-        return json.dumps(
-            {"branch": target, "ci_status": ci_status, "checks": checks},
-            indent=2,
-        )
+        ci_status, checks = await _checks_for_ref(client, owner, repo, target)
+        return json_payload(BranchCiStatus(branch=target, ci_status=ci_status, checks=checks))
 
     return get_branch_ci_status
 
@@ -951,40 +920,33 @@ async def _check_ci(
     These are independent — a PR can be GREEN + CONFLICT (CI passes but
     has merge conflicts from a prior merge).
     """
-    pr_details = await client.get_pr_details(owner, repo, pr_number)
-    head_sha = pr_details.get("head", {}).get("sha", "")
-    mergeable = pr_details.get("mergeable")
-    mergeable_state = pr_details.get("mergeable_state")
+    pr = PullRequest.model_validate(await client.get_pr_details(owner, repo, pr_number))
 
-    checks_summary: list[dict[str, Any]] = []
+    checks_summary: list[CheckSummary] = []
     ci_status = "NONE"
-
-    if head_sha:
-        check_runs_data, commit_status_data = await asyncio.gather(
-            client.get_commit_check_runs(owner, repo, head_sha),
-            client.get_commit_status(owner, repo, head_sha),
-        )
-        ci_status, checks_summary = _summarize_checks(check_runs_data, commit_status_data)
+    if pr.head.sha:
+        ci_status, checks_summary = await _checks_for_ref(client, owner, repo, pr.head.sha)
 
     # Merge status is independent of CI status
-    if mergeable is False or mergeable_state in ("dirty", "conflict"):
+    if pr.mergeable is False or pr.mergeable_state in ("dirty", "conflict"):
         merge_status = "CONFLICT"
-    elif mergeable is True and mergeable_state in ("clean", "has_hooks", "unstable"):
+    elif pr.mergeable is True and pr.mergeable_state in ("clean", "has_hooks", "unstable"):
         merge_status = "CLEAN"
     else:
         merge_status = "UNKNOWN"
 
-    summary = {
-        "pr_number": pr_number,
-        "title": pr_details.get("title"),
-        "head_sha": head_sha,
-        "mergeable": mergeable,
-        "mergeable_state": mergeable_state,
-        "ci_status": ci_status,
-        "merge_status": merge_status,
-        "checks": checks_summary,
-    }
-    return ci_status, merge_status, json.dumps(summary, indent=2)
+    summary = PrStatus(
+        pr_number=pr_number,
+        title=pr.title,
+        head_sha=pr.head.sha,
+        base_ref=pr.base.ref,
+        mergeable=pr.mergeable,
+        mergeable_state=pr.mergeable_state,
+        ci_status=ci_status,
+        merge_status=merge_status,
+        checks=checks_summary,
+    )
+    return ci_status, merge_status, json_payload(summary)
 
 
 def _make_wait_for_ci(client: GitHubClient) -> ToolFn:
@@ -1015,25 +977,26 @@ def _make_wait_for_ci(client: GitHubClient) -> ToolFn:
     return wait_for_ci
 
 
-def _select_candidate_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _select_candidate_runs(runs: list[WorkflowRun]) -> list[WorkflowRun]:
     """Pick the newest non-passing run for each distinct workflow.
 
     A commit usually triggers several workflows, and re-running one adds
     another run with the same name on the same SHA. Keep one run per workflow
     name so every failing workflow is represented exactly once, by its most
-    recent attempt.
+    recent attempt. Timestamps are aware UTC by the time they arrive here, so
+    a re-run recorded with a numeric offset still orders against a 'Z' one.
     """
-    ordered = sorted(runs, key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    ordered = sorted(runs, key=lambda r: r.created_at, reverse=True)
 
-    selected: list[dict[str, Any]] = []
+    selected: list[WorkflowRun] = []
     seen_workflows: set[str] = set()
     for run in ordered:
         # Fall back to the run id so unnamed runs are never merged together.
-        workflow = str(run.get("name") or run.get("id"))
+        workflow = run.name or str(run.id)
         if workflow in seen_workflows:
             continue
         seen_workflows.add(workflow)
-        if str(run.get("conclusion") or "").lower() in PASSING_RUN_CONCLUSIONS:
+        if (run.conclusion or "").lower() in PASSING_RUN_CONCLUSIONS:
             continue
         selected.append(run)
     return selected
@@ -1047,13 +1010,15 @@ def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
         Returns the tail of each failed job's log, capped at a few jobs; the
         cap is stated in the output when it is reached.
         """
-        pr_details = await client.get_pr_details(owner, repo, pr_number)
-        head_sha = pr_details.get("head", {}).get("sha", "")
+        pr = PullRequest.model_validate(await client.get_pr_details(owner, repo, pr_number))
+        head_sha = pr.head.sha
         if not head_sha:
             return f"Error: No head SHA found for PR #{pr_number}."
 
-        runs_data = await client.get_workflow_runs_for_commit(owner, repo, head_sha)
-        runs = runs_data.get("workflow_runs", [])
+        runs_data = WorkflowRunsResponse.model_validate(
+            await client.get_workflow_runs_for_commit(owner, repo, head_sha),
+        )
+        runs = runs_data.workflow_runs
         if not runs:
             return f"No workflow runs found for commit {head_sha}."
 
@@ -1061,10 +1026,12 @@ def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
         total_failed = 0
 
         for run in _select_candidate_runs(runs):
-            workflow = str(run.get("name") or f"run {run['id']}")
-            jobs_data = await client.get_workflow_run_jobs(owner, repo, run["id"])
-            for job in jobs_data.get("jobs", []):
-                if job.get("conclusion") != "failure":
+            workflow = run.name or f"run {run.id}"
+            jobs_data = WorkflowJobsResponse.model_validate(
+                await client.get_workflow_run_jobs(owner, repo, run.id),
+            )
+            for job in jobs_data.jobs:
+                if job.conclusion != "failure":
                     continue
                 total_failed += 1
                 if len(failed_jobs_logs) >= DEFAULT_MAX_FAILED_JOBS:
@@ -1088,17 +1055,16 @@ async def _format_failed_job(
     owner: str,
     repo: str,
     workflow: str,
-    job: dict[str, Any],
+    job: WorkflowJob,
 ) -> str:
     """Render one failed job as a labelled tail of its log.
 
     The workflow name is part of the label because job names collide across
     workflows ("build" in CI and in Release are different failures).
     """
-    job_id = job["id"]
-    header = f"--- FAILED JOB: {workflow} / {job['name']} (ID: {job_id}) ---"
+    header = f"--- FAILED JOB: {workflow} / {job.name} (ID: {job.id}) ---"
     try:
-        log_text = await client.get_job_logs(owner, repo, job_id)
+        log_text = await client.get_job_logs(owner, repo, job.id)
     except (httpx.HTTPError, GitHubClientError) as e:
         return f"{header}\nFailed to retrieve log: {e}\n"
     tail = "\n".join(log_text.splitlines()[-WORKFLOW_LOG_TAIL_LINES:])
@@ -1109,16 +1075,25 @@ def _make_list_bot_prs(client: GitHubClient, bots: list[BotConfig]) -> ToolFn:
     async def list_bot_prs(owner: str, repo: str) -> str:
         """List open dependency-bot pull requests for a repository.
 
-        Returns a compact JSON list with only the essential fields:
-        number, title, author, and created_at. Sorted oldest first.
-        Only PRs authored by configured bots are included.
+        Returns a compact JSON list with only the essential fields: number,
+        title, author, created_at, and base_ref — the branch the PR targets,
+        which is what 'get_branch_ci_status' should be asked about. Sorted
+        oldest first. Only PRs authored by configured bots are included.
         """
         allowed_authors = {b.author for b in bots}
         all_prs = await client.list_open_prs(owner, repo)
-        bot_prs = [pr for pr in all_prs if pr["author"] in allowed_authors]
-        if not bot_prs:
-            return json.dumps({"bot_prs": [], "count": 0})
-        return json.dumps({"bot_prs": bot_prs, "count": len(bot_prs)}, indent=2)
+        bot_prs = [
+            BotPrSummary(
+                number=pr.number,
+                title=pr.title,
+                author=pr.author,
+                created_at=pr.created_at,
+                base_ref=pr.base.ref,
+            )
+            for pr in all_prs
+            if pr.author in allowed_authors
+        ]
+        return json_payload(BotPrList(bot_prs=bot_prs, count=len(bot_prs)))
 
     return list_bot_prs
 
@@ -1138,7 +1113,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
         additions count, and deletions count for each file.
         """
         files = await client.get_pr_files(owner, repo, pr_number)
-        return json.dumps(files, indent=2)
+        return json.dumps([f.model_dump() for f in files], indent=2)
 
     async def get_file_contents(
         owner: str,
@@ -1159,16 +1134,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
 
         """
         data = await client.get_file_contents(owner, repo, path, ref)
-        return json.dumps(
-            {
-                "name": data.get("name"),
-                "path": data.get("path"),
-                "size": data.get("size"),
-                "content": data.get("content"),
-                "encoding": data.get("encoding"),
-            },
-            indent=2,
-        )
+        return json_payload(FileContents.model_validate(data))
 
     async def list_commits(
         owner: str,
@@ -1188,7 +1154,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
 
         """
         commits = await client.list_commits(owner, repo, sha, per_page)
-        return json.dumps(commits, indent=2)
+        return json.dumps([c.model_dump() for c in commits], indent=2)
 
     async def get_commit_details(owner: str, repo: str, sha: str) -> str:
         """Get details of a specific commit including changed files and patches.
@@ -1202,8 +1168,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
         (each with filename, status, and patch).
 
         """
-        data = await client.get_commit(owner, repo, sha)
-        return json.dumps(data, indent=2)
+        return json_payload(await client.get_commit(owner, repo, sha))
 
     async def list_branches(owner: str, repo: str) -> str:
         """List branch names for a repository.

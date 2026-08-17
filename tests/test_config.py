@@ -31,6 +31,7 @@ from dependency_director.main import (
     _check_open_bot_prs,
     run_agent_for_repo,
 )
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import GitHubClient
 
 from .conftest import AsyncFSHelper
@@ -915,6 +916,13 @@ async def test_run_agent_for_repo_early_halt(
 # --- Issue #7: _check_open_bot_prs uses provided client ---
 
 
+def _pr(number: int, title: str, author: str) -> PullRequest:
+    """Build the parsed pull request that list_open_prs now returns."""
+    return PullRequest.model_validate(
+        {"number": number, "title": title, "user": {"login": author}, "created_at": "2026-01-01"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_check_open_bot_prs_uses_provided_client() -> None:
     """_check_open_bot_prs must use the provided GitHubClient, not create its own.
@@ -924,9 +932,9 @@ async def test_check_open_bot_prs_uses_provided_client() -> None:
     mock_client = MagicMock(spec=GitHubClient)
     mock_client.list_open_prs = AsyncMock(
         return_value=[
-            {"number": 1, "title": "bump foo", "author": "dependabot[bot]", "created_at": "2026-01-01"},
-            {"number": 2, "title": "bump bar", "author": "human-user", "created_at": "2026-01-02"},
-            {"number": 3, "title": "bump baz", "author": "renovate[bot]", "created_at": "2026-01-03"},
+            _pr(1, "bump foo", "dependabot[bot]"),
+            _pr(2, "bump bar", "human-user"),
+            _pr(3, "bump baz", "renovate[bot]"),
         ],
     )
 
@@ -934,8 +942,8 @@ async def test_check_open_bot_prs_uses_provided_client() -> None:
 
     mock_client.list_open_prs.assert_called_once_with("owner", "repo")
     assert len(result) == 2
-    assert result[0]["number"] == 1
-    assert result[1]["number"] == 3
+    assert result[0].number == 1
+    assert result[1].number == 3
 
 
 @pytest.mark.asyncio
@@ -944,8 +952,8 @@ async def test_check_open_bot_prs_filters_by_custom_bots() -> None:
     mock_client = MagicMock(spec=GitHubClient)
     mock_client.list_open_prs = AsyncMock(
         return_value=[
-            {"number": 1, "title": "bump foo", "author": "dependabot[bot]", "created_at": "2026-01-01"},
-            {"number": 2, "title": "bump bar", "author": "custom[bot]", "created_at": "2026-01-02"},
+            _pr(1, "bump foo", "dependabot[bot]"),
+            _pr(2, "bump bar", "custom[bot]"),
         ],
     )
     custom_bots = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
@@ -953,7 +961,7 @@ async def test_check_open_bot_prs_filters_by_custom_bots() -> None:
     result = await _check_open_bot_prs("owner", "repo", mock_client, custom_bots)
 
     assert len(result) == 1
-    assert result[0]["number"] == 2
+    assert result[0].number == 2
 
 
 # --- Issue #3: agent.chat error does not crash multi-repo sweep ---

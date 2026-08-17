@@ -27,6 +27,7 @@ from dependency_director.config import (
     get_safety_policies,
 )
 from dependency_director.instructions import get_system_instructions
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
     GitHubClient,
     GitHubClientError,
@@ -95,10 +96,10 @@ async def _check_open_bot_prs(
     repo_name: str,
     client: GitHubClient,
     bots: list[BotConfig],
-) -> list[dict[str, Any]]:
+) -> list[PullRequest]:
     open_prs = await client.list_open_prs(owner, repo_name)
     allowed_authors = {b.author for b in bots}
-    return [pr for pr in open_prs if pr.get("author") in allowed_authors]
+    return [pr for pr in open_prs if pr.author in allowed_authors]
 
 
 class _SdkIssueCollector(logging.Handler):

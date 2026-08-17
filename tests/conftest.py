@@ -10,6 +10,7 @@ import httpx as httpx_mod
 import pytest
 
 from dependency_director.config import DEFAULT_BOTS, BotConfig
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import GitHubClient, ToolFn, _make_write_tools
 
 
@@ -106,7 +107,7 @@ def mock_list_open_prs() -> Generator[MagicMock]:
         new_callable=AsyncMock,
     ) as mock:
 
-        async def side_effect(_owner: str, _repo: str) -> list[dict[str, str | int]]:
+        async def side_effect(_owner: str, _repo: str) -> list[PullRequest]:
             allowed_authors = ["dependabot[bot]"]
             frame = inspect.currentframe()
             while frame:
@@ -118,12 +119,15 @@ def mock_list_open_prs() -> Generator[MagicMock]:
                 frame = frame.f_back
 
             return [
-                {
-                    "number": 12 + i,
-                    "title": f"bump foo for {author}",
-                    "author": author,
-                    "created_at": "2026-06-08T00:00:00Z",
-                }
+                PullRequest.model_validate(
+                    {
+                        "number": 12 + i,
+                        "title": f"bump foo for {author}",
+                        "user": {"login": author},
+                        "created_at": "2026-06-08T00:00:00Z",
+                        "base": {"ref": "main"},
+                    },
+                )
                 for i, author in enumerate(allowed_authors)
             ]
 
