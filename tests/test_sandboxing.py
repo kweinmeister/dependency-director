@@ -830,6 +830,43 @@ def test_validate_sandboxed_command_git_config() -> None:
     assert validate_argv(shlex.split("git status"), temp_dir) is None
 
 
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        "env LD_PRELOAD=evil.so git status",
+        "env DYLD_INSERT_LIBRARIES=evil.dylib git status",
+        "env GIT_SSH_COMMAND=evil git fetch origin",
+        "env GIT_CONFIG_PARAMETERS=core.sshcommand=evil git status",
+        "env -u PATH LD_PRELOAD=evil.so git status",
+        "/usr/bin/env LD_LIBRARY_PATH=/evil python3 -m pytest",
+    ],
+)
+def test_validate_argv_blocks_env_passed_variables(command_line: str) -> None:
+    """Verify blocked env vars are caught when passed through ``env`` too.
+
+    A bare ``LD_PRELOAD=x cmd`` was already rejected, but the same assignment
+    written as ``env LD_PRELOAD=x cmd`` reaches the process identically and
+    must be rejected on the same terms.
+    """
+    res = validate_argv(shlex.split(command_line), tempfile.gettempdir())
+    assert res is not None
+    assert "Security Error" in res
+
+
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        "env DATABASE_URL=sqlite:///:memory: pytest",
+        "env SECRET_KEY=dummy YOUTUBE_API_KEY=dummy uv run pytest",
+        "env GIT_TERMINAL_PROMPT=0 git fetch origin",
+        "env CI=true uv sync",
+    ],
+)
+def test_validate_argv_allows_ordinary_env_usage(command_line: str) -> None:
+    """Verify the env-var check does not block the form the agent is told to use."""
+    assert validate_argv(shlex.split(command_line), tempfile.gettempdir()) is None
+
+
 @pytest.mark.asyncio
 async def test_create_run_command_tool_agent_registration(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
     """Verify that create_run_command_tool successfully registers with the Agent config.

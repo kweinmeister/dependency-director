@@ -16,20 +16,14 @@ from typing import Any, NamedTuple, cast
 
 import httpx
 
+from dependency_director.argv import (
+    CompoundPart,
+    resolve_exe,
+    split_compound_argv,
+)
 from dependency_director.config import DEFAULT_COMMAND_TIMEOUT, DEFAULT_SRT_SETTINGS_PATH, SAFE_ENV_ALLOWLIST, BotConfig
 
-
-class CompoundPart(NamedTuple):
-    """A sub-command extracted from a compound argv list.
-
-    Attributes:
-        argv: The sub-command argument list.
-        operator: The operator preceding this sub-command (None for the first).
-
-    """
-
-    argv: list[str]
-    operator: str | None
+__all__ = ["CompoundPart", "split_compound_argv"]
 
 
 class CommandResult(NamedTuple):
@@ -47,7 +41,6 @@ class CommandResult(NamedTuple):
 
 OWNER_RE = re.compile(r"^[a-zA-Z0-9-]{1,39}$")
 REPO_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
-_ENV_FLAGS_WITH_ARG = {"-u", "--unset"}
 
 
 class GitHubClientError(Exception):
@@ -1222,50 +1215,6 @@ def _check_git_command(tokens: list[str], idx: int, operators: set[str]) -> str 
     return None
 
 
-def _extract_env_command_exe(tokens: list[str], idx: int) -> str:
-    exe_name = "env"
-    if len(tokens) > idx + 1:
-        j = idx + 1
-        while j < len(tokens):
-            t = tokens[j]
-            if t == "--":
-                j += 1
-                if j < len(tokens):
-                    exe_name = Path(tokens[j]).name.lower()
-                break
-            if t in _ENV_FLAGS_WITH_ARG:
-                j += 2
-            elif t.startswith("-") or "=" in t:
-                j += 1
-            else:
-                exe_name = Path(t).name.lower()
-                break
-    return exe_name
-
-
-def split_compound_argv(argv: list[str]) -> list[CompoundPart]:
-    """Split an argv list on ``&&`` and ``||`` tokens into sub-commands.
-
-    Returns a list of CompoundPart(argv, operator) tuples.  The first
-    part has operator=None; subsequent parts record the joining operator.
-    """
-    compound_ops = {"&&", "||"}
-    parts: list[CompoundPart] = []
-    current: list[str] = []
-    current_op: str | None = None
-
-    for token in argv:
-        if token in compound_ops:
-            parts.append(CompoundPart(argv=current, operator=current_op))
-            current = []
-            current_op = token
-        else:
-            current.append(token)
-
-    parts.append(CompoundPart(argv=current, operator=current_op))
-    return parts
-
-
 def _check_shell_operators(argv: list[str]) -> str | None:
     """Return an error if dangerous shell operators are present as tokens."""
     dangerous_operators = {";", "|", "&"}
@@ -1280,25 +1229,25 @@ def _check_shell_operators(argv: list[str]) -> str | None:
 def _resolve_exe(argv: list[str]) -> tuple[int, str] | str:
     """Return (exe_idx, exe_name) or an error string.
 
-    Walk leading ``KEY=val`` env-var assignments, validate each, then
-    identify the executable index and normalized name.
+    Identify the executable index and normalized name, then validate every
+    ``KEY=val`` assignment attached to it — whether written bare or passed
+    through ``env``, since both reach the process the same way.
     """
-    for i, token in enumerate(argv):
-        if "=" in token and not token.startswith("-"):
-            err = _check_env_var_token(token)
-            if err:
-                return err
-            continue
-        exe_idx = i
-        exe_name = Path(argv[exe_idx]).name.lower()
-        # Unwrap `env` wrapper
-        if exe_name == "env":
-            for j in range(exe_idx + 1, len(argv)):
-                if argv[j] in ("-S", "--split-string"):
-                    return "Security Error: 'env -S/--split-string' is blocked."
-            exe_name = _extract_env_command_exe(argv, exe_idx)
-        return exe_idx, exe_name
-    return "Security Error: No executable found in command."
+    resolved = resolve_exe(argv)
+    if resolved is None:
+        return "Security Error: No executable found in command."
+
+    for token in resolved.env_assignments:
+        err = _check_env_var_token(token)
+        if err:
+            return err
+
+    if Path(argv[resolved.wrapper_idx]).name.lower() == "env":
+        for token in argv[resolved.wrapper_idx + 1 :]:
+            if token in ("-S", "--split-string"):
+                return "Security Error: 'env -S/--split-string' is blocked."
+
+    return resolved.wrapper_idx, resolved.name
 
 
 def _check_exec_pivots(exe_name: str, argv: list[str], exe_idx: int) -> str | None:

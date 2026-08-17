@@ -241,6 +241,74 @@ def test_dry_run_git_push_substring() -> None:
     assert block_push.when({"command_line": "git -C dir push"}) is True
 
 
+@pytest.mark.parametrize(
+    ("command_line", "blocked"),
+    [
+        # --- Plain invocations ---
+        ("git push origin main", True),
+        ("git push origin pr-90:dependabot/pip/ty-0.0.64", True),
+        ("/usr/bin/git push origin main", True),
+        ("git -C dir push", True),
+        ("git -c user.name=x push origin main", True),
+        # --- env(1) wrappers: the form the system instructions tell the agent to use ---
+        ("env GIT_TERMINAL_PROMPT=0 git push origin main", True),
+        ("env -u SSH_AUTH_SOCK git push origin main", True),
+        ("env -- git push origin main", True),
+        ("/usr/bin/env GIT_TERMINAL_PROMPT=0 git push origin main", True),
+        # --- Bare KEY=val prefixes ---
+        ("GIT_AUTHOR_NAME=x git push origin main", True),
+        ("A=1 B=2 git push origin main", True),
+        # --- Compound commands where git is not the leading token ---
+        ("ls && git push origin main", True),
+        ("git status && git push origin main", True),
+        ("uv run pytest || git push origin main", True),
+        ("git add -A && env FOO=1 git push origin main", True),
+        # --- Must stay allowed ---
+        ("git status", False),
+        ("git pull", False),
+        ("git pushup", False),
+        ("git fetch origin pull/90/head:pr-90", False),
+        ("git merge origin/main", False),
+        ("echo push", False),
+        ("env FOO=bar uv sync", False),
+        ("uv run pytest && ruff check .", False),
+        ("git commit -m push", False),
+        ("env FOO=push git status", False),
+        ("", False),
+    ],
+)
+def test_dry_run_push_guard_resists_wrappers(command_line: str, *, blocked: bool) -> None:
+    """Verify the dry-run push guard cannot be evaded by env or compound wrappers.
+
+    The agent is instructed to prefix commands with ``env KEY=val`` (see
+    ``get_system_instructions``), so a guard that only inspects ``argv[0]``
+    would let real pushes through during a dry run.
+    """
+    block_push = next(p for p in get_dry_run_policies() if p.name == "dry_run_block_push")
+    assert block_push.when({"command_line": command_line}) is blocked
+
+
+def test_dry_run_push_guard_covers_both_arg_spellings() -> None:
+    """Verify the guard reads both 'command_line' and legacy 'CommandLine' args."""
+    block_push = next(p for p in get_dry_run_policies() if p.name == "dry_run_block_push")
+    assert block_push.when({"CommandLine": "env FOO=1 git push origin main"}) is True
+    assert block_push.when({}) is False
+
+
+def test_dry_run_push_guard_applies_to_sandboxed_tool() -> None:
+    """Verify the sandboxed runner is guarded identically to the builtin runner."""
+    policies = get_dry_run_policies()
+    sandboxed = next(p for p in policies if p.name == "dry_run_block_push_sandboxed")
+    assert sandboxed.when({"command_line": "env FOO=1 git push origin main"}) is True
+    assert sandboxed.when({"command_line": "git status"}) is False
+
+
+def test_dry_run_push_guard_handles_unparseable_quoting() -> None:
+    """Verify an unbalanced quote fails closed when it mentions a push."""
+    block_push = next(p for p in get_dry_run_policies() if p.name == "dry_run_block_push")
+    assert block_push.when({"command_line": 'git push origin "unclosed'}) is True
+
+
 @pytest.mark.asyncio
 async def test_workspace_cleanup_on_start(
     mock_agent_class: MagicMock,

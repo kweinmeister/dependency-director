@@ -2,12 +2,13 @@
 
 import importlib.resources
 import shlex
-from pathlib import Path
 from typing import Any
 
 from google.antigravity.hooks import policy
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from dependency_director.argv import is_git_push_argv
 
 
 class BotConfig(BaseModel):
@@ -157,13 +158,9 @@ def get_dry_run_policies() -> list[Any]:
         try:
             tokens = shlex.split(cmd_stripped)
         except ValueError:
+            # Unparseable quoting: fail closed rather than guess.
             return "git" in cmd_stripped and "push" in cmd_stripped
-        if not tokens:
-            return False
-        exe_name = Path(tokens[0]).name.lower()
-        if exe_name == "git":
-            return "push" in [t.lower() for t in tokens[1:]]
-        return False
+        return is_git_push_argv(tokens)
 
     return [
         policy.deny("run_command", when=is_git_push, name="dry_run_block_push"),
