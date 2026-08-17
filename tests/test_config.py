@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -637,6 +638,96 @@ async def test_run_agent_for_repo_processes_chunks(mock_agent_class: MagicMock, 
         standalone_fix=False,
         review_wait=0,
     )
+
+
+async def _empty_chunks() -> AsyncGenerator[types.Text]:
+    """Yield no chunks, as a turn that produced nothing renderable does."""
+    return
+    yield types.Text(text="", step_index=0)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_reports_a_clean_turn_as_completed(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify a turn that logs nothing is still reported as a clean completion."""
+    _ = mock_agent_class
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+    assert "Agent execution completed for test-owner/test-repo" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_surfaces_errors_the_sdk_only_logged(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The SDK reports some terminal failures by logging, not raising or yielding a chunk.
+
+    A model-output loop is the case seen in practice: the turn ends early with
+    truncated output while the run still claims to have completed.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    async def _chat_that_logs_a_system_error(_prompt: str) -> MagicMock:
+        logging.getLogger().warning(
+            "System step error (HTTP %s): %s",
+            0,
+            "Detected a loop in the model's output.",
+        )
+        response = MagicMock()
+        response.chunks = _empty_chunks()
+        return response
+
+    mock_agent_class.return_value.chat = AsyncMock(side_effect=_chat_that_logs_a_system_error)
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+    output = capsys.readouterr().out
+    assert "Detected a loop in the model's output." in output
+    assert "Agent execution completed" not in output
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_ignores_its_own_log_records(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Our own warnings are already on screen; re-reporting them would double up."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    async def _chat_that_triggers_our_own_warning(_prompt: str) -> MagicMock:
+        logging.getLogger("dependency_director.main").warning("A warning we emitted ourselves")
+        response = MagicMock()
+        response.chunks = _empty_chunks()
+        return response
+
+    mock_agent_class.return_value.chat = AsyncMock(side_effect=_chat_that_triggers_our_own_warning)
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+    assert "Agent execution completed for test-owner/test-repo" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

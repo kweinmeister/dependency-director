@@ -101,6 +101,28 @@ async def _check_open_bot_prs(
     return [pr for pr in open_prs if pr.get("author") in allowed_authors]
 
 
+class _SdkIssueCollector(logging.Handler):
+    """Collect warning-or-worse log records emitted by anything but us.
+
+    The SDK reports some terminal conditions by logging rather than raising or
+    yielding a chunk — a loop detected in the model's output arrives as
+    'System step error (HTTP 0): ...' on the root logger. The turn then ends
+    quietly with truncated output, and the caller has no way to tell it apart
+    from a clean run.
+    """
+
+    def __init__(self) -> None:
+        """Collect at WARNING and above."""
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Record the message unless we logged it ourselves."""
+        if record.name.startswith("dependency_director"):
+            return
+        self.messages.append(record.getMessage())
+
+
 async def _render_agent_response(response: types.ChatResponse) -> None:
     text_buffer: list[str] = []
 
@@ -331,6 +353,9 @@ async def run_agent_for_repo(
             )
             click.secho(wrapped_prompt, fg="blue")
 
+            issues = _SdkIssueCollector()
+            root_logger = logging.getLogger()
+            root_logger.addHandler(issues)
             try:
                 response = await agent.chat(prompt)
                 await _render_agent_response(response)
@@ -340,10 +365,21 @@ async def run_agent_for_repo(
                     f"\n[bold red]❌ Agent execution failed for {repo} (see log above).[/bold red]",
                 )
                 return
+            finally:
+                root_logger.removeHandler(issues)
 
-            console.print(
-                f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
-            )
+            if issues.messages:
+                console.print(
+                    f"\n[bold yellow]⚠ Agent execution for {repo} ended with "
+                    f"{len(issues.messages)} error(s) the SDK only logged; "
+                    f"the run may be incomplete.[/bold yellow]",
+                )
+                for message in issues.messages:
+                    console.print(f"  [yellow]{message}[/yellow]")
+            else:
+                console.print(
+                    f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
+                )
 
             usage = agent.conversation.total_usage
             cached = usage.cached_content_token_count or 0
