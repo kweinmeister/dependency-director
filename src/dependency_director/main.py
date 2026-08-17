@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import click
 import httpx
 from google.antigravity import Agent, LocalAgentConfig, types
-from google.antigravity.hooks import hooks
+from google.antigravity.hooks import hooks, policy
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -178,6 +178,11 @@ async def _prepare_agent_environment(
         Path(tempfile.gettempdir()) / f"dependency-director-{repo_hash}",
     )
     await asyncio.to_thread(_prepare_workspace, workspace_tmp)
+
+    # srt only sandboxes run_command_sandboxed. The SDK's own view/edit/create
+    # file tools bypass it, so under allow("*") they can reach any path on the
+    # host. Listing workspaces does not bound them; this policy does.
+    policies = [*policy.workspace_only([str(SKILLS_PATH), workspace_tmp]), *policies]
 
     if settings.no_sandbox:
         run_command = None

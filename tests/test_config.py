@@ -523,11 +523,11 @@ async def test_agent_workspaces_exclude_our_own_source_tree(
     mock_agent_class: MagicMock,
     github_token: str,
 ) -> None:
-    """Workspaces grant the model file tools, so our checkout must not be one.
+    """The workspace list bounds the file tools, so our checkout must not be in it.
 
     PROJECT_ROOT holds this project's own source and the .env our template tells
     users to create there, holding GITHUB_TOKEN and GEMINI_API_KEY. The skill
-    loads from skills_paths, a separate mechanism, so granting the whole root
+    loads from skills_paths, a separate mechanism, so listing the whole root
     buys nothing and exposes credentials to read and the source to rewrite.
     """
     settings = Settings()
@@ -546,9 +546,50 @@ async def test_agent_workspaces_exclude_our_own_source_tree(
     workspaces = mock_agent_class.call_args[1]["config"].workspaces
     assert str(PROJECT_ROOT) not in workspaces
     assert str(SKILLS_PATH) in workspaces
-    # Nothing granted may contain our own source, however it is spelled.
+    # Nothing listed may contain our own source, however it is spelled.
     our_source = Path(main.__file__).resolve()
     assert not any(our_source.is_relative_to(Path(ws).resolve()) for ws in workspaces)
+
+
+@pytest.mark.asyncio
+async def test_file_tools_are_denied_outside_the_workspace(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """The workspace list is inert on its own; a policy has to enforce it.
+
+    srt sandboxes run_command_sandboxed, but the SDK's built-in view/edit/create
+    file tools do not go through it. Under a bare allow("*") they reach any path
+    on the host — ~/.ssh, ~/.aws/credentials, our own .env. Only
+    policy.workspace_only() actually bounds them.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+    config_passed = mock_agent_class.call_args[1]["config"]
+    guarded = {p.tool: p for p in config_passed.policies if p.name == "workspace_only"}
+    assert {t.value for t in BuiltinTools.file_tools()} <= guarded.keys()
+
+    workspace = next(ws for ws in config_passed.workspaces if "dependency-director-" in ws)
+    for tool_policy in guarded.values():
+        assert tool_policy.decision is policy.Decision.DENY
+        assert tool_policy.when(types.ToolCall(name="view_file", args={}, canonical_path="/etc/passwd"))
+        assert tool_policy.when(
+            types.ToolCall(name="view_file", args={}, canonical_path=str(Path(main.__file__).resolve())),
+        )
+        assert not tool_policy.when(
+            types.ToolCall(name="view_file", args={}, canonical_path=f"{workspace}/repo/setup.py"),
+        )
 
 
 @pytest.mark.parametrize(
