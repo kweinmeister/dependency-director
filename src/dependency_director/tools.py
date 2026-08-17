@@ -1532,6 +1532,28 @@ def validate_argv(argv: list[str], workspace_dir: str) -> str | None:
     return None
 
 
+def _splice_middle[T: (str, list[str])](units: T, cap: int, marker_for: Callable[[int], T]) -> T:
+    """Keep the head and tail of ``units``, naming what was dropped between.
+
+    ``units`` is measured in whatever the cap counts: a string for a character
+    budget, a list of lines for a line budget. ``marker_for`` returns the
+    replacement for the middle in the same currency, so its own size is
+    charged against the cap rather than added on top of it — otherwise every
+    truncated stream comes back over the limit the caller configured.
+    """
+    if cap <= 0 or len(units) <= cap:
+        return units
+
+    # Reserve against the longest the marker can get. Its length only grows
+    # with the omitted count, so sizing on the whole input can never underrun.
+    budget = max(cap - len(marker_for(len(units))), 0)
+    head_n = int(budget * OUTPUT_HEAD_FRACTION)
+    tail_n = budget - head_n
+    head = units[:head_n]
+    tail = units[len(units) - tail_n :] if tail_n else units[:0]
+    return (head + marker_for(len(units) - budget) + tail)[:cap]
+
+
 def _truncate_middle(text: str, limits: OutputLimits) -> str:
     """Trim the middle out of ``text`` to fit within ``limits``.
 
@@ -1541,22 +1563,11 @@ def _truncate_middle(text: str, limits: OutputLimits) -> str:
     catches output that is short on lines but enormous on one of them.
     """
     if limits.max_lines > 0:
-        lines = text.splitlines()
-        if len(lines) > limits.max_lines:
-            head_n = int(limits.max_lines * OUTPUT_HEAD_FRACTION)
-            tail_n = limits.max_lines - head_n
-            omitted = len(lines) - limits.max_lines
-            text = "\n".join(
-                [*lines[:head_n], f"... [{omitted} lines omitted] ...", *lines[-tail_n:]],
-            )
+        text = "\n".join(
+            _splice_middle(text.splitlines(), limits.max_lines, lambda n: [f"... [{n} lines omitted] ..."]),
+        )
 
-    if limits.max_chars > 0 and len(text) > limits.max_chars:
-        head_n = int(limits.max_chars * OUTPUT_HEAD_FRACTION)
-        tail_n = limits.max_chars - head_n
-        omitted = len(text) - limits.max_chars
-        text = f"{text[:head_n]}\n... [{omitted} characters omitted] ...\n{text[-tail_n:]}"
-
-    return text
+    return _splice_middle(text, limits.max_chars, lambda n: f"\n... [{n} characters omitted] ...\n")
 
 
 def _format_command_result(

@@ -44,6 +44,11 @@ OUTPUT_HEAD_FRACTION = 0.2
 class OutputLimits(NamedTuple):
     """Caps applied to a single command's stdout and stderr.
 
+    Each cap applies per stream, so a command that floods both can return
+    twice ``max_chars`` in total. That is deliberate: halving the budget would
+    cost a stdout-only failure half its output to guard against a case that
+    only arises when both streams are already saturated.
+
     Attributes:
         max_lines: Maximum lines kept per stream; 0 disables the line cap.
         max_chars: Maximum characters kept per stream; 0 disables the char cap.

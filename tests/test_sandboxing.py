@@ -4,6 +4,7 @@ import contextlib
 import fnmatch
 import inspect
 import json
+import re
 import shlex
 import tempfile
 from pathlib import Path
@@ -18,6 +19,7 @@ from dependency_director.tools import (
     CommandResult,
     SandboxedCommandRunner,
     _format_command_result,
+    _truncate_middle,
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
@@ -1225,14 +1227,47 @@ def test_command_output_line_cap_keeps_head_and_tail() -> None:
     assert "line0" in out
     assert "line999" in out
     assert "line500" not in out
-    assert "800 lines omitted" in out
+    # 199 lines survive: the marker occupies the 200th against the cap.
+    assert "801 lines omitted" in out
 
 
 def test_command_output_char_cap_bounds_a_single_long_line() -> None:
     """Verify one enormous line is capped, which the line cap alone cannot do."""
     out = _format_command_result(b"x" * 100_000, b"", 0, OutputLimits(max_lines=200, max_chars=24_000))
-    assert len(out) < 30_000
+    stdout_section = out.split("--- STDOUT ---\n", 1)[1].split("\n--- STDERR ---", 1)[0]
+    assert len(stdout_section) <= 24_000
     assert "characters omitted" in out
+
+
+@pytest.mark.parametrize("max_chars", [100, 1_000, 24_000])
+@pytest.mark.parametrize("size", [1_000, 100_000])
+def test_truncation_stays_within_the_char_cap(size: int, max_chars: int) -> None:
+    """Verify the cap bounds the result, marker included.
+
+    The marker and its newlines are part of what the model has to read, so a
+    budget spent entirely on head and tail before splicing the marker in
+    overshoots the cap the caller configured.
+    """
+    out = _truncate_middle("x" * size, OutputLimits(max_lines=0, max_chars=max_chars))
+    assert len(out) <= max_chars
+
+
+@pytest.mark.parametrize("max_lines", [3, 50, 200])
+def test_truncation_stays_within_the_line_cap(max_lines: int) -> None:
+    """Verify the marker line counts against the line cap rather than adding to it."""
+    text = "\n".join(f"line{i}" for i in range(1_000))
+    out = _truncate_middle(text, OutputLimits(max_lines=max_lines, max_chars=0))
+    assert len(out.splitlines()) <= max_lines
+
+
+def test_truncation_reports_how_much_it_actually_dropped() -> None:
+    """Verify the omitted count matches what is missing, so the agent can trust it."""
+    text = "\n".join(f"line{i}" for i in range(1_000))
+    out = _truncate_middle(text, OutputLimits(max_lines=100, max_chars=0))
+    kept = [line for line in out.splitlines() if "omitted" not in line]
+    match = re.search(r"\[(\d+) lines omitted\]", out)
+    assert match is not None
+    assert int(match.group(1)) == 1_000 - len(kept)
 
 
 @pytest.mark.parametrize(
