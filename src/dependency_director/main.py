@@ -428,8 +428,6 @@ def _check_api_keys(settings: Settings) -> None:
 
 
 async def _validate_repo_accessibility(repo: str, token: str | None) -> None:
-    if "pytest" in sys.modules:
-        return
     owner_name, repo_name = repo.split("/", 1)
     client = GitHubClient(token=token)
     try:
@@ -701,7 +699,7 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     "-m",
     type=int,
     default=None,
-    help="Maximum troubleshooting attempts per repository chunk.",
+    help="Maximum fix-and-test attempts per failing PR before it is skipped.",
 )
 @click.option(
     "--dry-run",

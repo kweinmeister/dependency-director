@@ -286,8 +286,48 @@ async def test_run_agent_no_repos_found(mock_get_repos: MagicMock, github_token:
 
 @pytest.mark.asyncio
 @patch("dependency_director.main.run_agent_for_repo", new_callable=AsyncMock)
-async def test_run_agent_vertex_no_api_key_succeeds(mock_run_agent_for_repo: MagicMock, github_token: str) -> None:
+async def test_run_agent_single_repo_checks_accessibility_before_spawning(
+    mock_run_agent_for_repo: MagicMock,
+    github_token: str,
+) -> None:
+    """An unreachable repository must fail the pre-check in any process, tests included."""
+    request = httpx_mod.Request("GET", "https://api.github.com/repos/test-owner/missing")
+    with (
+        patch("dependency_director.main.Settings") as mock_settings_cls,
+        patch("httpx.AsyncClient.get") as mock_get,
+    ):
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.gemini_api_key = "placeholder-key"
+        mock_settings.github_token = github_token
+        mock_settings.vertex = False
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = httpx_mod.HTTPStatusError(
+            "404 Not Found",
+            request=request,
+            response=httpx_mod.Response(404, request=request),
+        )
+        mock_get.return_value = mock_response
+        with pytest.raises(SystemExit):
+            await run_agent(
+                "test-owner",
+                concurrency=1,
+                max_attempts=3,
+                repo="test-owner/missing",
+                dry_run=True,
+            )
+    mock_run_agent_for_repo.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("dependency_director.main._validate_repo_accessibility", new_callable=AsyncMock)
+@patch("dependency_director.main.run_agent_for_repo", new_callable=AsyncMock)
+async def test_run_agent_vertex_no_api_key_succeeds(
+    mock_run_agent_for_repo: MagicMock,
+    mock_validate_repo: MagicMock,
+    github_token: str,
+) -> None:
     """Vertex AI mode with project+location should not require GEMINI_API_KEY."""
+    _ = mock_validate_repo
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
         mock_settings.gemini_api_key = ""

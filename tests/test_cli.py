@@ -24,6 +24,13 @@ def test_cli_help() -> None:
     assert "dependency-director" in result.output
 
 
+def test_cli_max_attempts_help_describes_the_unit_it_counts() -> None:
+    """--max-attempts bounds fix attempts per failing PR; 'repository chunk' is not a thing."""
+    result = CliRunner().invoke(cli, ["--help"])
+    assert "repository chunk" not in result.output
+    assert "per failing PR" in result.output
+
+
 @patch("dependency_director.main.run_agent", new_callable=AsyncMock)
 def test_cli_target_owner_repo(mock_run_agent: MagicMock) -> None:
     """Verify CLI execution when provided with an owner/repository target."""

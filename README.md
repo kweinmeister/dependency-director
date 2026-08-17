@@ -244,7 +244,7 @@ file. A template is provided in [`.env.template`](.env.template).
 | `GEMINI_API_KEY`                | API Key for accessing Gemini Developer API models (not needed if using Vertex).             | _(Required)_                                                              |
 | `GITHUB_TOKEN`                  | GitHub Personal Access Token. Required to perform merges, comments, or scan private repos.  | _(Recommended)_                                                           |
 | `DEPDIRECTOR_OWNER`             | Default GitHub user or organization to scan (can be overridden by CLI argument).            | _(Optional)_                                                              |
-| `DEPDIRECTOR_MAX_FIX_ATTEMPTS`  | Maximum iterative edit-and-test loops per failing repository.                               | `3`                                                                       |
+| `DEPDIRECTOR_MAX_FIX_ATTEMPTS`  | Maximum iterative fix-and-test attempts per failing PR.                                     | `3`                                                                       |
 | `DEPDIRECTOR_CONCURRENCY`       | Maximum concurrent repository operations (1 = sequential).                                  | `1`                                                                       |
 | `DEPDIRECTOR_REVIEW_WAIT`       | Minutes to poll for review bot comments after pushing a fix (0 = disabled).                 | `0`                                                                       |
 | `DEPDIRECTOR_BOTS`              | JSON array of bot configs (`[{"author":"...","rebase_command":"..."}]`).                    | Default bots (automated dependency update tools like Renovate/Dependabot) |
@@ -354,11 +354,11 @@ depdirector --help
 | Flag                 | Description                                                                                                  |
 | :------------------- | :----------------------------------------------------------------------------------------------------------- |
 | `-d, --dry-run`      | Simulate execution without merging or pushing fixes.                                                         |
-| `-a, --auto-merge`   | Enable native GitHub auto-merge on any created patch PRs.                                                    |
+| `-a, --auto-merge`   | Squash-merge fix PRs via the GitHub API once CI is green, instead of leaving them for manual review.         |
 | `-v, --verify-all`   | Force local test verification of all PRs (including green ones) before merging.                               |
 | `--standalone-fix`   | Create fixes on a new branch with a separate PR instead of pushing to the original dependency update branch.  |
 | `-c, --concurrency`  | Override the maximum concurrent repository scans.                                                            |
-| `-m, --max-attempts` | Override the maximum edit-test attempts per failure.                                                          |
+| `-m, --max-attempts` | Override the maximum fix-and-test attempts per failing PR.                                                    |
 | `-w, --review-wait`  | Minutes to wait for review comments after pushing a fix (overrides env).                                     |
 | `-H, --hint`         | Extra context appended to the agent prompt (e.g. skip a PR or supply target guidance).                       |
 | `--no-sandbox`       | Disable sandbox-runtime (srt) sandboxing (restricts to GitHub-only API operations, no shell access).         |
