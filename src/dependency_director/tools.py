@@ -862,6 +862,82 @@ def _make_get_pr_status(client: GitHubClient) -> ToolFn:
     return get_pr_status
 
 
+def _summarize_checks(
+    check_runs_data: dict[str, Any],
+    commit_status_data: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Reduce check runs and legacy statuses for a ref to (ci_status, checks).
+
+    ci_status is GREEN, RED, PENDING, or NONE. Modern check runs and the legacy
+    commit-status API are folded into one list because a repository may report
+    through either.
+    """
+    checks_summary: list[dict[str, Any]] = [
+        {
+            "name": run.get("name"),
+            "status": run.get("status"),
+            "conclusion": run.get("conclusion"),
+        }
+        for run in check_runs_data.get("check_runs", [])
+    ]
+
+    legacy_statuses = commit_status_data.get("statuses", [])
+    legacy_state = commit_status_data.get("state") if legacy_statuses else None
+    checks_summary.extend(
+        {
+            "name": status.get("context"),
+            "status": "completed",
+            "conclusion": "success"
+            if status.get("state") == "success"
+            else ("failure" if status.get("state") in ("failure", "error") else None),
+        }
+        for status in legacy_statuses
+    )
+
+    has_failures = any(
+        r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
+    )
+    has_pending = any(r.get("status") not in ("completed", "success") for r in checks_summary)
+
+    ci_status = "NONE"
+    if has_failures or legacy_state in ("failure", "error"):
+        ci_status = "RED"
+    elif has_pending or legacy_state == "pending":
+        ci_status = "PENDING"
+    elif checks_summary or legacy_state == "success":
+        ci_status = "GREEN"
+
+    return ci_status, checks_summary
+
+
+def _make_get_branch_ci_status(client: GitHubClient) -> ToolFn:
+    async def get_branch_ci_status(owner: str, repo: str, branch: str = "") -> str:
+        """Report CI health for a branch, without cloning it.
+
+        Use this to tell whether a PR's CI failure is the PR's fault or was
+        already broken on the branch it targets.
+
+        Args:
+            owner: The owner of the repository.
+            repo: The repository name.
+            branch: Branch to check. Defaults to the repository's default branch.
+
+        """
+        target = branch or await client.get_default_branch(owner, repo)
+        # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
+        check_runs_data, commit_status_data = await asyncio.gather(
+            client.get_commit_check_runs(owner, repo, target),
+            client.get_commit_status(owner, repo, target),
+        )
+        ci_status, checks = _summarize_checks(check_runs_data, commit_status_data)
+        return json.dumps(
+            {"branch": target, "ci_status": ci_status, "checks": checks},
+            indent=2,
+        )
+
+    return get_branch_ci_status
+
+
 async def _check_ci(
     client: GitHubClient,
     owner: str,
@@ -888,40 +964,7 @@ async def _check_ci(
             client.get_commit_check_runs(owner, repo, head_sha),
             client.get_commit_status(owner, repo, head_sha),
         )
-        check_runs = check_runs_data.get("check_runs", [])
-        checks_summary.extend(
-            {
-                "name": run.get("name"),
-                "status": run.get("status"),
-                "conclusion": run.get("conclusion"),
-            }
-            for run in check_runs
-        )
-
-        legacy_statuses = commit_status_data.get("statuses", [])
-        legacy_state = commit_status_data.get("state") if legacy_statuses else None
-        checks_summary.extend(
-            {
-                "name": status.get("context"),
-                "status": "completed",
-                "conclusion": "success"
-                if status.get("state") == "success"
-                else ("failure" if status.get("state") in ("failure", "error") else None),
-            }
-            for status in legacy_statuses
-        )
-
-        has_failures = any(
-            r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
-        )
-        has_pending = any(r.get("status") not in ("completed", "success") for r in checks_summary)
-
-        if has_failures or legacy_state in ("failure", "error"):
-            ci_status = "RED"
-        elif has_pending or legacy_state == "pending":
-            ci_status = "PENDING"
-        elif checks_summary or legacy_state == "success":
-            ci_status = "GREEN"
+        ci_status, checks_summary = _summarize_checks(check_runs_data, commit_status_data)
 
     # Merge status is independent of CI status
     if mergeable is False or mergeable_state in ("dirty", "conflict"):
@@ -1196,27 +1239,31 @@ def create_agent_tools(
     )
 
     get_pr_status = _make_get_pr_status(client)
+    get_branch_ci_status = _make_get_branch_ci_status(client)
     wait_for_ci = _make_wait_for_ci(client)
     get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client)
     list_bot_prs = _make_list_bot_prs(client, bots)
     create_pr = _make_create_pr(client, dry_run=dry_run)
     legacy = _make_legacy_tools(client)
 
+    # Alphabetical: callers unpack positionally, so a stable order keeps the
+    # insertion point for a new tool obvious instead of "append to the end".
     return (
-        merge_bot_pr,
-        rebase_bot_pr,
-        wait_for_reviews,
-        get_pr_status,
-        wait_for_ci,
-        get_pr_workflow_run_logs,
-        list_bot_prs,
+        create_pr,
+        get_branch_ci_status,
+        legacy.get_commit_details,
+        legacy.get_file_contents,
         legacy.get_pr_diff,
         legacy.get_pr_files,
-        legacy.get_file_contents,
-        legacy.list_commits,
-        legacy.get_commit_details,
+        get_pr_status,
+        get_pr_workflow_run_logs,
+        list_bot_prs,
         legacy.list_branches,
-        create_pr,
+        legacy.list_commits,
+        merge_bot_pr,
+        rebase_bot_pr,
+        wait_for_ci,
+        wait_for_reviews,
     )
 
 

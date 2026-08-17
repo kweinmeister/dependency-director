@@ -854,7 +854,7 @@ async def test_agent_config_no_mcp_servers(mock_agent_class: MagicMock, github_t
 
 @pytest.mark.asyncio
 async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock, github_token: str) -> None:
-    """All 13 host tools (+ optional run_command) should be registered."""
+    """All 15 host tools (+ optional run_command) should be registered."""
     settings = Settings()
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
@@ -871,21 +871,22 @@ async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock
     config_passed = mock_agent_class.call_args[1]["config"]
     tool_names = {t.__name__ for t in config_passed.tools}
     expected = {
-        "list_bot_prs",
-        "merge_bot_pr",
-        "rebase_bot_pr",
-        "wait_for_reviews",
-        "get_pr_status",
-        "wait_for_ci",
-        "get_pr_workflow_run_logs",
+        "create_pr",
+        "get_branch_ci_status",
+        "get_commit_details",
+        "get_file_contents",
         "get_pr_diff",
         "get_pr_files",
-        "get_file_contents",
-        "list_commits",
-        "get_commit_details",
+        "get_pr_status",
+        "get_pr_workflow_run_logs",
+        "list_bot_prs",
         "list_branches",
-        "create_pr",
+        "list_commits",
+        "merge_bot_pr",
+        "rebase_bot_pr",
         "run_command_sandboxed",
+        "wait_for_ci",
+        "wait_for_reviews",
     }
     assert tool_names == expected
 

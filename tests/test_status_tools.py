@@ -177,18 +177,18 @@ def tools(mock_client: MagicMock) -> tuple[ToolFn, ...]:
 @pytest.fixture
 def get_pr_status(tools: tuple[ToolFn, ...]) -> ToolFn:
     """Fixture to retrieve the PR status checking tool."""
-    fn = tools[3]
+    fn = tools[6]
     fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_status", f"Unexpected tool at index 3: {fn_name!r}"
+    assert fn_name == "get_pr_status", f"Unexpected tool at index 6: {fn_name!r}"
     return fn
 
 
 @pytest.fixture
 def get_pr_workflow_run_logs(tools: tuple[ToolFn, ...]) -> ToolFn:
     """Fixture to retrieve the PR workflow run log fetching tool."""
-    fn = tools[5]
+    fn = tools[7]
     fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_workflow_run_logs", f"Unexpected tool at index 5: {fn_name!r}"
+    assert fn_name == "get_pr_workflow_run_logs", f"Unexpected tool at index 7: {fn_name!r}"
     return fn
 
 
@@ -649,3 +649,88 @@ async def test_check_ci_includes_head_sha() -> None:
     result = json.loads(result_json)
     assert "head_sha" in result, "head_sha must be present in _check_ci response"
     assert result["head_sha"] == "deadbeef123"
+
+
+@pytest.fixture
+def get_branch_ci_status(tools: tuple[ToolFn, ...]) -> ToolFn:
+    """Fixture to retrieve the branch CI status tool."""
+    fn = tools[1]
+    fn_name = getattr(fn, "__name__", "")
+    assert fn_name == "get_branch_ci_status", f"Unexpected tool at index 1: {fn_name!r}"
+    return fn
+
+
+@pytest.mark.parametrize(
+    ("check_runs", "expected"),
+    [
+        ([{"name": "ci", "status": "completed", "conclusion": "success"}], "GREEN"),
+        ([{"name": "ci", "status": "completed", "conclusion": "failure"}], "RED"),
+        ([{"name": "ci", "status": "in_progress", "conclusion": None}], "PENDING"),
+        ([], "NONE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_verdicts(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+    check_runs: list[dict[str, object]],
+    expected: str,
+) -> None:
+    """Verify branch health is classified with the same verdicts used for PRs."""
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": check_runs})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_branch_ci_status("owner", "repo", "main"))
+    assert result["branch"] == "main"
+    assert result["ci_status"] == expected
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_costs_one_round_of_calls(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """The whole point is answering before a clone, so it must not resolve a SHA first.
+
+    GitHub accepts a branch name as a commit ref, so the branch is queried directly.
+    """
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    await get_branch_ci_status("owner", "repo", "main")
+    mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "main")
+    mock_client.get_commit_status.assert_awaited_once_with("owner", "repo", "main")
+    mock_client.get_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_defaults_to_the_default_branch(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """Callers asking 'is the base broken?' should not have to know the base's name."""
+    mock_client.get_default_branch = AsyncMock(return_value="trunk")
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_branch_ci_status("owner", "repo"))
+    assert result["branch"] == "trunk"
+    mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "trunk")
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_reports_which_checks_failed(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """A bare RED is not actionable; the agent needs to know what to go fix."""
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={
+            "check_runs": [
+                {"name": "lint", "status": "completed", "conclusion": "failure"},
+                {"name": "test", "status": "completed", "conclusion": "success"},
+            ],
+        },
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_branch_ci_status("owner", "repo", "main"))
+    assert result["ci_status"] == "RED"
+    failed = [c["name"] for c in result["checks"] if c["conclusion"] == "failure"]
+    assert failed == ["lint"]
