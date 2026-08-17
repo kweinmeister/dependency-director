@@ -1,5 +1,6 @@
 """Tests for PR status tools and check suites in dependency-director."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -722,6 +723,62 @@ async def test_tool_get_branch_ci_status_costs_one_round_of_calls(
     mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "main")
     mock_client.get_commit_status.assert_awaited_once_with("owner", "repo", "main")
     mock_client.get_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_is_checked_once_per_branch(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """Every red PR on a base asks about it, but the answer is fetched once.
+
+    Instructions alone cannot stop the model re-checking, and a repo with a
+    dozen red PRs would otherwise pay for a dozen identical round trips.
+    """
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    first, second = await asyncio.gather(
+        get_branch_ci_status("owner", "repo", "main"),
+        get_branch_ci_status("owner", "repo", "main"),
+    )
+
+    assert first == second
+    mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "main")
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_caches_each_branch_separately(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """A second base branch is a different question and must be asked."""
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    await get_branch_ci_status("owner", "repo", "main")
+    await get_branch_ci_status("owner", "repo", "develop")
+
+    assert mock_client.get_commit_check_runs.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_does_not_cache_failures(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """A transient API error must not become this run's permanent answer."""
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    mock_client.get_commit_check_runs = AsyncMock(
+        side_effect=[GitHubNotFoundError("boom"), {"check_runs": []}],
+    )
+
+    with pytest.raises(GitHubNotFoundError):
+        await get_branch_ci_status("owner", "repo", "main")
+    result = json.loads(await get_branch_ci_status("owner", "repo", "main"))
+
+    assert result["ci_status"] == "NONE"
+    assert mock_client.get_commit_check_runs.await_count == 2
 
 
 @pytest.mark.asyncio

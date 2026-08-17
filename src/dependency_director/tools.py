@@ -998,6 +998,14 @@ async def _checks_for_ref(client: GitHubClient, owner: str, repo: str, ref: str)
 
 
 def _make_get_branch_ci_status(client: GitHubClient) -> ToolFn:
+    # A base branch is checked once and the verdict reused for every red PR
+    # sharing it. The cache lives in this closure, which is built once per
+    # repository run, so its lifetime is exactly one run and nothing has to
+    # invalidate it. The lock keeps two PRs asking about the same base at the
+    # same moment from both paying for the round trip.
+    cache: dict[tuple[str, str, str], str] = {}
+    lock = asyncio.Lock()
+
     async def get_branch_ci_status(owner: str, repo: str, branch: str = "") -> str:
         """Report CI health for a branch, without cloning it.
 
@@ -1015,9 +1023,15 @@ def _make_get_branch_ci_status(client: GitHubClient) -> ToolFn:
 
         """
         target = branch or await client.get_default_branch(owner, repo)
-        # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
-        ci_status, checks = await _checks_for_ref(client, owner, repo, target)
-        return json_payload(BranchCiStatus(branch=target, ci_status=ci_status, checks=checks))
+        key = (owner, repo, target)
+        async with lock:
+            if key not in cache:
+                # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
+                # An exception leaves the cache untouched: a transient API failure
+                # must not become this run's permanent answer for the branch.
+                ci_status, checks = await _checks_for_ref(client, owner, repo, target)
+                cache[key] = json_payload(BranchCiStatus(branch=target, ci_status=ci_status, checks=checks))
+            return cache[key]
 
     return get_branch_ci_status
 
