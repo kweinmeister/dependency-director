@@ -166,6 +166,7 @@ async def _prepare_agent_environment(
             github_token=settings.github_token,
             command_timeout=settings.command_timeout,
             output_limits=settings.output_limits,
+            cache_dir=settings.cache_dir,
         )
     return workspace_tmp, policies, run_command
 
@@ -231,12 +232,8 @@ async def run_agent_for_repo(
     workspace_tmp: str | None = None
     run_command: Any | None = None
     try:
-        workspace_tmp, policies, run_command = await _prepare_agent_environment(
-            repo,
-            settings,
-            dry_run=dry_run,
-        )
-
+        # Check for work before building anything: a repo with no bot PRs should
+        # cost one API call, not a workspace and a sandbox configuration.
         owner, repo_name = repo.split("/", 1)
         bot_prs = await _check_open_bot_prs(owner, repo_name, client, settings.bots)
 
@@ -244,6 +241,12 @@ async def run_agent_for_repo(
             click.echo("Open Pull Requests (Initial List)\n")
             click.echo(f" • No open dependency update PRs were found for {repo}.\n")
             return
+
+        workspace_tmp, policies, run_command = await _prepare_agent_environment(
+            repo,
+            settings,
+            dry_run=dry_run,
+        )
 
         # Get agent system instructions
         system_instructions = get_system_instructions(

@@ -2,6 +2,8 @@
 
 import importlib.resources
 import shlex
+import tempfile
+from pathlib import Path
 from typing import Any, NamedTuple
 
 from google.antigravity.hooks import policy
@@ -68,6 +70,12 @@ WORKFLOW_LOG_TAIL_LINES = 50
 # still in progress — is examined, since the per-job conclusion is the real
 # filter and an extra API call is cheaper than a missed failure.
 PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+
+# Shared package cache for every sandboxed command. It deliberately sits outside
+# the per-repo workspace, which is deleted before and after each repository —
+# a cache inside it would make every repo re-download every dependency.
+DEFAULT_CACHE_DIR: str = str(Path(tempfile.gettempdir()) / "dependency-director-cache")
+
 DEFAULT_SRT_SETTINGS_PATH: str = str(
     importlib.resources.files("dependency_director") / "srt-settings.json",
 )
@@ -183,6 +191,10 @@ class Settings(BaseSettings):
         default=DEFAULT_MAX_OUTPUT_CHARS,
         ge=0,
         validation_alias="depdirector_max_output_chars",
+    )
+    cache_dir: str = Field(
+        default=DEFAULT_CACHE_DIR,
+        validation_alias="depdirector_cache_dir",
     )
 
     @property

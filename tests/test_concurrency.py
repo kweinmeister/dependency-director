@@ -39,6 +39,31 @@ async def test_get_repositories_filters_forks(github_token: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_repositories_filters_archived_and_disabled(github_token: str) -> None:
+    """Verify that get_repositories skips archived and disabled repositories."""
+    mock_repos_page1 = [
+        {"name": "repo-1", "fork": False},
+        {"name": "repo-archived", "fork": False, "archived": True},
+        {"name": "repo-disabled", "fork": False, "disabled": True},
+        {"name": "repo-2", "fork": False, "archived": False, "disabled": False},
+    ]
+    mock_repos_page2: list[dict[str, Any]] = []
+    with patch("httpx.AsyncClient.get") as mock_get:
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "not-test-owner"}
+        mock_response1 = MagicMock()
+        mock_response1.status_code = 200
+        mock_response1.json.return_value = mock_repos_page1
+        mock_response2 = MagicMock()
+        mock_response2.status_code = 200
+        mock_response2.json.return_value = mock_repos_page2
+        mock_get.side_effect = [mock_user, mock_response1, mock_response2]
+        repos = await get_repositories(owner="test-owner", token=github_token)
+        assert repos == ["test-owner/repo-1", "test-owner/repo-2"]
+
+
+@pytest.mark.asyncio
 async def test_get_repositories_pagination(github_token: str) -> None:
     """Verify that get_repositories correctly handles paginated repository results."""
     page_1_data = [{"name": "repo-1", "fork": False}]

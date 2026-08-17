@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.antigravity import LocalAgentConfig
 
-from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH, OutputLimits
+from dependency_director.config import DEFAULT_CACHE_DIR, DEFAULT_SRT_SETTINGS_PATH, OutputLimits
 from dependency_director.tools import (
     CommandResult,
     SandboxedCommandRunner,
@@ -660,43 +660,95 @@ async def test_sandbox_diagnostics_formatting(tmp_path: Path, async_fs: type[Asy
         assert "[Sandbox Diagnostic] Filesystem access failed with 'Permission denied'" not in output
 
 
+# Cache environment variable -> path relative to the cache base ("" means the base itself).
+CACHE_ENV_SUBPATHS = {
+    "BUN_INSTALL": "bun",
+    "CARGO_HOME": "cargo",
+    "COMPOSER_CACHE_DIR": "composer",
+    "DENO_DIR": "deno",
+    "DOTNET_CLI_HOME": "dotnet",
+    "GEM_HOME": "gems",
+    "GEM_PATH": "gems",
+    "GOMODCACHE": "go/pkg/mod",
+    "GRADLE_USER_HOME": "gradle",
+    "MIX_HOME": "mix",
+    "NPM_CONFIG_CACHE": "npm",
+    "NUGET_PACKAGES": "nuget",
+    "PIP_CACHE_DIR": "pip",
+    "PIPENV_CACHE_DIR": "pipenv",
+    "PNPM_HOME": "pnpm",
+    "POETRY_CACHE_DIR": "poetry",
+    "PUB_CACHE": "pub-cache",
+    "UV_CACHE_DIR": "uv",
+    "UV_PYTHON_INSTALL_DIR": "uv/python",
+    "UV_TOOL_DIR": "uv/tools",
+    "XDG_CACHE_HOME": "",
+    "YARN_CACHE_FOLDER": "yarn",
+}
+
+
+async def _capture_sandbox_exec(run_command: Any, command: str = "echo hello") -> Any:
+    """Run a command with the subprocess mocked out and return the mock's call."""
+    mock_process = AsyncMock()
+    mock_process.communicate.return_value = (b"", b"")
+    mock_process.returncode = 0
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+        await run_command(command)
+    mock_exec.assert_called_once()
+    return mock_exec.call_args
+
+
 @pytest.mark.asyncio
 async def test_sandbox_cache_env_overrides(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
-    """Verify cache environment variables can override defaults."""
+    """Verify cache environment variables point at the configured cache directory."""
+    workspace = str(tmp_path / "workspace")
+    cache_dir = str(tmp_path / "shared-cache")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), cache_dir=cache_dir)
+    env = (await _capture_sandbox_exec(run_command)).kwargs.get("env", {})
+    for var, subpath in CACHE_ENV_SUBPATHS.items():
+        expected = str(Path(cache_dir).joinpath(*subpath.split("/"))) if subpath else cache_dir
+        assert env.get(var) == expected, var
+
+
+@pytest.mark.asyncio
+async def test_sandbox_cache_dir_survives_workspace_cleanup(
+    tmp_path: Path,
+    async_fs: type[AsyncFSHelper],
+) -> None:
+    """Verify caches live outside the workspace, which is deleted before and after every repo."""
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     settings_file = tmp_path / "settings.json"
     settings_file.write_text('{"filesystem": {}}')
     run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
-    mock_process = AsyncMock()
-    mock_process.communicate.return_value = (b"", b"")
-    mock_process.returncode = 0
-    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
-        await run_command("echo hello")
-        mock_exec.assert_called_once()
-        kwargs = mock_exec.call_args.kwargs
-        env = kwargs.get("env", {})
-        cache_base = str(Path(workspace) / ".cache")
-        assert env.get("NPM_CONFIG_CACHE") == str(Path(cache_base) / "npm")
-        assert env.get("YARN_CACHE_FOLDER") == str(Path(cache_base) / "yarn")
-        assert env.get("PNPM_HOME") == str(Path(cache_base) / "pnpm")
-        assert env.get("BUN_INSTALL") == str(Path(cache_base) / "bun")
-        assert env.get("DENO_DIR") == str(Path(cache_base) / "deno")
-        assert env.get("PIP_CACHE_DIR") == str(Path(cache_base) / "pip")
-        assert env.get("UV_CACHE_DIR") == str(Path(cache_base) / "uv")
-        assert env.get("POETRY_CACHE_DIR") == str(Path(cache_base) / "poetry")
-        assert env.get("PIPENV_CACHE_DIR") == str(Path(cache_base) / "pipenv")
-        assert env.get("GOMODCACHE") == str(Path(cache_base) / "go" / "pkg" / "mod")
-        assert env.get("CARGO_HOME") == str(Path(cache_base) / "cargo")
-        assert env.get("GEM_HOME") == str(Path(cache_base) / "gems")
-        assert env.get("GEM_PATH") == str(Path(cache_base) / "gems")
-        assert env.get("COMPOSER_CACHE_DIR") == str(Path(cache_base) / "composer")
-        assert env.get("GRADLE_USER_HOME") == str(Path(cache_base) / "gradle")
-        assert env.get("NUGET_PACKAGES") == str(Path(cache_base) / "nuget")
-        assert env.get("DOTNET_CLI_HOME") == str(Path(cache_base) / "dotnet")
-        assert env.get("PUB_CACHE") == str(Path(cache_base) / "pub-cache")
-        assert env.get("MIX_HOME") == str(Path(cache_base) / "mix")
-        assert env.get("XDG_CACHE_HOME") == cache_base
+    env = (await _capture_sandbox_exec(run_command)).kwargs.get("env", {})
+    for var in CACHE_ENV_SUBPATHS:
+        value = env.get(var, "")
+        assert value.startswith(DEFAULT_CACHE_DIR), var
+        assert not value.startswith(workspace), var
+
+
+@pytest.mark.asyncio
+async def test_sandbox_cache_dir_is_created_and_granted_read_write(
+    tmp_path: Path,
+    async_fs: type[AsyncFSHelper],
+) -> None:
+    """Verify the shared cache directory exists and the sandbox may read and write it."""
+    workspace = str(tmp_path / "workspace")
+    cache_dir = str(tmp_path / "shared-cache")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), cache_dir=cache_dir)
+    assert await async_fs.exists(cache_dir)
+    args = (await _capture_sandbox_exec(run_command)).args
+    config_path = args[args.index("--settings") + 1]
+    filesystem = json.loads(await async_fs.read_text(config_path))["filesystem"]
+    assert cache_dir in filesystem["allowRead"]
+    assert cache_dir in filesystem["allowWrite"]
 
 
 @pytest.mark.asyncio

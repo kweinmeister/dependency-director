@@ -205,6 +205,21 @@ Two entries are worth calling out:
   needed for a pull to complete. If you do not review Docker PRs,
   removing these tightens the sandbox at no cost.
 
+### Package cache
+
+Every sandboxed command runs with its package caches (`UV_CACHE_DIR`,
+`CARGO_HOME`, `NPM_CONFIG_CACHE`, `GOMODCACHE`, and ~20 others) pointed
+at a single shared directory, granted read and write inside the
+sandbox. It deliberately lives outside the per-repo workspace, which is
+deleted before and after every repository — a cache inside the
+workspace would make every repo re-download every dependency.
+
+The trade-off is that repositories in a run share a cache. That is what
+makes it useful, and it is the same trust boundary as a developer
+machine, but it does mean a package installed while reviewing one repo
+is visible to the next. Point `DEPDIRECTOR_CACHE_DIR` at a fresh
+directory per run if you would rather not share.
+
 > [!TIP]
 > **DependencyDirector works best on repositories with good test
 > coverage.** When a dependency update breaks something, the agent
@@ -242,6 +257,7 @@ file. A template is provided in [`.env.template`](.env.template).
 | `DEPDIRECTOR_COMMAND_TIMEOUT`   | Seconds allowed per sandboxed command before it is killed (minimum 10).                     | `300`                                                                     |
 | `DEPDIRECTOR_MAX_OUTPUT_LINES`  | Lines kept per stream from each command's output; the middle is dropped (0 = unlimited).    | `200`                                                                     |
 | `DEPDIRECTOR_MAX_OUTPUT_CHARS`  | Characters kept per stream from each command's output (0 = unlimited).                      | `24000`                                                                   |
+| `DEPDIRECTOR_CACHE_DIR`         | Package cache shared by every repository and run (see [Package cache](#package-cache)).     | `<tmp>/dependency-director-cache`                                         |
 
 <!-- markdownlint-enable MD013 MD060 -->
 

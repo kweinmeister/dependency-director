@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from dependency_director.config import (
     DEFAULT_BOTS,
+    DEFAULT_CACHE_DIR,
     BotConfig,
     OutputLimits,
     Settings,
@@ -133,6 +134,68 @@ def test_settings_output_limits_reject_negative(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setenv(var, "-1")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_settings_cache_dir_defaults_outside_any_workspace() -> None:
+    """Verify the package cache defaults to a shared path the workspace cleanup cannot reach."""
+    cache_dir = Settings().cache_dir
+    assert cache_dir == DEFAULT_CACHE_DIR
+    assert not Path(cache_dir).name.startswith("dependency-director-workspace")
+    assert Path(cache_dir).parent == Path(tempfile.gettempdir())
+
+
+def test_settings_cache_dir_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify the shared package cache location can be overridden from the environment."""
+    monkeypatch.setenv("DEPDIRECTOR_CACHE_DIR", "/tmp/custom-depdirector-cache")
+    assert Settings().cache_dir == "/tmp/custom-depdirector-cache"
+
+
+@pytest.mark.asyncio
+async def test_repo_without_bot_prs_skips_workspace_and_sandbox_setup(
+    mock_agent_class: MagicMock,
+    mock_list_open_prs: MagicMock,
+    github_token: str,
+) -> None:
+    """Verify a repo with no bot PRs costs no workspace, no sandbox, and no agent spawn."""
+    mock_list_open_prs.side_effect = None
+    mock_list_open_prs.return_value = []
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    with (
+        patch("dependency_director.main.create_run_command_tool") as mock_run_command_tool,
+        patch("dependency_director.main._prepare_workspace") as mock_prepare_workspace,
+    ):
+        await run_agent_for_repo(
+            repo="test-owner/test-repo",
+            settings=settings,
+            max_attempts=3,
+        )
+    mock_prepare_workspace.assert_not_called()
+    mock_run_command_tool.assert_not_called()
+    mock_agent_class.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_passes_cache_dir_to_sandbox(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """Verify the configured shared cache directory reaches the sandboxed command tool."""
+    _ = mock_agent_class
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    settings.cache_dir = "/tmp/custom-depdirector-cache"
+    with patch("dependency_director.main.create_run_command_tool") as mock_run_command_tool:
+        await run_agent_for_repo(
+            repo="test-owner/test-repo",
+            settings=settings,
+            max_attempts=3,
+            dry_run=True,
+        )
+    mock_run_command_tool.assert_called_once()
+    assert mock_run_command_tool.call_args.kwargs["cache_dir"] == "/tmp/custom-depdirector-cache"
 
 
 def test_safety_policy_structure() -> None:

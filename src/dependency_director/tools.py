@@ -22,6 +22,7 @@ from dependency_director.argv import (
     split_compound_argv,
 )
 from dependency_director.config import (
+    DEFAULT_CACHE_DIR,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_MAX_FAILED_JOBS,
     DEFAULT_OUTPUT_LIMITS,
@@ -575,7 +576,11 @@ class GitHubClient:
             raise
 
     async def get_repositories(self, owner: str) -> list[str]:
-        """Fetch non-forked repositories from GitHub API.
+        """Fetch active, non-forked repositories from GitHub API.
+
+        Forks are skipped because their dependency PRs belong upstream.
+        Archived and disabled repositories are skipped because they reject
+        pushes and merges, so scanning them can only waste a run.
 
         Uses pagination to get all repositories for the given owner.
         """
@@ -600,7 +605,11 @@ class GitHubClient:
             if not repos_data:
                 break
 
-            repos.extend(f"{owner}/{repo['name']}" for repo in repos_data if not repo.get("fork", False))
+            repos.extend(
+                f"{owner}/{repo['name']}"
+                for repo in repos_data
+                if not any(repo.get(flag, False) for flag in ("fork", "archived", "disabled"))
+            )
             page += 1
 
         return repos
@@ -1569,8 +1578,8 @@ def _format_command_result(
     return "\n".join(parts)
 
 
-def _setup_cache_env(workspace_dir: str, env: dict[str, str]) -> None:
-    cache_base = Path(workspace_dir) / ".cache"
+def _setup_cache_env(cache_dir: str, env: dict[str, str]) -> None:
+    cache_base = Path(cache_dir)
     env["BUN_INSTALL"] = str(cache_base / "bun")
     env["CARGO_HOME"] = str(cache_base / "cargo")
     env["COMPOSER_CACHE_DIR"] = str(cache_base / "composer")
@@ -1624,6 +1633,7 @@ class SandboxConfig(NamedTuple):
         github_token: Token for authenticated git operations.
         command_timeout: Max seconds per sandboxed command.
         output_limits: Caps on the output returned to the model.
+        cache_dir: Shared package cache, outside the workspace so it persists.
 
     """
 
@@ -1632,6 +1642,7 @@ class SandboxConfig(NamedTuple):
     github_token: str | None = None
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT
     output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS
+    cache_dir: str = DEFAULT_CACHE_DIR
 
 
 class SandboxedCommandRunner:
@@ -1726,7 +1737,7 @@ class SandboxedCommandRunner:
     ) -> CommandResult:
         """Execute a single (non-compound) argv array through srt."""
         env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
-        _setup_cache_env(self.cfg.workspace_dir, env)
+        _setup_cache_env(self.cfg.cache_dir, env)
 
         is_git_command = _is_git_command_argv(argv)
 
@@ -1800,11 +1811,15 @@ def create_run_command_tool(
     github_token: str | None = None,
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
     output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
+    cache_dir: str = DEFAULT_CACHE_DIR,
 ) -> Callable[..., Awaitable[str]]:
     """Create a sandboxed run_command tool bound to a workspace."""
     config_path = None
     init_error = None
     srt_config = {}
+
+    # The cache outlives the workspace, so it may already exist from an earlier repo.
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
     base_path = srt_settings_path or DEFAULT_SRT_SETTINGS_PATH
     try:
@@ -1815,12 +1830,12 @@ def create_run_command_tool(
         fs_config["allowGitConfig"] = False
 
         allow_write = fs_config.setdefault("allowWrite", [])
-        if workspace_dir not in allow_write:
-            allow_write.append(workspace_dir)
-
         allow_read = fs_config.setdefault("allowRead", [])
-        if workspace_dir not in allow_read:
-            allow_read.append(workspace_dir)
+        for path in (workspace_dir, cache_dir):
+            if path not in allow_write:
+                allow_write.append(path)
+            if path not in allow_read:
+                allow_read.append(path)
 
         with tempfile.NamedTemporaryFile(
             suffix=".json",
@@ -1842,6 +1857,7 @@ def create_run_command_tool(
             github_token=github_token,
             command_timeout=command_timeout,
             output_limits=output_limits,
+            cache_dir=cache_dir,
         ),
         config_path=config_path,
         init_error=init_error,
