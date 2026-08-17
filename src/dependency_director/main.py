@@ -290,7 +290,6 @@ async def run_agent_for_repo(
             async def __call__(self, error: Exception) -> None:
                 await self.run(None, error)
 
-        project_root = str(PROJECT_ROOT)
         skills_path = str(SKILLS_PATH)
 
         agent_tools: list[Any] = [
@@ -322,7 +321,11 @@ async def run_agent_for_repo(
             hooks=[RepoToolErrorHook()],
             tools=agent_tools,
             skills_paths=[skills_path],
-            workspaces=[project_root, workspace_tmp],
+            # Workspaces are what file tools may touch. Grant the clone and the
+            # skill, not PROJECT_ROOT: our checkout holds this project's source
+            # and the .env our template puts there, and the skill is loaded via
+            # skills_paths regardless.
+            workspaces=[skills_path, workspace_tmp],
             capabilities=types.CapabilitiesConfig(
                 enable_subagents=False,
                 disabled_tools=[types.BuiltinTools.RUN_COMMAND],

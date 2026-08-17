@@ -15,6 +15,7 @@ from google.antigravity.hooks import hooks, policy
 from google.antigravity.types import BuiltinTools
 from pydantic import ValidationError
 
+from dependency_director import main
 from dependency_director.config import (
     DEFAULT_BOTS,
     DEFAULT_CACHE_DIR,
@@ -24,7 +25,12 @@ from dependency_director.config import (
     get_dry_run_policies,
     get_safety_policies,
 )
-from dependency_director.main import _check_open_bot_prs, run_agent_for_repo
+from dependency_director.main import (
+    PROJECT_ROOT,
+    SKILLS_PATH,
+    _check_open_bot_prs,
+    run_agent_for_repo,
+)
 from dependency_director.tools import GitHubClient
 
 from .conftest import AsyncFSHelper
@@ -510,6 +516,39 @@ async def test_agent_config_no_vertex_excludes_project(mock_agent_class: MagicMo
     assert config_passed.vertex is not True
     assert config_passed.project is None
     assert config_passed.location is None
+
+
+@pytest.mark.asyncio
+async def test_agent_workspaces_exclude_our_own_source_tree(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """Workspaces grant the model file tools, so our checkout must not be one.
+
+    PROJECT_ROOT holds this project's own source and the .env our template tells
+    users to create there, holding GITHUB_TOKEN and GEMINI_API_KEY. The skill
+    loads from skills_paths, a separate mechanism, so granting the whole root
+    buys nothing and exposes credentials to read and the source to rewrite.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+    workspaces = mock_agent_class.call_args[1]["config"].workspaces
+    assert str(PROJECT_ROOT) not in workspaces
+    assert str(SKILLS_PATH) in workspaces
+    # Nothing granted may contain our own source, however it is spelled.
+    our_source = Path(main.__file__).resolve()
+    assert not any(our_source.is_relative_to(Path(ws).resolve()) for ws in workspaces)
 
 
 @pytest.mark.parametrize(
