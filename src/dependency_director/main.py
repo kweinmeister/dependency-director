@@ -256,23 +256,7 @@ async def run_agent_for_repo(
     # Claims the root-logger records raised by this run; see _SdkIssueCollector.
     _current_repo.set(repo)
     client = GitHubClient(token=settings.github_token)
-    (
-        create_pr,
-        get_branch_ci_status,
-        get_commit_details,
-        get_file_contents,
-        get_pr_diff,
-        get_pr_files,
-        get_pr_status,
-        get_pr_workflow_run_logs,
-        list_bot_prs,
-        list_branches,
-        list_commits,
-        merge_bot_pr,
-        rebase_bot_pr,
-        wait_for_ci,
-        wait_for_reviews,
-    ) = create_agent_tools(
+    tools = create_agent_tools(
         client=client,
         bots=settings.bots,
         dry_run=dry_run,
@@ -322,23 +306,7 @@ async def run_agent_for_repo(
 
         skills_path = str(SKILLS_PATH)
 
-        agent_tools: list[Any] = [
-            create_pr,
-            get_branch_ci_status,
-            get_commit_details,
-            get_file_contents,
-            get_pr_diff,
-            get_pr_files,
-            get_pr_status,
-            get_pr_workflow_run_logs,
-            list_bot_prs,
-            list_branches,
-            list_commits,
-            merge_bot_pr,
-            rebase_bot_pr,
-            wait_for_ci,
-            wait_for_reviews,
-        ]
+        agent_tools: list[Any] = [*tools]
         if run_command is not None:
             agent_tools.append(run_command)
 

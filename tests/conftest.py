@@ -38,13 +38,12 @@ def wait_tool(mock_client: MagicMock) -> Callable[..., ToolFn]:
         bots: list[BotConfig] = DEFAULT_BOTS,
         dry_run: bool = False,
     ) -> ToolFn:
-        _, _, wait = _make_write_tools(
+        return _make_write_tools(
             client=mock_client,
             bots=bots,
             dry_run=dry_run,
             review_wait=review_wait,
-        )
-        return wait
+        ).wait_for_reviews
 
     return _make
 

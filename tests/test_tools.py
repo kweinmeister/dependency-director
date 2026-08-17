@@ -19,6 +19,7 @@ from dependency_director.tools import (
     GitHubNotFoundError,
     GitHubRateLimitError,
     ToolFn,
+    WriteTools,
     _check_bot_author,
     _make_create_pr,
     _make_wait_for_ci,
@@ -29,21 +30,21 @@ from .conftest import make_client_with_responses, make_client_with_status
 
 
 @pytest.fixture
-def tools(mock_client: MagicMock) -> tuple[ToolFn, ToolFn, ToolFn]:
+def tools(mock_client: MagicMock) -> WriteTools:
     """Fixture to set up write tools for status checking tests."""
     return _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
 
 
 @pytest.fixture
-def dry_run_tools(mock_client: MagicMock) -> tuple[ToolFn, ToolFn, ToolFn]:
+def dry_run_tools(mock_client: MagicMock) -> WriteTools:
     """Fixture to set up write tools in dry-run mode."""
     return _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=True, review_wait=0)
 
 
 @pytest.mark.asyncio
-async def test_merge_bot_pr_success(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_merge_bot_pr_success(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify bot PR merge command succeeds when all requirements are met."""
-    merge, _, _ = tools
+    merge = tools.merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.merge_pr = AsyncMock(return_value={"message": "Merge successful"})
     result = await merge("owner", "repo", 42)
@@ -52,9 +53,9 @@ async def test_merge_bot_pr_success(mock_client: MagicMock, tools: tuple[ToolFn,
 
 
 @pytest.mark.asyncio
-async def test_merge_bot_pr_dry_run(mock_client: MagicMock, dry_run_tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_merge_bot_pr_dry_run(mock_client: MagicMock, dry_run_tools: WriteTools) -> None:
     """Verify bot PR merge is simulated correctly in dry-run mode."""
-    merge, _, _ = dry_run_tools
+    merge = dry_run_tools.merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.merge_pr = AsyncMock()
     result = await merge("owner", "repo", 42)
@@ -63,9 +64,9 @@ async def test_merge_bot_pr_dry_run(mock_client: MagicMock, dry_run_tools: tuple
 
 
 @pytest.mark.asyncio
-async def test_merge_bot_pr_blocked(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_merge_bot_pr_blocked(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify bot PR merge is blocked when requirements are not met."""
-    merge, _, _ = tools
+    merge = tools.merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="malicious_user")
     with pytest.raises(PermissionError) as exc_info:
         await merge("owner", "repo", 42)
@@ -73,18 +74,18 @@ async def test_merge_bot_pr_blocked(mock_client: MagicMock, tools: tuple[ToolFn,
 
 
 @pytest.mark.asyncio
-async def test_merge_bot_pr_api_error(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_merge_bot_pr_api_error(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify bot PR merge handles GitHub API errors gracefully."""
-    merge, _, _ = tools
+    merge = tools.merge_bot_pr
     mock_client.get_pr_author = AsyncMock(side_effect=Exception("GitHub API down"))
     with pytest.raises(Exception, match="GitHub API down"):
         await merge("owner", "repo", 42)
 
 
 @pytest.mark.asyncio
-async def test_merge_api_error_on_merge_call(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_merge_api_error_on_merge_call(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify PR merge handles API error during merge call."""
-    merge, _, _ = tools
+    merge = tools.merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.merge_pr = AsyncMock(side_effect=Exception("Merge conflict"))
     with pytest.raises(Exception, match="Merge conflict"):
@@ -93,18 +94,18 @@ async def test_merge_api_error_on_merge_call(mock_client: MagicMock, tools: tupl
 
 
 @pytest.mark.asyncio
-async def test_merge_empty_author_blocked(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_merge_empty_author_blocked(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify PR merge is blocked if the author name is empty."""
-    merge, _, _ = tools
+    merge = tools.merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="")
     with pytest.raises(PermissionError):
         await merge("owner", "repo", 42)
 
 
 @pytest.mark.asyncio
-async def test_rebase_bot_pr_success(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_rebase_bot_pr_success(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify bot PR rebase command succeeds when all requirements are met."""
-    _, rebase, _ = tools
+    rebase = tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.comment_on_pr = AsyncMock()
     result = await rebase("owner", "repo", 42)
@@ -113,9 +114,9 @@ async def test_rebase_bot_pr_success(mock_client: MagicMock, tools: tuple[ToolFn
 
 
 @pytest.mark.asyncio
-async def test_rebase_bot_pr_dry_run(mock_client: MagicMock, dry_run_tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_rebase_bot_pr_dry_run(mock_client: MagicMock, dry_run_tools: WriteTools) -> None:
     """Verify bot PR rebase is simulated correctly in dry-run mode."""
-    _, rebase, _ = dry_run_tools
+    rebase = dry_run_tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.comment_on_pr = AsyncMock()
     result = await rebase("owner", "repo", 42)
@@ -124,18 +125,18 @@ async def test_rebase_bot_pr_dry_run(mock_client: MagicMock, dry_run_tools: tupl
 
 
 @pytest.mark.asyncio
-async def test_rebase_bot_pr_blocked(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_rebase_bot_pr_blocked(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify bot PR rebase is blocked when requirements are not met."""
-    _, rebase, _ = tools
+    rebase = tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="malicious_user")
     with pytest.raises(PermissionError):
         await rebase("owner", "repo", 42)
 
 
 @pytest.mark.asyncio
-async def test_rebase_api_error_on_comment(mock_client: MagicMock, tools: tuple[ToolFn, ToolFn, ToolFn]) -> None:
+async def test_rebase_api_error_on_comment(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify PR rebase handles API error during commenting."""
-    _, rebase, _ = tools
+    rebase = tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.comment_on_pr = AsyncMock(side_effect=Exception("Forbidden"))
     with pytest.raises(Exception, match="Forbidden"):
@@ -145,7 +146,7 @@ async def test_rebase_api_error_on_comment(mock_client: MagicMock, tools: tuple[
 @pytest.mark.asyncio
 async def test_merge_renovate_success(mock_client: MagicMock) -> None:
     """Verify PR merge succeeds for Renovate bot."""
-    merge, _, _ = _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
+    merge = _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0).merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="renovate[bot]")
     mock_client.merge_pr = AsyncMock(return_value={"message": "OK"})
     result = await merge("owner", "repo", 42)
@@ -157,7 +158,7 @@ async def test_merge_bot_pr_405_returns_actionable_message(
     mock_client: MagicMock,
 ) -> None:
     """Verify PR merge 405 error returns an actionable message."""
-    merge, _, _ = _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
+    merge = _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0).merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_response = MagicMock()
     mock_response.status_code = 405
@@ -173,7 +174,7 @@ async def test_merge_bot_pr_405_returns_actionable_message(
 @pytest.mark.asyncio
 async def test_rebase_renovate_uses_correct_command(mock_client: MagicMock) -> None:
     """Verify Renovate bot rebase uses the correct CLI command."""
-    _, rebase, _ = _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
+    rebase = _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0).rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="renovate[bot]")
     mock_client.comment_on_pr = AsyncMock()
     await rebase("owner", "repo", 42)
@@ -184,7 +185,7 @@ async def test_rebase_renovate_uses_correct_command(mock_client: MagicMock) -> N
 async def test_custom_bot_accepted(mock_client: MagicMock) -> None:
     """Verify custom bot configuration is accepted."""
     custom = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
-    merge, _, _ = _make_write_tools(client=mock_client, bots=custom, dry_run=False, review_wait=0)
+    merge = _make_write_tools(client=mock_client, bots=custom, dry_run=False, review_wait=0).merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="custom[bot]")
     mock_client.merge_pr = AsyncMock(return_value={"message": "OK"})
     result = await merge("owner", "repo", 1)
@@ -195,7 +196,7 @@ async def test_custom_bot_accepted(mock_client: MagicMock) -> None:
 async def test_custom_bot_rejects_default(mock_client: MagicMock) -> None:
     """Verify custom bot configuration rejects default bot commands."""
     custom = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
-    merge, _, _ = _make_write_tools(client=mock_client, bots=custom, dry_run=False, review_wait=0)
+    merge = _make_write_tools(client=mock_client, bots=custom, dry_run=False, review_wait=0).merge_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     with pytest.raises(PermissionError):
         await merge("owner", "repo", 1)
@@ -794,13 +795,13 @@ def _commit(login: str | None) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_rebase_refuses_to_clobber_agent_commits(mock_client: MagicMock, tools: tuple[ToolFn, ...]) -> None:
+async def test_rebase_refuses_to_clobber_agent_commits(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify a rebase is refused once the branch carries non-bot commits.
 
     Asking Dependabot to rebase force-pushes the branch from scratch, which
     silently discards any fix already pushed to it.
     """
-    _, rebase, _ = tools
+    rebase = tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.list_pr_commits = AsyncMock(return_value=[_commit("dependabot[bot]"), _commit("someone-else")])
     mock_client.comment_on_pr = AsyncMock()
@@ -814,7 +815,7 @@ async def test_rebase_refuses_to_clobber_agent_commits(mock_client: MagicMock, t
 @pytest.mark.asyncio
 async def test_rebase_refuses_when_commit_author_is_unattributed(
     mock_client: MagicMock,
-    tools: tuple[ToolFn, ...],
+    tools: WriteTools,
 ) -> None:
     """Verify an unattributed commit blocks the rebase.
 
@@ -822,7 +823,7 @@ async def test_rebase_refuses_when_commit_author_is_unattributed(
     and wrongly discarding a fix costs more than a rebase the agent has to
     request another way.
     """
-    _, rebase, _ = tools
+    rebase = tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.list_pr_commits = AsyncMock(return_value=[_commit(None)])
     mock_client.comment_on_pr = AsyncMock()
@@ -834,9 +835,9 @@ async def test_rebase_refuses_when_commit_author_is_unattributed(
 
 
 @pytest.mark.asyncio
-async def test_rebase_proceeds_on_untouched_bot_branch(mock_client: MagicMock, tools: tuple[ToolFn, ...]) -> None:
+async def test_rebase_proceeds_on_untouched_bot_branch(mock_client: MagicMock, tools: WriteTools) -> None:
     """Verify the guard leaves an untouched bot branch rebaseable."""
-    _, rebase, _ = tools
+    rebase = tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.list_pr_commits = AsyncMock(return_value=[_commit("dependabot[bot]")])
     mock_client.comment_on_pr = AsyncMock(return_value={})
@@ -850,10 +851,10 @@ async def test_rebase_proceeds_on_untouched_bot_branch(mock_client: MagicMock, t
 @pytest.mark.asyncio
 async def test_rebase_dry_run_still_reports_the_clobber(
     mock_client: MagicMock,
-    dry_run_tools: tuple[ToolFn, ...],
+    dry_run_tools: WriteTools,
 ) -> None:
     """Verify dry-run surfaces the refusal rather than promising a rebase it would not do."""
-    _, rebase, _ = dry_run_tools
+    rebase = dry_run_tools.rebase_bot_pr
     mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
     mock_client.list_pr_commits = AsyncMock(return_value=[_commit("someone-else")])
 

@@ -9,6 +9,7 @@ import pytest
 from dependency_director.config import DEFAULT_BOTS, DEFAULT_MAX_FAILED_JOBS, LogLimits
 from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
+    AgentTools,
     GitHubClient,
     GitHubNotFoundError,
     ToolFn,
@@ -170,27 +171,21 @@ async def test_github_client_get_job_logs_redirect_handling(github_token: str) -
 
 
 @pytest.fixture
-def tools(mock_client: MagicMock) -> tuple[ToolFn, ...]:
+def tools(mock_client: MagicMock) -> AgentTools:
     """Fixture to set up write tools for status checking tests."""
     return create_agent_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
 
 
 @pytest.fixture
-def get_pr_status(tools: tuple[ToolFn, ...]) -> ToolFn:
+def get_pr_status(tools: AgentTools) -> ToolFn:
     """Fixture to retrieve the PR status checking tool."""
-    fn = tools[6]
-    fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_status", f"Unexpected tool at index 6: {fn_name!r}"
-    return fn
+    return tools.get_pr_status
 
 
 @pytest.fixture
-def get_pr_workflow_run_logs(tools: tuple[ToolFn, ...]) -> ToolFn:
+def get_pr_workflow_run_logs(tools: AgentTools) -> ToolFn:
     """Fixture to retrieve the PR workflow run log fetching tool."""
-    fn = tools[7]
-    fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_workflow_run_logs", f"Unexpected tool at index 7: {fn_name!r}"
-    return fn
+    return tools.get_pr_workflow_run_logs
 
 
 @pytest.mark.asyncio
@@ -485,7 +480,7 @@ async def test_workflow_run_logs_honour_configured_caps(mock_client: MagicMock) 
         review_wait=0,
         log_limits=LogLimits(max_failed_jobs=1, tail_lines=2),
     )
-    get_logs = tools[7]
+    get_logs = tools.get_pr_workflow_run_logs
     mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
     mock_client.get_workflow_runs_for_commit = AsyncMock(return_value={"workflow_runs": [_run(1, "CI")]})
     mock_client.get_workflow_run_jobs = AsyncMock(
@@ -683,12 +678,9 @@ async def test_check_ci_includes_head_sha() -> None:
 
 
 @pytest.fixture
-def get_branch_ci_status(tools: tuple[ToolFn, ...]) -> ToolFn:
+def get_branch_ci_status(tools: AgentTools) -> ToolFn:
     """Fixture to retrieve the branch CI status tool."""
-    fn = tools[1]
-    fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_branch_ci_status", f"Unexpected tool at index 1: {fn_name!r}"
-    return fn
+    return tools.get_branch_ci_status
 
 
 @pytest.mark.parametrize(
@@ -771,12 +763,9 @@ async def test_tool_get_branch_ci_status_reports_which_checks_failed(
 
 
 @pytest.fixture
-def list_bot_prs(tools: tuple[ToolFn, ...]) -> ToolFn:
+def list_bot_prs(tools: AgentTools) -> ToolFn:
     """Fixture to retrieve the bot PR listing tool."""
-    fn = tools[8]
-    fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "list_bot_prs", f"Unexpected tool at index 8: {fn_name!r}"
-    return fn
+    return tools.list_bot_prs
 
 
 @pytest.mark.asyncio

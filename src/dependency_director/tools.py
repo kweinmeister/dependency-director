@@ -739,6 +739,38 @@ class LegacyTools(NamedTuple):
     list_branches: ToolFn
 
 
+class WriteTools(NamedTuple):
+    """Container for the tool functions that change state on GitHub."""
+
+    merge_bot_pr: ToolFn
+    rebase_bot_pr: ToolFn
+    wait_for_reviews: ToolFn
+
+
+class AgentTools(NamedTuple):
+    """Every tool function handed to the agent, named rather than positional.
+
+    Alphabetical, so the insertion point for a new tool is obvious. Iterating
+    the tuple yields them in that order, which is what the agent config wants.
+    """
+
+    create_pr: ToolFn
+    get_branch_ci_status: ToolFn
+    get_commit_details: ToolFn
+    get_file_contents: ToolFn
+    get_pr_diff: ToolFn
+    get_pr_files: ToolFn
+    get_pr_status: ToolFn
+    get_pr_workflow_run_logs: ToolFn
+    list_bot_prs: ToolFn
+    list_branches: ToolFn
+    list_commits: ToolFn
+    merge_bot_pr: ToolFn
+    rebase_bot_pr: ToolFn
+    wait_for_ci: ToolFn
+    wait_for_reviews: ToolFn
+
+
 def _make_merge_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run: bool) -> ToolFn:
     async def merge_bot_pr(owner: str, repo: str, pr_number: int) -> str:
         """Merge a pull request authored by a configured bot.
@@ -932,12 +964,12 @@ def _make_write_tools(
     *,
     dry_run: bool,
     review_wait: int,
-) -> tuple[ToolFn, ToolFn, ToolFn]:
+) -> WriteTools:
     """Create agent tool functions with config bound via closure."""
-    return (
-        _make_merge_bot_pr(client, bots, dry_run=dry_run),
-        _make_rebase_bot_pr(client, bots, dry_run=dry_run),
-        _make_wait_for_reviews(client, review_wait),
+    return WriteTools(
+        merge_bot_pr=_make_merge_bot_pr(client, bots, dry_run=dry_run),
+        rebase_bot_pr=_make_rebase_bot_pr(client, bots, dry_run=dry_run),
+        wait_for_reviews=_make_wait_for_reviews(client, review_wait),
     )
 
 
@@ -1281,41 +1313,32 @@ def create_agent_tools(
     dry_run: bool,
     review_wait: int,
     log_limits: LogLimits = DEFAULT_LOG_LIMITS,
-) -> tuple[ToolFn, ...]:
+) -> AgentTools:
     """Create all agent tool functions, including legacy tools, status tools, and workflow log tools."""
-    merge_bot_pr, rebase_bot_pr, wait_for_reviews = _make_write_tools(
+    write = _make_write_tools(
         client=client,
         bots=bots,
         dry_run=dry_run,
         review_wait=review_wait,
     )
-
-    get_pr_status = _make_get_pr_status(client)
-    get_branch_ci_status = _make_get_branch_ci_status(client)
-    wait_for_ci = _make_wait_for_ci(client)
-    get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client, log_limits)
-    list_bot_prs = _make_list_bot_prs(client, bots)
-    create_pr = _make_create_pr(client, dry_run=dry_run)
     legacy = _make_legacy_tools(client)
 
-    # Alphabetical: callers unpack positionally, so a stable order keeps the
-    # insertion point for a new tool obvious instead of "append to the end".
-    return (
-        create_pr,
-        get_branch_ci_status,
-        legacy.get_commit_details,
-        legacy.get_file_contents,
-        legacy.get_pr_diff,
-        legacy.get_pr_files,
-        get_pr_status,
-        get_pr_workflow_run_logs,
-        list_bot_prs,
-        legacy.list_branches,
-        legacy.list_commits,
-        merge_bot_pr,
-        rebase_bot_pr,
-        wait_for_ci,
-        wait_for_reviews,
+    return AgentTools(
+        create_pr=_make_create_pr(client, dry_run=dry_run),
+        get_branch_ci_status=_make_get_branch_ci_status(client),
+        get_commit_details=legacy.get_commit_details,
+        get_file_contents=legacy.get_file_contents,
+        get_pr_diff=legacy.get_pr_diff,
+        get_pr_files=legacy.get_pr_files,
+        get_pr_status=_make_get_pr_status(client),
+        get_pr_workflow_run_logs=_make_get_pr_workflow_run_logs(client, log_limits),
+        list_bot_prs=_make_list_bot_prs(client, bots),
+        list_branches=legacy.list_branches,
+        list_commits=legacy.list_commits,
+        merge_bot_pr=write.merge_bot_pr,
+        rebase_bot_pr=write.rebase_bot_pr,
+        wait_for_ci=_make_wait_for_ci(client),
+        wait_for_reviews=write.wait_for_reviews,
     )
 
 
