@@ -2,7 +2,7 @@
 
 import asyncio
 import inspect
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -49,24 +49,42 @@ def wait_tool(mock_client: MagicMock) -> Callable[..., ToolFn]:
     return _make
 
 
+def make_client_with_responses(
+    responses: Sequence[httpx_mod.Response],
+    token: str | None = None,
+) -> tuple[GitHubClient, MagicMock]:
+    """Create a GitHubClient whose transport replays the given responses in order.
+
+    The final response repeats once the script is exhausted, so a test only has
+    to spell out the turns it cares about. The transport mock is returned
+    alongside the client so callers can assert how many requests were made.
+    """
+    c = GitHubClient(token=token or "placeholder")
+    queued = list(responses)
+
+    async def handle(request: httpx_mod.Request) -> httpx_mod.Response:
+        response = queued.pop(0) if len(queued) > 1 else queued[0]
+        response.request = request
+        return response
+
+    mock_transport = MagicMock()
+    mock_transport.aclose = AsyncMock()
+    mock_transport.handle_async_request = AsyncMock(side_effect=handle)
+    c.client._transport = mock_transport
+    return c, mock_transport
+
+
 def make_client_with_status(status_code: int, url: str, token: str | None = None) -> GitHubClient:
     """Create a GitHubClient whose transport always returns the given HTTP status.
 
     Useful for testing the event-hook error-classification logic without
     making real network calls.
     """
-    token_str = token or "placeholder"
-    c = GitHubClient(token=token_str)
-    mock_transport = MagicMock()
-    mock_transport.aclose = AsyncMock()
-    mock_transport.handle_async_request = AsyncMock(
-        return_value=httpx_mod.Response(
-            status_code=status_code,
-            request=httpx_mod.Request("GET", url),
-        ),
+    client, _ = make_client_with_responses(
+        [httpx_mod.Response(status_code=status_code, request=httpx_mod.Request("GET", url))],
+        token,
     )
-    c.client._transport = mock_transport
-    return c
+    return client
 
 
 async def _mock_chunks_async_generator() -> AsyncGenerator[None]:

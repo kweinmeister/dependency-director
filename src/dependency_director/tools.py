@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import copy
+import functools
 import json
 import os
 import re
@@ -28,6 +29,9 @@ from dependency_director.config import (
     DEFAULT_SRT_SETTINGS_PATH,
     OUTPUT_HEAD_FRACTION,
     PASSING_RUN_CONCLUSIONS,
+    RATE_LIMIT_BASE_DELAY_SECONDS,
+    RATE_LIMIT_MAX_ATTEMPTS,
+    RATE_LIMIT_MAX_DELAY_SECONDS,
     SAFE_ENV_ALLOWLIST,
     BotConfig,
     LogLimits,
@@ -85,6 +89,47 @@ class GitHubNotFoundError(GitHubClientError):
     """Exception raised for 404 errors."""
 
 
+class GitHubRateLimitError(GitHubClientError):
+    """Exception raised when GitHub refuses a request for rate-limit reasons.
+
+    Attributes:
+        retry_after: Seconds GitHub asked the caller to wait, or None when it
+            gave no advice and the caller should back off on its own schedule.
+
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        """Record the message and the pause GitHub requested, if any."""
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Return the pause GitHub asked for, or None if it named none."""
+    raw = response.headers.get("retry-after", "")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        # GitHub may spell Retry-After as an HTTP date. Treat that the same as
+        # an absent header and let exponential backoff pick the delay.
+        return None
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """Report whether a refusal is a rate limit rather than a permission problem.
+
+    A 429 always is. A 403 only counts when GitHub says so — a secondary limit
+    sends 'Retry-After' and an exhausted primary limit sends
+    'x-ratelimit-remaining: 0'. A missing-scope 403 sends neither, and retrying
+    it would stall the run without ever succeeding.
+    """
+    if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+        return True
+    if response.status_code != HTTPStatus.FORBIDDEN:
+        return False
+    return "retry-after" in response.headers or response.headers.get("x-ratelimit-remaining") == "0"
+
+
 def _validate_repo_params(owner: str, repo: str) -> None:
     if not OWNER_RE.match(owner):
         msg = f"Invalid owner name: {owner!r}"
@@ -108,6 +153,10 @@ class GitHubClient:
             self.headers["Authorization"] = f"Bearer {token}"
 
         async def check_api_errors(response: httpx.Response) -> None:
+            if _is_rate_limited(response):
+                msg = f"GitHub API error {response.status_code} on {response.url} - Rate limited."
+                raise GitHubRateLimitError(msg, _retry_after_seconds(response))
+
             if response.status_code in (
                 HTTPStatus.UNAUTHORIZED,
                 HTTPStatus.FORBIDDEN,
@@ -134,6 +183,28 @@ class GitHubClient:
 
         self.client = httpx.AsyncClient(event_hooks={"response": [check_api_errors]})
 
+    async def _send_with_backoff(
+        self,
+        send: Callable[[], Awaitable[httpx.Response]],
+    ) -> httpx.Response:
+        """Issue a request, retrying while GitHub reports a rate limit.
+
+        Honours the pause GitHub asks for and otherwise doubles its own, giving
+        up once the attempts run out or the requested wait exceeds the ceiling.
+        Every other failure propagates untouched on the first attempt.
+        """
+        attempt = 0
+        while True:
+            try:
+                return await send()
+            except GitHubRateLimitError as exc:
+                attempt += 1
+                backoff = RATE_LIMIT_BASE_DELAY_SECONDS * 2 ** (attempt - 1)
+                wait = exc.retry_after if exc.retry_after is not None else backoff
+                if attempt >= RATE_LIMIT_MAX_ATTEMPTS or wait > RATE_LIMIT_MAX_DELAY_SECONDS:
+                    raise
+                await asyncio.sleep(wait)
+
     async def _request(
         self,
         method: str,
@@ -157,24 +228,27 @@ class GitHubClient:
         if follow_redirects:
             kwargs["follow_redirects"] = True
 
+        send: Callable[[], Awaitable[httpx.Response]]
         if method_upper == "GET":
             if params is not None:
                 kwargs["params"] = params
-            response = await self.client.get(url, **kwargs)
+            send = functools.partial(self.client.get, url, **kwargs)
         elif method_upper == "PUT":
             if json_data is not None:
                 kwargs["json"] = json_data
-            response = await self.client.put(url, **kwargs)
+            send = functools.partial(self.client.put, url, **kwargs)
         elif method_upper == "POST":
             if json_data is not None:
                 kwargs["json"] = json_data
-            response = await self.client.post(url, **kwargs)
+            send = functools.partial(self.client.post, url, **kwargs)
         else:
             if params is not None:
                 kwargs["params"] = params
             if json_data is not None:
                 kwargs["json"] = json_data
-            response = await self.client.request(method, url, **kwargs)
+            send = functools.partial(self.client.request, method, url, **kwargs)
+
+        response = await self._send_with_backoff(send)
         response.raise_for_status()
         return response
 
@@ -522,9 +596,12 @@ class GitHubClient:
             return bool(cached_login and cached_login.lower() == owner.lower())
 
         try:
-            response = await self.client.get(
-                "https://api.github.com/user",
-                headers=self.headers,
+            response = await self._send_with_backoff(
+                functools.partial(
+                    self.client.get,
+                    "https://api.github.com/user",
+                    headers=self.headers,
+                ),
             )
             response.raise_for_status()
             user_data = response.json()
@@ -532,7 +609,10 @@ class GitHubClient:
                 login = str(user_data.get("login") or "")
                 self._user_cache[token] = login
                 return login.lower() == owner.lower()
-        except GitHubAuthenticationError:
+        except (GitHubAuthenticationError, GitHubRateLimitError):
+            # A rate limit says nothing about who the token belongs to.
+            # Swallowing it here would silently fall back to the public
+            # endpoint and hide half the owner's repositories.
             raise
         except (httpx.HTTPError, GitHubClientError):
             pass
@@ -552,7 +632,7 @@ class GitHubClient:
             url = f"{endpoint_prefix}?type=owner&per_page=100&page={page}"
 
         try:
-            response = await self.client.get(url, headers=self.headers)
+            response = await self._send_with_backoff(functools.partial(self.client.get, url, headers=self.headers))
             response.raise_for_status()
             return is_authenticated_user, endpoint_prefix, response.json()
         except (httpx.HTTPStatusError, GitHubNotFoundError) as e:
@@ -578,7 +658,7 @@ class GitHubClient:
             ):
                 endpoint_prefix = f"https://api.github.com/orgs/{owner}/repos"
                 url = f"{endpoint_prefix}?type=sources&per_page=100&page={page}"
-                response = await self.client.get(url, headers=self.headers)
+                response = await self._send_with_backoff(functools.partial(self.client.get, url, headers=self.headers))
                 response.raise_for_status()
                 return is_authenticated_user, endpoint_prefix, response.json()
             raise

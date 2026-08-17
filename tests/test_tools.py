@@ -6,11 +6,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx as httpx_mod
 import pytest
 
-from dependency_director.config import DEFAULT_BOTS, BotConfig
+from dependency_director.config import (
+    DEFAULT_BOTS,
+    RATE_LIMIT_BASE_DELAY_SECONDS,
+    RATE_LIMIT_MAX_ATTEMPTS,
+    RATE_LIMIT_MAX_DELAY_SECONDS,
+    BotConfig,
+)
 from dependency_director.tools import (
     GitHubAuthenticationError,
     GitHubClient,
     GitHubNotFoundError,
+    GitHubRateLimitError,
     ToolFn,
     _check_bot_author,
     _make_create_pr,
@@ -18,7 +25,7 @@ from dependency_director.tools import (
     _make_write_tools,
 )
 
-from .conftest import make_client_with_status
+from .conftest import make_client_with_responses, make_client_with_status
 
 
 @pytest.fixture
@@ -512,6 +519,133 @@ async def test_github_client_get_file_contents_404_raises_not_found() -> None:
         await c.get_file_contents("owner", "repo", "path")
     assert "GitHub API error 404" in str(exc_info.value)
     await c.close()
+
+
+# --- rate-limit backoff tests ---
+
+
+def _pr_payload(author: str = "dependabot[bot]") -> dict[str, object]:
+    return {"number": 1, "title": "bump foo", "user": {"login": author}}
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [
+        (429, {"Retry-After": "7"}),
+        (403, {"Retry-After": "7"}),
+        (403, {"Retry-After": "7", "x-ratelimit-remaining": "0"}),
+    ],
+    ids=["too-many-requests", "secondary-limit-403", "primary-limit-403"],
+)
+@pytest.mark.asyncio
+async def test_github_client_retries_a_rate_limited_request(
+    status: int,
+    headers: dict[str, str],
+    github_token: str,
+) -> None:
+    """A rate-limited response is retried after the delay GitHub asked for."""
+    client, transport = make_client_with_responses(
+        [
+            httpx_mod.Response(status, headers=headers),
+            httpx_mod.Response(200, json=_pr_payload()),
+        ],
+        token=github_token,
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        author = await client.get_pr_author("owner", "repo", 1)
+
+    assert author == "dependabot[bot]"
+    assert transport.handle_async_request.await_count == 2
+    mock_sleep.assert_awaited_once_with(7.0)
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_backs_off_exponentially_without_retry_after(github_token: str) -> None:
+    """A rate limit with no Retry-After header falls back to exponential backoff."""
+    client, _ = make_client_with_responses(
+        [
+            httpx_mod.Response(429),
+            httpx_mod.Response(429),
+            httpx_mod.Response(200, json=_pr_payload()),
+        ],
+        token=github_token,
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        await client.get_pr_author("owner", "repo", 1)
+
+    assert [call.args[0] for call in mock_sleep.await_args_list] == [
+        RATE_LIMIT_BASE_DELAY_SECONDS,
+        RATE_LIMIT_BASE_DELAY_SECONDS * 2,
+    ]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_bounds_rate_limit_retries(github_token: str) -> None:
+    """Retries stop at the attempt cap instead of hammering a limited endpoint."""
+    client, transport = make_client_with_responses(
+        [httpx_mod.Response(429) for _ in range(RATE_LIMIT_MAX_ATTEMPTS)],
+        token=github_token,
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(GitHubRateLimitError):
+        await client.get_pr_author("owner", "repo", 1)
+
+    assert transport.handle_async_request.await_count == RATE_LIMIT_MAX_ATTEMPTS
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_gives_up_when_retry_after_exceeds_the_cap(github_token: str) -> None:
+    """A wait longer than the ceiling is reported, not slept through."""
+    client, transport = make_client_with_responses(
+        [httpx_mod.Response(429, headers={"Retry-After": str(int(RATE_LIMIT_MAX_DELAY_SECONDS) + 1)})],
+        token=github_token,
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, pytest.raises(GitHubRateLimitError):
+        await client.get_pr_author("owner", "repo", 1)
+
+    mock_sleep.assert_not_awaited()
+    assert transport.handle_async_request.await_count == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_does_not_retry_a_permission_403(github_token: str) -> None:
+    """A 403 with no rate-limit headers is a scope problem; retrying only stalls."""
+    client, transport = make_client_with_responses(
+        [httpx_mod.Response(403)],
+        token=github_token,
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, pytest.raises(GitHubAuthenticationError):
+        await client.get_pr_author("owner", "repo", 1)
+
+    mock_sleep.assert_not_awaited()
+    assert transport.handle_async_request.await_count == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_repository_listing_retries_a_rate_limited_page(github_token: str) -> None:
+    """The repository listing calls the transport directly and must back off too."""
+    client, transport = make_client_with_responses(
+        [
+            # Identity probe, then a rate-limited first page, its retry, and the
+            # empty page that ends pagination.
+            httpx_mod.Response(200, json={"login": "somebody-else"}),
+            httpx_mod.Response(429, headers={"Retry-After": "3"}),
+            httpx_mod.Response(200, json=[{"name": "repo-a"}]),
+            httpx_mod.Response(200, json=[]),
+        ],
+        token=github_token,
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        repos = await client.get_repositories("owner")
+
+    assert repos == ["owner/repo-a"]
+    mock_sleep.assert_awaited_once_with(3.0)
+    assert transport.handle_async_request.await_count == 4
+    await client.close()
 
 
 # --- wait_for_ci tests (TDD) ---

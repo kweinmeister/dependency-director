@@ -89,6 +89,16 @@ class LogLimits(NamedTuple):
 
 DEFAULT_LOG_LIMITS = LogLimits()
 
+# Bounded retry for GitHub's rate limiters. A scan of a large owner issues
+# hundreds of requests, and GitHub answers a tripped limit with 429 or 403 plus
+# a Retry-After header. Waiting the requested pause is nearly always cheaper
+# than failing the repository, but only within limits: a run that sleeps
+# unboundedly is indistinguishable from one that has hung, so a wait longer
+# than the ceiling is reported instead of slept through.
+RATE_LIMIT_MAX_ATTEMPTS = 4
+RATE_LIMIT_BASE_DELAY_SECONDS = 1.0
+RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
+
 # Workflow run conclusions that cannot contain a failed job, so the run's jobs
 # are never fetched. Everything else — including an unset conclusion on a run
 # still in progress — is examined, since the per-job conclusion is the real
