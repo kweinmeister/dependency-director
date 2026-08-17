@@ -152,6 +152,13 @@ The agent operates under two modes of programmatic safety:
    - **GitHub token scoped** — The token env vars are only present
      in the subprocess environment when running git commands.
 
+1. **File tools bounded to the workspace** — srt sandboxes command
+   execution, but the SDK's built-in `view_file`, `edit_file` and
+   `create_file` tools do not go through it. A `workspace_only`
+   policy confines all three to the per-repo clone and the agent
+   skill directory, so they cannot reach the rest of the host —
+   including this project's own checkout and `.env`.
+
 1. **No-Sandbox Fallback (`--no-sandbox`)** — When sandboxing is
    explicitly bypassed, the agent falls back to GitHub-only
    operations. No command execution tool is registered.
