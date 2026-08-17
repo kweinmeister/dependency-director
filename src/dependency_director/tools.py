@@ -23,14 +23,14 @@ from dependency_director.argv import (
 from dependency_director.config import (
     DEFAULT_CACHE_DIR,
     DEFAULT_COMMAND_TIMEOUT,
-    DEFAULT_MAX_FAILED_JOBS,
+    DEFAULT_LOG_LIMITS,
     DEFAULT_OUTPUT_LIMITS,
     DEFAULT_SRT_SETTINGS_PATH,
     OUTPUT_HEAD_FRACTION,
     PASSING_RUN_CONCLUSIONS,
     SAFE_ENV_ALLOWLIST,
-    WORKFLOW_LOG_TAIL_LINES,
     BotConfig,
+    LogLimits,
     OutputLimits,
 )
 from dependency_director.schemas import (
@@ -1005,7 +1005,7 @@ def _select_candidate_runs(runs: list[WorkflowRun]) -> list[WorkflowRun]:
     return selected
 
 
-def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
+def _make_get_pr_workflow_run_logs(client: GitHubClient, log_limits: LogLimits) -> ToolFn:
     async def get_pr_workflow_run_logs(owner: str, repo: str, pr_number: int) -> str:
         """Fetch raw logs for failed GitHub Actions workflow runs on a pull request.
 
@@ -1037,9 +1037,11 @@ def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
                 if job.conclusion != "failure":
                     continue
                 total_failed += 1
-                if len(failed_jobs_logs) >= DEFAULT_MAX_FAILED_JOBS:
+                if len(failed_jobs_logs) >= log_limits.max_failed_jobs:
                     continue
-                failed_jobs_logs.append(await _format_failed_job(client, owner, repo, workflow, job))
+                failed_jobs_logs.append(
+                    await _format_failed_job(client, owner, repo, workflow, job, log_limits.tail_lines),
+                )
 
         if not failed_jobs_logs:
             return f"No failed jobs found across {len(runs)} workflow run(s) for commit {head_sha}."
@@ -1047,7 +1049,7 @@ def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
         output = "\n".join(failed_jobs_logs)
         omitted = total_failed - len(failed_jobs_logs)
         if omitted:
-            output += f"\n--- {omitted} more failed job(s) omitted (cap: {DEFAULT_MAX_FAILED_JOBS}) ---\n"
+            output += f"\n--- {omitted} more failed job(s) omitted (cap: {log_limits.max_failed_jobs}) ---\n"
         return output
 
     return get_pr_workflow_run_logs
@@ -1059,6 +1061,7 @@ async def _format_failed_job(
     repo: str,
     workflow: str,
     job: WorkflowJob,
+    tail_lines: int,
 ) -> str:
     """Render one failed job as a labelled tail of its log.
 
@@ -1070,7 +1073,7 @@ async def _format_failed_job(
         log_text = await client.get_job_logs(owner, repo, job.id)
     except (httpx.HTTPError, GitHubClientError) as e:
         return f"{header}\nFailed to retrieve log: {e}\n"
-    tail = "\n".join(log_text.splitlines()[-WORKFLOW_LOG_TAIL_LINES:])
+    tail = "\n".join(log_text.splitlines()[-tail_lines:])
     return f"{header}\n{tail}\n"
 
 
@@ -1197,6 +1200,7 @@ def create_agent_tools(
     *,
     dry_run: bool,
     review_wait: int,
+    log_limits: LogLimits = DEFAULT_LOG_LIMITS,
 ) -> tuple[ToolFn, ...]:
     """Create all agent tool functions, including legacy tools, status tools, and workflow log tools."""
     merge_bot_pr, rebase_bot_pr, wait_for_reviews = _make_write_tools(
@@ -1209,7 +1213,7 @@ def create_agent_tools(
     get_pr_status = _make_get_pr_status(client)
     get_branch_ci_status = _make_get_branch_ci_status(client)
     wait_for_ci = _make_wait_for_ci(client)
-    get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client)
+    get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client, log_limits)
     list_bot_prs = _make_list_bot_prs(client, bots)
     create_pr = _make_create_pr(client, dry_run=dry_run)
     legacy = _make_legacy_tools(client)

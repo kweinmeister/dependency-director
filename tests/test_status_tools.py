@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx as httpx_mod
 import pytest
 
-from dependency_director.config import DEFAULT_BOTS, DEFAULT_MAX_FAILED_JOBS
+from dependency_director.config import DEFAULT_BOTS, DEFAULT_MAX_FAILED_JOBS, LogLimits
 from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
     GitHubClient,
@@ -469,6 +469,36 @@ async def test_workflow_run_logs_caps_jobs_and_reports_the_cap(
     assert result.count("--- FAILED JOB:") == DEFAULT_MAX_FAILED_JOBS
     assert "job0" in result
     assert f"{5 - DEFAULT_MAX_FAILED_JOBS} more failed job" in result
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_honour_configured_caps(mock_client: MagicMock) -> None:
+    """Verify both CI-log caps come from configuration, not from constants.
+
+    A repo whose failure only makes sense with more jobs or a longer tail has
+    no way to say so while the caps are baked in.
+    """
+    tools = create_agent_tools(
+        client=mock_client,
+        bots=DEFAULT_BOTS,
+        dry_run=False,
+        review_wait=0,
+        log_limits=LogLimits(max_failed_jobs=1, tail_lines=2),
+    )
+    get_logs = tools[7]
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(return_value={"workflow_runs": [_run(1, "CI")]})
+    mock_client.get_workflow_run_jobs = AsyncMock(
+        return_value={"jobs": [_job(100 + i, f"job{i}") for i in range(3)]},
+    )
+    mock_client.get_job_logs = AsyncMock(return_value="setup\nline1\nline2")
+
+    result = await get_logs("owner", "repo", 22)
+
+    assert result.count("--- FAILED JOB:") == 1
+    assert "2 more failed job" in result
+    assert "setup" not in result
+    assert "line1\nline2" in result
 
 
 @pytest.mark.asyncio

@@ -63,7 +63,26 @@ DEFAULT_MAX_FAILED_JOBS = 3
 
 # Lines kept from the end of each failed job's log. Failures report at the
 # bottom; the setup output above it is noise.
-WORKFLOW_LOG_TAIL_LINES = 50
+DEFAULT_WORKFLOW_LOG_TAIL_LINES = 50
+
+
+class LogLimits(NamedTuple):
+    """Caps applied to the CI logs fetched for one pull request.
+
+    Attributes:
+        max_failed_jobs: Failed jobs whose logs are returned; the rest are
+            counted and reported, never dropped silently.
+        tail_lines: Lines kept from the end of each job's log.
+
+    Neither may be 0: a run that fetches logs and then returns none of them is
+    a wasted round trip, and 'no failures found' would be a lie.
+    """
+
+    max_failed_jobs: int = DEFAULT_MAX_FAILED_JOBS
+    tail_lines: int = DEFAULT_WORKFLOW_LOG_TAIL_LINES
+
+
+DEFAULT_LOG_LIMITS = LogLimits()
 
 # Workflow run conclusions that cannot contain a failed job, so the run's jobs
 # are never fetched. Everything else — including an unset conclusion on a run
@@ -192,6 +211,16 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias="depdirector_max_output_chars",
     )
+    max_failed_jobs: int = Field(
+        default=DEFAULT_MAX_FAILED_JOBS,
+        ge=1,
+        validation_alias="depdirector_max_failed_jobs",
+    )
+    workflow_log_tail_lines: int = Field(
+        default=DEFAULT_WORKFLOW_LOG_TAIL_LINES,
+        ge=1,
+        validation_alias="depdirector_workflow_log_tail_lines",
+    )
     cache_dir: str = Field(
         default=DEFAULT_CACHE_DIR,
         validation_alias="depdirector_cache_dir",
@@ -201,6 +230,11 @@ class Settings(BaseSettings):
     def output_limits(self) -> OutputLimits:
         """Return the configured command output caps."""
         return OutputLimits(max_lines=self.max_output_lines, max_chars=self.max_output_chars)
+
+    @property
+    def log_limits(self) -> LogLimits:
+        """Return the configured CI-log caps."""
+        return LogLimits(max_failed_jobs=self.max_failed_jobs, tail_lines=self.workflow_log_tail_lines)
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -20,6 +20,7 @@ from dependency_director.config import (
     DEFAULT_BOTS,
     DEFAULT_CACHE_DIR,
     BotConfig,
+    LogLimits,
     OutputLimits,
     Settings,
     get_dry_run_policies,
@@ -140,6 +141,29 @@ def test_settings_output_limits_are_configurable(monkeypatch: pytest.MonkeyPatch
 def test_settings_output_limits_reject_negative(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
     """Verify a negative cap is rejected rather than silently slicing backwards."""
     monkeypatch.setenv(var, "-1")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_log_limits_default_to_the_documented_values() -> None:
+    """Verify the CI-log caps default to what the README and .env.template state."""
+    assert Settings().log_limits == LogLimits(max_failed_jobs=3, tail_lines=50)
+
+
+def test_settings_log_limits_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify a repo whose failures need more context can raise both caps."""
+    monkeypatch.setenv("DEPDIRECTOR_MAX_FAILED_JOBS", "8")
+    monkeypatch.setenv("DEPDIRECTOR_WORKFLOW_LOG_TAIL_LINES", "200")
+    assert Settings().log_limits == LogLimits(max_failed_jobs=8, tail_lines=200)
+
+
+@pytest.mark.parametrize(
+    "var",
+    ["DEPDIRECTOR_MAX_FAILED_JOBS", "DEPDIRECTOR_WORKFLOW_LOG_TAIL_LINES"],
+)
+def test_settings_log_limits_reject_zero_and_below(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+    """Verify a cap of 0 is rejected: it would fetch logs and then return none of them."""
+    monkeypatch.setenv(var, "0")
     with pytest.raises(ValidationError):
         Settings()
 

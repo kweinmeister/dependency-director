@@ -293,6 +293,8 @@ file. A template is provided in [`.env.template`](.env.template).
 | `DEPDIRECTOR_COMMAND_TIMEOUT`   | Seconds allowed per sandboxed command before it is killed (minimum 10).                     | `300`                                                                     |
 | `DEPDIRECTOR_MAX_OUTPUT_LINES`  | Lines kept per stream from each command's output; the middle is dropped (0 = unlimited).    | `200`                                                                     |
 | `DEPDIRECTOR_MAX_OUTPUT_CHARS`  | Characters kept per stream from each command's output (0 = unlimited).                      | `24000`                                                                   |
+| `DEPDIRECTOR_MAX_FAILED_JOBS`   | Failed CI jobs whose logs are fetched per red PR; the rest are counted and reported.        | `3`                                                                       |
+| `DEPDIRECTOR_WORKFLOW_LOG_TAIL_LINES` | Lines kept from the end of each failed job's log.                                     | `50`                                                                      |
 | `DEPDIRECTOR_CACHE_DIR`         | Package cache shared by every repository and run (see [Package cache](#package-cache)).     | `<tmp>/dependency-director-cache`                                         |
 
 <!-- markdownlint-enable MD013 MD060 -->
