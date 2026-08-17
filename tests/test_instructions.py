@@ -324,6 +324,26 @@ def test_standalone_fix_creates_new_branch() -> None:
     assert "dependency-director/fix-" in content
 
 
+def test_standalone_fix_branch_placeholder_is_substitutable() -> None:
+    """Verify the fix branch uses the same placeholder as the source branch.
+
+    'fix-<pr-pr_number>' is not a placeholder the agent can fill in, so it
+    ends up in the branch name verbatim.
+    """
+    content = _section_content(_get_instructions(standalone_fix=True), "workflow")
+    assert "dependency-director/fix-<pr-number>" in content
+    assert "pr-pr_number" not in content
+
+
+def test_standalone_fix_names_the_pr_creation_tool() -> None:
+    """Verify the standalone strategy points at the tool that opens the PR.
+
+    Pushing a branch nobody opens a PR for leaves the fix invisible.
+    """
+    content = _section_content(_get_instructions(standalone_fix=True), "workflow")
+    assert "create_pr" in content
+
+
 # --- Flag interactions ---
 
 

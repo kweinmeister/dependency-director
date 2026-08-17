@@ -219,6 +219,7 @@ async def run_agent_for_repo(
         list_commits,
         get_commit_details,
         list_branches,
+        create_pr,
     ) = create_agent_tools(
         client=client,
         bots=settings.bots,
@@ -280,6 +281,7 @@ async def run_agent_for_repo(
             list_commits,
             get_commit_details,
             list_branches,
+            create_pr,
         ]
         if run_command is not None:
             agent_tools.append(run_command)

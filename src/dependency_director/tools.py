@@ -125,7 +125,9 @@ class GitHubClient:
         follow_redirects: bool = False,
     ) -> httpx.Response:
         _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/{path.lstrip('/')}"
+        # rstrip so an empty path addresses the repository itself rather than
+        # a trailing-slash URL.
+        url = f"https://api.github.com/repos/{owner}/{repo}/{path.lstrip('/')}".rstrip("/")
         req_headers = {**self.headers, **(headers or {})}
 
         method_upper = method.upper()
@@ -259,6 +261,41 @@ class GitHubClient:
             json_data={"body": body},
         )
         return cast("dict[str, Any]", response.json())
+
+    async def create_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+    ) -> dict[str, Any]:
+        """Open a pull request from ``head`` into ``base``."""
+        response = await self._post(
+            "pulls",
+            owner,
+            repo,
+            json_data={"title": title, "head": head, "base": base, "body": body},
+        )
+        return cast("dict[str, Any]", response.json())
+
+    async def get_default_branch(self, owner: str, repo: str) -> str:
+        """Fetch the repository's default branch, falling back to ``main``."""
+        response = await self._get("", owner, repo)
+        data = cast("dict[str, Any]", response.json())
+        branch = data.get("default_branch")
+        return branch if isinstance(branch, str) and branch else "main"
+
+    async def list_pr_commits(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the commits on a pull request's head branch."""
+        return [c async for c in self._list_paginated(f"pulls/{pr_number}/commits", owner, repo)]
 
     async def get_pr_reviews(
         self,
@@ -630,14 +667,47 @@ def _make_merge_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run: 
     return merge_bot_pr
 
 
+async def _find_foreign_commit_author(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    bots: list[BotConfig],
+) -> str | None:
+    """Return a description of the first commit on the PR the bot did not author.
+
+    Returns None when every commit is attributable to a configured bot.
+    """
+    bot_authors = {b.author for b in bots}
+    for commit in await client.list_pr_commits(owner, repo, pr_number):
+        gh_author = commit.get("author")
+        login = gh_author.get("login") if isinstance(gh_author, dict) else None
+        if not login:
+            return "an unattributed commit (no GitHub account on record)"
+        if login not in bot_authors:
+            return f"a commit by '{login}'"
+    return None
+
+
 def _make_rebase_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run: bool) -> ToolFn:
     async def rebase_bot_pr(owner: str, repo: str, pr_number: int) -> str:
         """Post a rebase comment on a pull request.
 
-        Author must be a configured bot.
+        Author must be a configured bot. Refuses when the branch carries
+        commits the bot did not author, because a bot rebase force-pushes the
+        branch from scratch and would discard them.
         """
         author = await client.get_pr_author(owner, repo, pr_number)
         bot = _check_bot_author(author, bots)
+
+        foreign = await _find_foreign_commit_author(client, owner, repo, pr_number, bots)
+        if foreign:
+            return (
+                f"Refused to rebase PR #{pr_number} in {owner}/{repo}: its branch contains "
+                f"{foreign}. Commenting '{bot.rebase_command}' force-pushes the branch from "
+                "scratch and would discard that work. Resolve the conflict locally and push "
+                "to the branch instead, or close this PR and open a standalone one."
+            )
 
         if dry_run:
             return f"[DRY-RUN] Would have commented '{bot.rebase_command}' on PR #{pr_number} in {owner}/{repo}."
@@ -648,6 +718,45 @@ def _make_rebase_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run:
         )
 
     return rebase_bot_pr
+
+
+def _make_create_pr(client: GitHubClient, *, dry_run: bool) -> ToolFn:
+    async def create_pr(
+        owner: str,
+        repo: str,
+        title: str,
+        head_branch: str,
+        body: str,
+        base_branch: str = "",
+    ) -> str:
+        """Open a pull request from an already-pushed branch.
+
+        Args:
+            owner: The owner of the repository.
+            repo: The repository name.
+            title: The pull request title.
+            head_branch: The branch holding the fix, already pushed to origin.
+            body: The pull request description. Reference the original PR here.
+            base_branch: Target branch. Defaults to the repository's default branch.
+
+        """
+        _validate_repo_params(owner, repo)
+        base = base_branch or await client.get_default_branch(owner, repo)
+
+        if dry_run:
+            return f"[DRY-RUN] Would have opened a PR '{title}' from {head_branch} into {base} in {owner}/{repo}."
+
+        result = await client.create_pull_request(
+            owner,
+            repo,
+            title=title,
+            head=head_branch,
+            base=base,
+            body=body,
+        )
+        return f"Opened PR #{result.get('number')} in {owner}/{repo}: {result.get('html_url', '')}"
+
+    return create_pr
 
 
 def _make_wait_for_reviews(client: GitHubClient, review_wait: int) -> ToolFn:
@@ -1078,6 +1187,7 @@ def create_agent_tools(
     wait_for_ci = _make_wait_for_ci(client)
     get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client)
     list_bot_prs = _make_list_bot_prs(client, bots)
+    create_pr = _make_create_pr(client, dry_run=dry_run)
     legacy = _make_legacy_tools(client)
 
     return (
@@ -1094,6 +1204,7 @@ def create_agent_tools(
         legacy.list_commits,
         legacy.get_commit_details,
         legacy.list_branches,
+        create_pr,
     )
 
 

@@ -34,8 +34,10 @@ def get_system_instructions(
     if standalone_fix:
         fix_strategy = (
             "commit to local branch, push using 'git push origin "
-            "pr-<pr-number>:dependency-director/fix-<pr-pr_number>', "
-            "and open PR targeting main referencing original."
+            "pr-<pr-number>:dependency-director/fix-<pr-number>', then call "
+            "'create_pr(owner, repo, title, head_branch, body)' with "
+            "head_branch='dependency-director/fix-<pr-number>' and a body "
+            "referencing the original PR."
         )
     else:
         fix_strategy = (

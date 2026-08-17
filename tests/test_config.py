@@ -623,6 +623,7 @@ async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock
         "list_commits",
         "get_commit_details",
         "list_branches",
+        "create_pr",
         "run_command_sandboxed",
     }
     assert tool_names == expected

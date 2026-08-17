@@ -13,6 +13,7 @@ from dependency_director.tools import (
     GitHubNotFoundError,
     ToolFn,
     _check_bot_author,
+    _make_create_pr,
     _make_wait_for_ci,
     _make_write_tools,
 )
@@ -588,3 +589,184 @@ async def test_wait_for_ci_timeout(mock_client: MagicMock, ci_tool: ToolFn) -> N
     assert "pending" in result.lower() or "timeout" in result.lower()
     # Should have polled max retries + 1 initial call
     assert mock_client.get_pr_details.call_count >= 10
+
+
+# --- create_pr tool ---
+
+
+@pytest.fixture
+def create_pr(mock_client: MagicMock) -> ToolFn:
+    """Fixture for the standalone-PR creation tool."""
+    return _make_create_pr(mock_client, dry_run=False)
+
+
+@pytest.mark.asyncio
+async def test_create_pr_opens_pull_request(mock_client: MagicMock, create_pr: ToolFn) -> None:
+    """Verify create_pr opens a PR and reports its URL.
+
+    The standalone fix strategy pushes to its own branch, which is useless
+    without a way to open the PR that carries it.
+    """
+    mock_client.get_default_branch = AsyncMock(return_value="main")
+    mock_client.create_pull_request = AsyncMock(
+        return_value={"number": 101, "html_url": "https://github.com/owner/repo/pull/101"},
+    )
+    result = await create_pr("owner", "repo", "fix: bump ty", "dependency-director/fix-90", "Fixes #90", "")
+    assert "#101" in result
+    assert "https://github.com/owner/repo/pull/101" in result
+    mock_client.create_pull_request.assert_awaited_once_with(
+        "owner",
+        "repo",
+        title="fix: bump ty",
+        head="dependency-director/fix-90",
+        base="main",
+        body="Fixes #90",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_pr_uses_explicit_base_without_lookup(mock_client: MagicMock, create_pr: ToolFn) -> None:
+    """Verify an explicit base branch is honoured and skips the default-branch lookup."""
+    mock_client.get_default_branch = AsyncMock(return_value="main")
+    mock_client.create_pull_request = AsyncMock(return_value={"number": 7, "html_url": "u"})
+    await create_pr("owner", "repo", "t", "head", "b", "develop")
+    mock_client.create_pull_request.assert_awaited_once_with(
+        "owner",
+        "repo",
+        title="t",
+        head="head",
+        base="develop",
+        body="b",
+    )
+    mock_client.get_default_branch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_pr_dry_run_does_not_write(mock_client: MagicMock) -> None:
+    """Verify dry-run reports the intended PR without creating one."""
+    mock_client.create_pull_request = AsyncMock()
+    tool = _make_create_pr(mock_client, dry_run=True)
+    result = await tool("owner", "repo", "fix: bump ty", "dependency-director/fix-90", "body", "main")
+    assert "[DRY-RUN]" in result
+    mock_client.create_pull_request.assert_not_awaited()
+
+
+# --- rebase clobber guard ---
+
+
+def _commit(login: str | None) -> dict[str, object]:
+    """Build a minimal PR-commit payload attributed to the given login."""
+    return {"sha": "s", "author": {"login": login} if login else None}
+
+
+@pytest.mark.asyncio
+async def test_rebase_refuses_to_clobber_agent_commits(mock_client: MagicMock, tools: tuple[ToolFn, ...]) -> None:
+    """Verify a rebase is refused once the branch carries non-bot commits.
+
+    Asking Dependabot to rebase force-pushes the branch from scratch, which
+    silently discards any fix already pushed to it.
+    """
+    _, rebase, _ = tools
+    mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
+    mock_client.list_pr_commits = AsyncMock(return_value=[_commit("dependabot[bot]"), _commit("someone-else")])
+    mock_client.comment_on_pr = AsyncMock()
+
+    result = await rebase("owner", "repo", 90)
+
+    assert "someone-else" in result
+    mock_client.comment_on_pr.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rebase_refuses_when_commit_author_is_unattributed(
+    mock_client: MagicMock,
+    tools: tuple[ToolFn, ...],
+) -> None:
+    """Verify an unattributed commit blocks the rebase.
+
+    A commit GitHub cannot map to an account is not demonstrably the bot's,
+    and wrongly discarding a fix costs more than a rebase the agent has to
+    request another way.
+    """
+    _, rebase, _ = tools
+    mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
+    mock_client.list_pr_commits = AsyncMock(return_value=[_commit(None)])
+    mock_client.comment_on_pr = AsyncMock()
+
+    result = await rebase("owner", "repo", 90)
+
+    assert "unattributed" in result.lower()
+    mock_client.comment_on_pr.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rebase_proceeds_on_untouched_bot_branch(mock_client: MagicMock, tools: tuple[ToolFn, ...]) -> None:
+    """Verify the guard leaves an untouched bot branch rebaseable."""
+    _, rebase, _ = tools
+    mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
+    mock_client.list_pr_commits = AsyncMock(return_value=[_commit("dependabot[bot]")])
+    mock_client.comment_on_pr = AsyncMock(return_value={})
+
+    result = await rebase("owner", "repo", 90)
+
+    assert "Successfully requested rebase" in result
+    mock_client.comment_on_pr.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rebase_dry_run_still_reports_the_clobber(mock_client: MagicMock, dry_run_tools: tuple[ToolFn, ...]) -> None:
+    """Verify dry-run surfaces the refusal rather than promising a rebase it would not do."""
+    _, rebase, _ = dry_run_tools
+    mock_client.get_pr_author = AsyncMock(return_value="dependabot[bot]")
+    mock_client.list_pr_commits = AsyncMock(return_value=[_commit("someone-else")])
+
+    result = await rebase("owner", "repo", 90)
+
+    assert "[DRY-RUN]" not in result
+    assert "someone-else" in result
+
+
+# --- client methods backing create_pr ---
+
+
+@pytest.mark.asyncio
+async def test_github_client_get_default_branch(github_token: str) -> None:
+    """Verify the client reads the repository's default branch."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"default_branch": "trunk"}
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_response
+        c = GitHubClient(token=github_token)
+        assert await c.get_default_branch("owner", "repo") == "trunk"
+        mock_get.assert_called_once_with("https://api.github.com/repos/owner/repo", headers=c.headers)
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_get_default_branch_falls_back(github_token: str) -> None:
+    """Verify a repository with no reported default branch falls back to main."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {}
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_response
+        c = GitHubClient(token=github_token)
+        assert await c.get_default_branch("owner", "repo") == "main"
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_create_pull_request(github_token: str) -> None:
+    """Verify the client posts a pull request to the correct endpoint."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"number": 5}
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+        c = GitHubClient(token=github_token)
+        result = await c.create_pull_request("owner", "repo", title="t", head="h", base="b", body="d")
+        assert result["number"] == 5
+        mock_post.assert_called_once_with(
+            "https://api.github.com/repos/owner/repo/pulls",
+            headers=c.headers,
+            json={"title": "t", "head": "h", "base": "b", "body": "d"},
+        )
+        await c.close()
