@@ -104,10 +104,16 @@ landed. These need opposite responses, so before cloning for a RED
 PR the agent calls `get_branch_ci_status` once per run to tell them
 apart.
 
-When the base is red, no dependency PR in that repository can go
-green on its own. By default the agent reports the cause once and
-skips the remaining RED PRs rather than attempting fixes that cannot
-succeed — a repo-wide fix does not belong in a
+A red base does not excuse every red PR, so the comparison is per
+check name: the base only takes the blame for checks it is failing
+too. A PR that fails a check the base passes introduced that failure
+itself and is fixed as normal — otherwise one unrelated broken job
+(a deploy step, say) would quietly stop every fix in the repository.
+
+When the base is failing the same checks, no dependency PR in that
+repository can go green on its own. By default the agent reports the
+cause once and skips the remaining RED PRs rather than attempting
+fixes that cannot succeed — a repo-wide fix does not belong in a
 `dependabot/*` branch, where it would be poor review hygiene and
 would make Dependabot stop managing the PR.
 

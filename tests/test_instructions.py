@@ -784,6 +784,26 @@ def test_workflow_reports_a_broken_base_once_not_per_pr() -> None:
     assert "every remaining RED PR" in content
 
 
+def test_base_blame_requires_the_same_checks_to_be_failing() -> None:
+    """A red base does not excuse every red PR.
+
+    kweinmeister/voting-agent has a failing 'Deploy Frontend' job on main while
+    lint and tests pass. A PR that breaks lint there is the PR's own fault, so
+    blaming any RED PR on a merely-RED base would silently stop fixing them.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "check names" in lowered
+    assert "also failing on the base" in lowered
+
+
+def test_pr_only_failures_are_still_fixed_when_the_base_is_red() -> None:
+    """The escape hatch: a check the PR fails but the base passes is the PR's."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "passing on the base" in content
+    assert "the PR introduced that failure" in content
+
+
 def test_base_fix_section_absent_by_default() -> None:
     """Opening unrelated PRs is a surprise, so it must be opt-in."""
     assert "fix_base_branch" not in _section_titles(_get_instructions())

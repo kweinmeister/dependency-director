@@ -63,9 +63,13 @@ def get_system_instructions(
 
     base_health_check = (
         "Before cloning, call 'get_branch_ci_status(owner, repo)' ONCE per run to "
-        f"check the PR's base branch. Reuse that one result for every RED PR — do NOT "
-        f"re-check it per PR. If it reports ci_status='RED', {base_red_action} "
-        "If the base is GREEN, the failure belongs to the PR: continue. "
+        "check the PR's base branch. Reuse that one result for every RED PR — do NOT "
+        "re-check it per PR. If the base is GREEN, the failure belongs to the PR: continue. "
+        "If it reports ci_status='RED', compare check names: a base failure only excuses "
+        "the PR for the same check. If every check failing on the PR is also failing on "
+        f"the base, {base_red_action} "
+        "If the PR fails a check that is passing on the base, the PR introduced that "
+        "failure: continue and fix it as normal. "
     )
 
     if no_sandbox:
