@@ -581,12 +581,14 @@ async def test_file_tools_are_denied_outside_the_workspace(
     mock_agent_class: MagicMock,
     github_token: str,
 ) -> None:
-    """The workspace list is inert on its own; a policy has to enforce it.
+    """The file tools need both halves: the opt-in policy and the workspace list.
 
     srt sandboxes run_command_sandboxed, but the SDK's built-in view/edit/create
     file tools do not go through it. Under a bare allow("*") they reach any path
     on the host — ~/.ssh, ~/.aws/credentials, our own .env. Only
-    policy.workspace_only() actually bounds them.
+    policy.workspace_only() puts them under containment, and the harness
+    enforces that containment against the config's workspace list, so both
+    have to be right.
     """
     settings = Settings()
     settings.github_token = github_token
@@ -602,19 +604,18 @@ async def test_file_tools_are_denied_outside_the_workspace(
         review_wait=0,
     )
     config_passed = mock_agent_class.call_args[1]["config"]
-    guarded = {p.tool: p for p in config_passed.policies if p.name == "workspace_only"}
+    guarded = {p.tool: p for p in config_passed.policies if p.name == policy.WORKSPACE_ONLY_POLICY_NAME}
     assert {t.value for t in BuiltinTools.file_tools()} <= guarded.keys()
-
-    workspace = next(ws for ws in config_passed.workspaces if "dependency-director-" in ws)
     for tool_policy in guarded.values():
         assert tool_policy.decision is policy.Decision.DENY
-        assert tool_policy.when(types.ToolCall(name="view_file", args={}, canonical_path="/etc/passwd"))
-        assert tool_policy.when(
-            types.ToolCall(name="view_file", args={}, canonical_path=str(Path(main.__file__).resolve())),
-        )
-        assert not tool_policy.when(
-            types.ToolCall(name="view_file", args={}, canonical_path=f"{workspace}/repo/setup.py"),
-        )
+
+    # The boundary the harness applies to those tools: the clone and the skill,
+    # and nothing that would put a host path or our own source inside it.
+    workspaces = [Path(ws).resolve() for ws in config_passed.workspaces]
+    workspace = next(ws for ws in workspaces if "dependency-director-" in ws.name)
+    assert any((workspace / "repo" / "setup.py").is_relative_to(ws) for ws in workspaces)
+    for outside in (Path("/etc/passwd"), Path(main.__file__).resolve()):
+        assert not any(outside.is_relative_to(ws) for ws in workspaces)
 
 
 @pytest.mark.parametrize(
