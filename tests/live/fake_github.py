@@ -124,6 +124,42 @@ class FakeGitHub:
         self._record("list_branches", owner, repo)
         return list(self._branches)
 
+    async def find_open_pr_for_head(self, owner: str, repo: str, head_branch: str) -> PullRequest | None:
+        """Return the open PR on a head branch, counting any opened this run.
+
+        Including ``created_prs`` keeps the fake honest about GitHub's one-open-
+        PR-per-head rule, so a run that opens a PR and then asks for the same
+        head again gets the answer the real API would give.
+        """
+        self._record("find_open_pr_for_head", owner, repo, head_branch)
+        branch = head_branch.split(":")[-1]
+
+        for pr in self._prs:
+            if pr["head_ref"] == branch:
+                return PullRequest.model_validate(
+                    {
+                        "number": pr["number"],
+                        "title": pr["title"],
+                        "html_url": f"https://github.com/{owner}/{repo}/pull/{pr['number']}",
+                        "head": {"ref": branch},
+                        "base": {"ref": self._base_ref(pr)},
+                    },
+                )
+
+        for i, created in enumerate(self.created_prs, start=1):
+            if str(created["head"]).split(":")[-1] == branch:
+                number = 900 + i
+                return PullRequest.model_validate(
+                    {
+                        "number": number,
+                        "title": created["title"],
+                        "html_url": f"https://github.com/{owner}/{repo}/pull/{number}",
+                        "head": {"ref": branch},
+                        "base": {"ref": created["base"]},
+                    },
+                )
+        return None
+
     async def get_pr_author(self, owner: str, repo: str, pr_number: int) -> str:
         """Return the scripted PR author."""
         self._record("get_pr_author", owner, repo, pr_number)

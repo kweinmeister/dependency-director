@@ -13,6 +13,7 @@ from dependency_director.config import (
     RATE_LIMIT_MAX_DELAY_SECONDS,
     BotConfig,
 )
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
     GitHubAuthenticationError,
     GitHubClient,
@@ -22,8 +23,10 @@ from dependency_director.tools import (
     WriteTools,
     _check_bot_author,
     _make_create_pr,
+    _make_find_open_pr_for_branch,
     _make_wait_for_ci,
     _make_write_tools,
+    create_agent_tools,
 )
 
 from .conftest import make_client_with_responses, make_client_with_status
@@ -731,7 +734,12 @@ async def test_wait_for_ci_timeout(mock_client: MagicMock, ci_tool: ToolFn) -> N
 
 @pytest.fixture
 def create_pr(mock_client: MagicMock) -> ToolFn:
-    """Fixture for the standalone-PR creation tool."""
+    """Fixture for the standalone-PR creation tool.
+
+    The branch starts unclaimed, which is the ordinary case; tests about a
+    branch that already carries a PR override the lookup.
+    """
+    mock_client.find_open_pr_for_head = AsyncMock(return_value=None)
     return _make_create_pr(mock_client, dry_run=False)
 
 
@@ -779,11 +787,154 @@ async def test_create_pr_uses_explicit_base_without_lookup(mock_client: MagicMoc
 @pytest.mark.asyncio
 async def test_create_pr_dry_run_does_not_write(mock_client: MagicMock) -> None:
     """Verify dry-run reports the intended PR without creating one."""
+    mock_client.find_open_pr_for_head = AsyncMock(return_value=None)
     mock_client.create_pull_request = AsyncMock()
     tool = _make_create_pr(mock_client, dry_run=True)
     result = await tool("owner", "repo", "fix: bump ty", "dependency-director/fix-90", "body", "main")
     assert "[DRY-RUN]" in result
     mock_client.create_pull_request.assert_not_awaited()
+
+
+def _http_error(status: int, message: str = "") -> httpx_mod.HTTPStatusError:
+    """Build an HTTPStatusError carrying the given status, as the client raises it."""
+    response = MagicMock()
+    response.status_code = status
+    return httpx_mod.HTTPStatusError(message or str(status), request=MagicMock(), response=response)
+
+
+def _open_pr(number: int, url: str) -> PullRequest:
+    """Build the PR payload find_open_pr_for_head returns."""
+    return PullRequest.model_validate({"number": number, "html_url": url})
+
+
+@pytest.mark.asyncio
+async def test_create_pr_returns_the_pr_already_open_for_that_branch(
+    mock_client: MagicMock,
+    create_pr: ToolFn,
+) -> None:
+    """A branch that already carries an open PR must report that PR, not fail.
+
+    The base fix branch name is derived from the base ref, so a second run over
+    a base whose fix PR has not merged yet rebuilds the same branch and asks
+    GitHub for a PR that exists. GitHub answers 422, which told the agent
+    nothing and left it looping.
+    """
+    mock_client.find_open_pr_for_head = AsyncMock(
+        return_value=_open_pr(58, "https://github.com/owner/repo/pull/58"),
+    )
+    mock_client.create_pull_request = AsyncMock()
+
+    result = await create_pr("owner", "repo", "t", "dependency-director/fix-base-main", "b", "main")
+
+    assert "#58" in result
+    assert "https://github.com/owner/repo/pull/58" in result
+    mock_client.find_open_pr_for_head.assert_awaited_once_with(
+        "owner",
+        "repo",
+        "dependency-director/fix-base-main",
+    )
+    mock_client.create_pull_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_pr_recovers_when_the_pr_appears_mid_flight(
+    mock_client: MagicMock,
+    create_pr: ToolFn,
+) -> None:
+    """A PR opened between the check and the post must resolve to that PR.
+
+    The pre-check closes the common case but not the race, and a 422 the agent
+    cannot act on is the failure being fixed here.
+    """
+    mock_client.find_open_pr_for_head = AsyncMock(
+        side_effect=[None, _open_pr(58, "https://github.com/owner/repo/pull/58")],
+    )
+    mock_client.create_pull_request = AsyncMock(side_effect=_http_error(422, "Validation Failed"))
+
+    result = await create_pr("owner", "repo", "t", "dependency-director/fix-base-main", "b", "main")
+
+    assert "#58" in result
+
+
+@pytest.mark.asyncio
+async def test_create_pr_surfaces_the_validation_reason(mock_client: MagicMock, create_pr: ToolFn) -> None:
+    """A 422 with no PR behind it must hand the agent GitHub's own words.
+
+    'No commits between' and 'already exists' need opposite responses, and the
+    bare status code distinguishes neither.
+    """
+    mock_client.find_open_pr_for_head = AsyncMock(return_value=None)
+    mock_client.create_pull_request = AsyncMock(
+        side_effect=_http_error(422, "Validation Failed: No commits between main and fix-base-main"),
+    )
+
+    result = await create_pr("owner", "repo", "t", "dependency-director/fix-base-main", "b", "main")
+
+    assert "No commits between" in result
+    assert "422" in result
+
+
+@pytest.mark.asyncio
+async def test_create_pr_propagates_errors_it_cannot_explain(mock_client: MagicMock, create_pr: ToolFn) -> None:
+    """Only 422 is interpreted; a 500 must not be reported as a handled outcome."""
+    mock_client.find_open_pr_for_head = AsyncMock(return_value=None)
+    mock_client.create_pull_request = AsyncMock(side_effect=_http_error(500, "Server Error"))
+
+    with pytest.raises(httpx_mod.HTTPStatusError):
+        await create_pr("owner", "repo", "t", "head", "b", "main")
+
+
+@pytest.mark.asyncio
+async def test_create_pr_dry_run_reports_the_existing_pr(mock_client: MagicMock) -> None:
+    """Dry-run must not promise a PR that the real run would refuse to open."""
+    mock_client.find_open_pr_for_head = AsyncMock(
+        return_value=_open_pr(58, "https://github.com/owner/repo/pull/58"),
+    )
+    mock_client.create_pull_request = AsyncMock()
+    tool = _make_create_pr(mock_client, dry_run=True)
+
+    result = await tool("owner", "repo", "t", "dependency-director/fix-base-main", "b", "main")
+
+    assert "#58" in result
+    mock_client.create_pull_request.assert_not_awaited()
+
+
+# --- find_open_pr_for_branch tool ---
+
+
+@pytest.mark.asyncio
+async def test_find_open_pr_for_branch_reports_the_open_pr(mock_client: MagicMock) -> None:
+    """The agent needs this answer before cloning, not after pushing.
+
+    Re-doing a base fix that is already awaiting review costs a clone, a
+    rebuild, and a force-push over the branch a human is reviewing.
+    """
+    tool = _make_find_open_pr_for_branch(mock_client)
+    mock_client.find_open_pr_for_head = AsyncMock(
+        return_value=_open_pr(58, "https://github.com/owner/repo/pull/58"),
+    )
+
+    result = await tool("owner", "repo", "dependency-director/fix-base-main")
+
+    assert "58" in result
+    assert "https://github.com/owner/repo/pull/58" in result
+
+
+@pytest.mark.asyncio
+async def test_find_open_pr_for_branch_reports_no_pr(mock_client: MagicMock) -> None:
+    """An absent PR must read as a clear negative, not an empty string."""
+    tool = _make_find_open_pr_for_branch(mock_client)
+    mock_client.find_open_pr_for_head = AsyncMock(return_value=None)
+
+    result = await tool("owner", "repo", "dependency-director/fix-base-main")
+
+    assert "no open pull request" in result.lower()
+
+
+def test_find_open_pr_for_branch_is_handed_to_the_agent(mock_client: MagicMock) -> None:
+    """A tool the instructions tell the agent to call must be in the bundle."""
+    tools = create_agent_tools(mock_client, DEFAULT_BOTS, dry_run=False, review_wait=0)
+    assert tools.find_open_pr_for_branch is not None
 
 
 # --- rebase clobber guard ---
@@ -889,6 +1040,109 @@ async def test_github_client_get_default_branch_falls_back(github_token: str) ->
         mock_get.return_value = mock_response
         c = GitHubClient(token=github_token)
         assert await c.get_default_branch("owner", "repo") == "main"
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_api_error_carries_githubs_explanation() -> None:
+    """A refusal must reach the caller with GitHub's reason attached.
+
+    httpx names only the status code, so a 422 arrived as "Client error '422
+    Unprocessable Entity'" with the body — the only part that says which of the
+    several 422 causes applied — discarded.
+    """
+    body = {
+        "message": "Validation Failed",
+        "errors": [{"message": "A pull request already exists for owner:fix-base-main."}],
+    }
+    client, _ = make_client_with_responses(
+        [
+            httpx_mod.Response(
+                422,
+                json=body,
+                request=httpx_mod.Request("POST", "https://api.github.com/repos/owner/repo/pulls"),
+            ),
+        ],
+    )
+
+    with pytest.raises(httpx_mod.HTTPStatusError) as excinfo:
+        await client.create_pull_request("owner", "repo", title="t", head="h", base="b", body="d")
+
+    assert "Validation Failed" in str(excinfo.value)
+    assert "A pull request already exists" in str(excinfo.value)
+    # The response must survive enrichment; callers branch on its status code.
+    assert excinfo.value.response.status_code == 422
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_error_survives_an_unreadable_body() -> None:
+    """A non-JSON error body must degrade to the plain status, not crash."""
+    client, _ = make_client_with_responses(
+        [
+            httpx_mod.Response(
+                500,
+                text="<html>upstream is down</html>",
+                request=httpx_mod.Request("POST", "https://api.github.com/repos/owner/repo/pulls"),
+            ),
+        ],
+    )
+
+    with pytest.raises(httpx_mod.HTTPStatusError) as excinfo:
+        await client.create_pull_request("owner", "repo", title="t", head="h", base="b", body="d")
+
+    assert "500" in str(excinfo.value)
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_find_open_pr_for_head(github_token: str) -> None:
+    """Verify the client asks GitHub for the open PR on one head branch."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = [
+        {"number": 58, "html_url": "https://github.com/owner/repo/pull/58", "head": {"ref": "fix-base-main"}},
+    ]
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_response
+        c = GitHubClient(token=github_token)
+        found = await c.find_open_pr_for_head("owner", "repo", "fix-base-main")
+        assert found is not None
+        assert found.number == 58
+        assert found.html_url == "https://github.com/owner/repo/pull/58"
+        mock_get.assert_called_once_with(
+            "https://api.github.com/repos/owner/repo/pulls",
+            headers=c.headers,
+            params={"head": "owner:fix-base-main", "state": "open"},
+        )
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_find_open_pr_for_head_accepts_a_qualified_head(github_token: str) -> None:
+    """A head already spelled 'owner:branch' must not be qualified twice.
+
+    Faced with an unexplained 422 the agent guessed that head_branch wanted an
+    owner prefix, so the qualified spelling is one it will actually pass.
+    """
+    mock_response = MagicMock()
+    mock_response.json.return_value = []
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_response
+        c = GitHubClient(token=github_token)
+        await c.find_open_pr_for_head("owner", "repo", "owner:fix-base-main")
+        assert mock_get.call_args.kwargs["params"] == {"head": "owner:fix-base-main", "state": "open"}
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_find_open_pr_for_head_returns_none(github_token: str) -> None:
+    """Verify an unclaimed branch reports None rather than an empty model."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = []
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_response
+        c = GitHubClient(token=github_token)
+        assert await c.find_open_pr_for_head("owner", "repo", "fix-base-main") is None
         await c.close()
 
 

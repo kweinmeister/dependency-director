@@ -29,6 +29,9 @@ GIT_GLOBAL_FLAGS_WITH_ARG = {
 
 COMPOUND_OPERATORS = {"&&", "||"}
 
+# Every spelling by which 'git push' asks to overwrite the remote branch.
+FORCE_PUSH_FLAGS = {"-f", "--force", "--force-with-lease", "--force-if-includes"}
+
 
 class CompoundPart(NamedTuple):
     """A sub-command extracted from a compound argv list.
@@ -163,10 +166,47 @@ def is_git_push_argv(argv: list[str]) -> bool:
     Sees through ``env`` wrappers, ``KEY=val`` prefixes, absolute paths, and
     ``&&``/``||`` compounds.
     """
+    return any(_push_start(part.argv) is not None for part in split_compound_argv(argv))
+
+
+def _push_start(argv: list[str]) -> int | None:
+    """Return where a ``git push``'s arguments begin, or None if it is not one."""
+    resolved = resolve_exe(argv)
+    if resolved is None or resolved.name != "git":
+        return None
+    start = resolved.exe_idx + 1
+    return start if git_subcommand(argv, start) == "push" else None
+
+
+def _push_is_forced(argv: list[str], start: int) -> bool:
+    """Report whether a push's arguments ask for a forced update.
+
+    Covers the flag spellings, short-flag bundles such as ``-qf``, and the
+    ``+refspec`` form, which forces the update without naming a flag at all.
+    ``--force-with-lease`` counts: it only checks the remote against what the
+    caller last fetched, so a fetch immediately beforehand — which is what a
+    rejected push prompts — makes it overwrite just as freely.
+    """
+    for token in argv[start:]:
+        base = token.split("=", 1)[0]
+        if base in FORCE_PUSH_FLAGS:
+            return True
+        if token.startswith("-") and not token.startswith("--") and "f" in token[1:]:
+            return True
+        # After 'push', a leading '+' marks a refspec as forced.
+        if token.startswith("+"):
+            return True
+    return False
+
+
+def is_forced_git_push_argv(argv: list[str]) -> bool:
+    """Return True if any sub-command in ``argv`` force-pushes.
+
+    A forced push discards whatever the remote branch already carried, which
+    for a branch under review is a reviewer's commits.
+    """
     for part in split_compound_argv(argv):
-        resolved = resolve_exe(part.argv)
-        if resolved is None or resolved.name != "git":
-            continue
-        if git_subcommand(part.argv, resolved.exe_idx + 1) == "push":
+        start = _push_start(part.argv)
+        if start is not None and _push_is_forced(part.argv, start):
             return True
     return False

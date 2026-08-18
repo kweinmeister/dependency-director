@@ -17,6 +17,8 @@ strings with no schema, and validating them would be ceremony.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -90,6 +92,7 @@ class PullRequest(_Inbound):
 
     number: int = 0
     title: str = ""
+    html_url: str = ""
     user: GitHubUser | None = None
     created_at: str = ""
     head: PullRequestRef = Field(default_factory=PullRequestRef)
@@ -190,6 +193,19 @@ class BotPrSummary(BaseModel):
     title: str
     author: str
     created_at: str
+    base_ref: str
+
+
+class OpenPrSummary(BaseModel):
+    """The reply to ``find_open_pr_for_branch`` when a branch already has a PR.
+
+    ``html_url`` is here because the agent's job on finding one is to report it
+    to a human, and a bare number is not something a human can open.
+    """
+
+    number: int
+    title: str
+    html_url: str
     base_ref: str
 
 
@@ -316,3 +332,14 @@ def summarize_checks(
 def json_payload(model: BaseModel) -> str:
     """Render an outbound model as the indented JSON the agent reads."""
     return model.model_dump_json(indent=2)
+
+
+def json_payload_list(models: Sequence[BaseModel]) -> str:
+    """Render a sequence of outbound models as one indented JSON array.
+
+    Dumps in pydantic's JSON mode rather than handing ``model_dump()`` to
+    ``json.dumps``, so a field type Python's encoder cannot represent — a
+    datetime, a UUID — serializes here exactly as it does for a single model
+    instead of raising.
+    """
+    return json.dumps([model.model_dump(mode="json") for model in models], indent=2)

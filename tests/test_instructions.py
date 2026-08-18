@@ -815,6 +815,63 @@ def test_base_fix_pr_targets_the_base_that_was_diagnosed() -> None:
     assert "base_ref" in content
 
 
+def test_base_health_is_checked_before_logs_are_pulled() -> None:
+    """The cheap branch-level check has to precede the expensive per-PR one.
+
+    A base failing the same checks excuses every PR on it, so logs pulled
+    first are logs discarded. Reading them for five PRs is what turned one
+    repository into 2.6M input tokens.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert content.index("get_branch_ci_status") < content.index("get_pr_workflow_run_logs")
+
+
+def test_logs_are_read_once_per_distinct_failure() -> None:
+    """PRs failing the identical check must not each cost a full log read.
+
+    kweinmeister/fast-diff-mcp ran five dependency PRs that all failed the same
+    'Build and Test' job for the same reason, and the run pulled logs five
+    times — the single largest line item in a 4.5M-token run.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "already read logs for" in lowered
+    assert "reproduce" in lowered
+
+
+def test_log_reuse_falls_back_when_the_failure_differs() -> None:
+    """Two PRs can fail one check for unrelated reasons.
+
+    Reusing a diagnosis across them is only safe because the local run is the
+    real source of truth; without a stated fallback the agent would carry the
+    first PR's conclusion onto a failure it does not explain.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "does not reproduce" in lowered
+    assert "different error" in lowered
+
+
+def test_log_reuse_is_keyed_on_the_check_that_failed() -> None:
+    """The reuse rule has to be scoped to matching checks, not to 'a second RED PR'."""
+    content = _section_content(_get_instructions(), "workflow")
+    reuse_at = content.lower().index("already read logs for")
+    window = content[max(0, reuse_at - 300) : reuse_at + 300].lower()
+    assert "check" in window
+
+
+def test_dry_run_treats_a_blocked_push_as_expected() -> None:
+    """A push denial is the policy working, so it must not be reported as a failure.
+
+    Every RED PR in a dry run ends on one, and the agent narrated each into the
+    transcript as though something had gone wrong.
+    """
+    content = _section_content(_get_instructions(dry_run=True), "dry_run_mode")
+    lowered = content.lower()
+    assert "denied by policy" in lowered
+    assert "expected" in lowered
+
+
 def test_base_blame_requires_the_same_checks_to_be_failing() -> None:
     """A red base does not excuse every red PR.
 
@@ -858,6 +915,24 @@ def test_base_fix_scope_is_bounded_to_what_ci_fails_on() -> None:
     lowered = content.lower()
     assert "only" in lowered
     assert "unrelated" in lowered
+
+
+def test_base_fix_checks_for_a_pr_it_already_opened() -> None:
+    """A base fix awaiting review must stop the next run before it clones.
+
+    The fix branch name is derived from the base ref, so every run over an
+    unmerged base fix rebuilds the same branch, force-pushes over the PR a
+    human is reviewing, and then dead-ends when GitHub refuses the duplicate.
+    """
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    assert "find_open_pr_for_branch" in content
+    assert "before" in content.lower()
+
+
+def test_base_fix_leaves_generated_files_alone() -> None:
+    """'uv sync' rewrites the lockfile, and that is not part of a lint fix."""
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    assert "uv.lock" in content
 
 
 def test_base_fix_is_excluded_from_auto_merge() -> None:

@@ -125,6 +125,16 @@ agent's own change to a default branch is a larger step than merging
 a dependency bump. The dependency PRs stay blocked until that PR is
 reviewed, merged, and the bots rebase.
 
+Because the base stays red until then, the next run diagnoses it all
+over again. The fix branch name is derived from the base ref, so that
+run would rebuild the same branch and force-push over the PR someone
+is reviewing. To prevent it, the agent calls
+`find_open_pr_for_branch` before cloning: an open fix PR means the
+work is done, and the run reports it and moves on. `create_pr`
+enforces the same rule independently — asked for a branch that
+already carries an open PR, it reports that PR instead of opening a
+duplicate.
+
 ---
 
 ## Safety Guardrails
@@ -178,6 +188,12 @@ The agent operates under two modes of programmatic safety:
      `core.hookspath`, `core.sshcommand`), flags (`--upload-pack`,
      `--receive-pack`, `--config-env`, `--git-dir`), and protocol
      extensions are blocked.
+   - **Forced pushes blocked** — `git push -f`, `--force`,
+     `--force-with-lease`, `--force-if-includes`, and `+refspec`
+     are rejected. A forced push discards whatever the remote
+     branch already held, which on a branch under review is a
+     reviewer's commits. A non-fast-forward rejection is a signal
+     to reconcile, not to overwrite.
    - **GitHub token scoped** — The token env vars are only present
      in the subprocess environment when running git commands.
 
