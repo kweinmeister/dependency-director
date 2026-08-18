@@ -61,6 +61,8 @@
       "~/.local/share/gem",
       "~/.local/share/mise/installs",
       "~/.local/share/mise/shims",
+      "~/.local/share/uv/python",
+      "~/.local/share/uv/tools",
       "~/.local/share/virtualenvs",
       "~/.m2/repository",
       "~/.matlab",

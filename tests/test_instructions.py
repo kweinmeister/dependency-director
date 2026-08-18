@@ -722,6 +722,22 @@ def test_output_format_no_artifacts() -> None:
     assert "artifact" in section.lower() or "file" in section.lower()
 
 
+# --- Summary shape ---
+
+
+def test_output_format_summary_is_a_bullet_list_not_a_table() -> None:
+    """The final summary must be a bullet list, and tables ruled out explicitly.
+
+    'Summary list' alone left the model free to render a markdown table. On
+    kweinmeister/youtube-dashboard all five rows carried the identical reason
+    string, which tripped the looping-content detector: the turn died mid-table
+    and the SDK re-emitted the whole run.
+    """
+    content = _section_content(_get_instructions(), "output_format").lower()
+    assert "bullet list" in content
+    assert "never a table" in content
+
+
 # --- Rebase remaining RED after fix merge (auto-merge only) ---
 
 
@@ -858,6 +874,68 @@ def test_log_reuse_is_keyed_on_the_check_that_failed() -> None:
     reuse_at = content.lower().index("already read logs for")
     window = content[max(0, reuse_at - 300) : reuse_at + 300].lower()
     assert "check" in window
+
+
+def test_a_check_that_failed_from_a_runner_error_is_not_cloned() -> None:
+    """A check the runner itself killed says nothing about the dependency update.
+
+    kweinmeister/youtube-dashboard had five PRs whose only failing check was a
+    Gemini review action that died on 'FatalTurnLimitedError'. Nothing in the
+    repository can reproduce that, so the clone-sync-test cycle the agent ran
+    to prove it could only ever end where it started.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "runner error" in lowered
+    error_at = lowered.index("runner error")
+    window = lowered[error_at : error_at + 400]
+    assert "do not clone" in window
+
+
+def test_runner_error_triage_names_the_conditions_it_covers() -> None:
+    """'Runner error' is only actionable if the agent knows what counts as one."""
+    content = _section_content(_get_instructions(), "workflow").lower()
+    for condition in ("turn", "rate", "memory", "timed out", "authenticate"):
+        assert condition in content, f"runner-error triage does not mention {condition}"
+
+
+def test_a_diagnosis_outside_the_dependency_update_is_not_re_cloned() -> None:
+    """Reusing a log read is not enough when the clone is the expensive part.
+
+    The existing rule stops the second PR pulling logs but still sends it
+    through clone, 'uv sync' and a full test run to re-confirm a verdict the
+    agent already holds. For a cause no code change of its own would fix,
+    that whole cycle is dead weight.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "skip the clone" in lowered
+    assert "outside the dependency update" in lowered
+
+
+def test_clone_reuse_still_reproduces_a_real_code_failure() -> None:
+    """Skipping the clone is only safe for causes outside the PR's own code.
+
+    Two PRs can fail the same check for genuinely different code reasons, so
+    the shortcut must not swallow a failure a fix would actually address.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "clone and reproduce" in lowered
+    assert "real code failure" in lowered
+
+
+def test_non_reproduction_is_only_claimed_after_a_local_run() -> None:
+    """'Did not reproduce locally' is a claim about a test run that happened.
+
+    In the youtube-dashboard run the agent logged it for three PRs it never
+    cloned, reporting a local result it had not observed.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    claim_at = lowered.index("did not reproduce locally")
+    window = lowered[claim_at : claim_at + 400]
+    assert "actually ran" in window
 
 
 def test_dry_run_treats_a_blocked_push_as_expected() -> None:
