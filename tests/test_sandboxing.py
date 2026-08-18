@@ -1064,6 +1064,37 @@ def test_srt_settings_allows_package_registries(host: str, why: str) -> None:
     assert any(fnmatch.fnmatch(host, p) for p in patterns), f"network.allowedDomains does not cover {host} ({why})"
 
 
+@pytest.mark.parametrize(
+    ("path", "why"),
+    [
+        # uv keeps the interpreters it manages here, and 'denyRead: ~' hides
+        # them. kweinmeister/youtube-dashboard ran 'uv sync' against a repo
+        # whose only usable Python was one of these, so uv reported no
+        # interpreter at all and the agent burned nine commands hunting for a
+        # system one before landing on Homebrew's.
+        ("~/.local/share/uv/python", "uv-managed python interpreters"),
+        ("~/.local/share/uv/tools", "uv tool installs"),
+        # Pre-existing entries, asserted so a future edit cannot silently drop
+        # them while reshaping the list.
+        ("~/.cache/uv", "uv package cache"),
+        ("~/.local/share/mise/installs", "mise-managed runtimes"),
+        ("~/.pyenv/versions", "pyenv-managed interpreters"),
+    ],
+)
+def test_srt_settings_allows_toolchain_interpreter_paths(path: str, why: str) -> None:
+    """Verify the agent can read every directory a Python toolchain resolves through.
+
+    An entry counts when it names the path itself or a parent of it, so
+    broadening the list later (``~/.local/share/uv``) still satisfies this.
+    """
+    with Path(DEFAULT_SRT_SETTINGS_PATH).open() as f:
+        config = json.load(f)
+
+    allow_read = config.get("filesystem", {}).get("allowRead", [])
+    covered = any(path == entry or path.startswith(entry.rstrip("/") + "/") for entry in allow_read)
+    assert covered, f"filesystem.allowRead does not cover {path} ({why})"
+
+
 # --- Compound && / || support (TDD) ---
 
 
