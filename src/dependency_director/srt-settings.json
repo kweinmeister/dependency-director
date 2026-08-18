@@ -1,6 +1,8 @@
 {
   "network": {
     "allowedDomains": [
+      "*.crates.io",
+      "*.docker.io",
       "*.pkg.dev",
       "api.bitbucket.org",
       "api.github.com",
@@ -9,17 +11,22 @@
       "codeload.github.com",
       "crates.io",
       "files.pythonhosted.org",
+      "ghcr.io",
       "github.com",
       "gitlab.com",
+      "mcr.microsoft.com",
       "objects.githubusercontent.com",
+      "pkg-containers.githubusercontent.com",
+      "production.cloudflare.docker.com",
       "proxy.golang.org",
+      "public.ecr.aws",
       "pypi.org",
+      "quay.io",
       "raw.githubusercontent.com",
       "registry.npmjs.org",
       "registry.yarnpkg.com",
       "release-assets.githubusercontent.com",
-      "ssh.dev.azure.com",
-      "static.crates.io"
+      "ssh.dev.azure.com"
     ],
     "deniedDomains": [
       "*.ngrok.io",

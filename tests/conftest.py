@@ -2,7 +2,7 @@
 
 import asyncio
 import inspect
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +10,7 @@ import httpx as httpx_mod
 import pytest
 
 from dependency_director.config import DEFAULT_BOTS, BotConfig
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import GitHubClient, ToolFn, _make_write_tools
 
 
@@ -37,15 +38,39 @@ def wait_tool(mock_client: MagicMock) -> Callable[..., ToolFn]:
         bots: list[BotConfig] = DEFAULT_BOTS,
         dry_run: bool = False,
     ) -> ToolFn:
-        _, _, wait = _make_write_tools(
+        return _make_write_tools(
             client=mock_client,
             bots=bots,
             dry_run=dry_run,
             review_wait=review_wait,
-        )
-        return wait
+        ).wait_for_reviews
 
     return _make
+
+
+def make_client_with_responses(
+    responses: Sequence[httpx_mod.Response],
+    token: str | None = None,
+) -> tuple[GitHubClient, MagicMock]:
+    """Create a GitHubClient whose transport replays the given responses in order.
+
+    The final response repeats once the script is exhausted, so a test only has
+    to spell out the turns it cares about. The transport mock is returned
+    alongside the client so callers can assert how many requests were made.
+    """
+    c = GitHubClient(token=token or "placeholder")
+    queued = list(responses)
+
+    async def handle(request: httpx_mod.Request) -> httpx_mod.Response:
+        response = queued.pop(0) if len(queued) > 1 else queued[0]
+        response.request = request
+        return response
+
+    mock_transport = MagicMock()
+    mock_transport.aclose = AsyncMock()
+    mock_transport.handle_async_request = AsyncMock(side_effect=handle)
+    c.client._transport = mock_transport
+    return c, mock_transport
 
 
 def make_client_with_status(status_code: int, url: str, token: str | None = None) -> GitHubClient:
@@ -54,18 +79,11 @@ def make_client_with_status(status_code: int, url: str, token: str | None = None
     Useful for testing the event-hook error-classification logic without
     making real network calls.
     """
-    token_str = token or "placeholder"
-    c = GitHubClient(token=token_str)
-    mock_transport = MagicMock()
-    mock_transport.aclose = AsyncMock()
-    mock_transport.handle_async_request = AsyncMock(
-        return_value=httpx_mod.Response(
-            status_code=status_code,
-            request=httpx_mod.Request("GET", url),
-        ),
+    client, _ = make_client_with_responses(
+        [httpx_mod.Response(status_code=status_code, request=httpx_mod.Request("GET", url))],
+        token,
     )
-    c.client._transport = mock_transport
-    return c
+    return client
 
 
 async def _mock_chunks_async_generator() -> AsyncGenerator[None]:
@@ -106,7 +124,7 @@ def mock_list_open_prs() -> Generator[MagicMock]:
         new_callable=AsyncMock,
     ) as mock:
 
-        async def side_effect(_owner: str, _repo: str) -> list[dict[str, str | int]]:
+        async def side_effect(_owner: str, _repo: str) -> list[PullRequest]:
             allowed_authors = ["dependabot[bot]"]
             frame = inspect.currentframe()
             while frame:
@@ -118,12 +136,15 @@ def mock_list_open_prs() -> Generator[MagicMock]:
                 frame = frame.f_back
 
             return [
-                {
-                    "number": 12 + i,
-                    "title": f"bump foo for {author}",
-                    "author": author,
-                    "created_at": "2026-06-08T00:00:00Z",
-                }
+                PullRequest.model_validate(
+                    {
+                        "number": 12 + i,
+                        "title": f"bump foo for {author}",
+                        "user": {"login": author},
+                        "created_at": "2026-06-08T00:00:00Z",
+                        "base": {"ref": "main"},
+                    },
+                )
                 for i, author in enumerate(allowed_authors)
             ]
 

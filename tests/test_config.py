@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -14,8 +15,24 @@ from google.antigravity.hooks import hooks, policy
 from google.antigravity.types import BuiltinTools
 from pydantic import ValidationError
 
-from dependency_director.config import DEFAULT_BOTS, BotConfig, Settings, get_dry_run_policies, get_safety_policies
-from dependency_director.main import _check_open_bot_prs, run_agent_for_repo
+from dependency_director import main
+from dependency_director.config import (
+    DEFAULT_BOTS,
+    DEFAULT_CACHE_DIR,
+    BotConfig,
+    LogLimits,
+    OutputLimits,
+    Settings,
+    get_dry_run_policies,
+    get_safety_policies,
+)
+from dependency_director.main import (
+    PROJECT_ROOT,
+    SKILLS_PATH,
+    _check_open_bot_prs,
+    run_agent_for_repo,
+)
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import GitHubClient
 
 from .conftest import AsyncFSHelper
@@ -106,6 +123,111 @@ def test_settings_empty_bots_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DEPDIRECTOR_BOTS", "[]")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_settings_output_limits_default_to_the_documented_values() -> None:
+    """Verify the output caps default to what the README and .env.template state."""
+    assert Settings().output_limits == OutputLimits(max_lines=200, max_chars=24000)
+
+
+def test_settings_output_limits_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify both caps can be overridden from the environment, including to 0."""
+    monkeypatch.setenv("DEPDIRECTOR_MAX_OUTPUT_LINES", "0")
+    monkeypatch.setenv("DEPDIRECTOR_MAX_OUTPUT_CHARS", "5000")
+    assert Settings().output_limits == OutputLimits(max_lines=0, max_chars=5000)
+
+
+@pytest.mark.parametrize("var", ["DEPDIRECTOR_MAX_OUTPUT_LINES", "DEPDIRECTOR_MAX_OUTPUT_CHARS"])
+def test_settings_output_limits_reject_negative(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+    """Verify a negative cap is rejected rather than silently slicing backwards."""
+    monkeypatch.setenv(var, "-1")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_log_limits_default_to_the_documented_values() -> None:
+    """Verify the CI-log caps default to what the README and .env.template state."""
+    assert Settings().log_limits == LogLimits(max_failed_jobs=3, tail_lines=50)
+
+
+def test_settings_log_limits_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify a repo whose failures need more context can raise both caps."""
+    monkeypatch.setenv("DEPDIRECTOR_MAX_FAILED_JOBS", "8")
+    monkeypatch.setenv("DEPDIRECTOR_WORKFLOW_LOG_TAIL_LINES", "200")
+    assert Settings().log_limits == LogLimits(max_failed_jobs=8, tail_lines=200)
+
+
+@pytest.mark.parametrize(
+    "var",
+    ["DEPDIRECTOR_MAX_FAILED_JOBS", "DEPDIRECTOR_WORKFLOW_LOG_TAIL_LINES"],
+)
+def test_settings_log_limits_reject_zero_and_below(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+    """Verify a cap of 0 is rejected: it would fetch logs and then return none of them."""
+    monkeypatch.setenv(var, "0")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_cache_dir_defaults_outside_any_workspace() -> None:
+    """Verify the package cache defaults to a shared path the workspace cleanup cannot reach."""
+    cache_dir = Settings().cache_dir
+    assert cache_dir == DEFAULT_CACHE_DIR
+    assert not Path(cache_dir).name.startswith("dependency-director-workspace")
+    assert Path(cache_dir).parent == Path(tempfile.gettempdir())
+
+
+def test_settings_cache_dir_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify the shared package cache location can be overridden from the environment."""
+    monkeypatch.setenv("DEPDIRECTOR_CACHE_DIR", "/tmp/custom-depdirector-cache")
+    assert Settings().cache_dir == "/tmp/custom-depdirector-cache"
+
+
+@pytest.mark.asyncio
+async def test_repo_without_bot_prs_skips_workspace_and_sandbox_setup(
+    mock_agent_class: MagicMock,
+    mock_list_open_prs: MagicMock,
+    github_token: str,
+) -> None:
+    """Verify a repo with no bot PRs costs no workspace, no sandbox, and no agent spawn."""
+    mock_list_open_prs.side_effect = None
+    mock_list_open_prs.return_value = []
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    with (
+        patch("dependency_director.main.create_run_command_tool") as mock_run_command_tool,
+        patch("dependency_director.main._prepare_workspace") as mock_prepare_workspace,
+    ):
+        await run_agent_for_repo(
+            repo="test-owner/test-repo",
+            settings=settings,
+            max_attempts=3,
+        )
+    mock_prepare_workspace.assert_not_called()
+    mock_run_command_tool.assert_not_called()
+    mock_agent_class.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_passes_cache_dir_to_sandbox(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """Verify the configured shared cache directory reaches the sandboxed command tool."""
+    _ = mock_agent_class
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    settings.cache_dir = "/tmp/custom-depdirector-cache"
+    with patch("dependency_director.main.create_run_command_tool") as mock_run_command_tool:
+        await run_agent_for_repo(
+            repo="test-owner/test-repo",
+            settings=settings,
+            max_attempts=3,
+            dry_run=True,
+        )
+    mock_run_command_tool.assert_called_once()
+    assert mock_run_command_tool.call_args.kwargs["cache_dir"] == "/tmp/custom-depdirector-cache"
 
 
 def test_safety_policy_structure() -> None:
@@ -241,6 +363,74 @@ def test_dry_run_git_push_substring() -> None:
     assert block_push.when({"command_line": "git -C dir push"}) is True
 
 
+@pytest.mark.parametrize(
+    ("command_line", "blocked"),
+    [
+        # --- Plain invocations ---
+        ("git push origin main", True),
+        ("git push origin pr-90:dependabot/pip/ty-0.0.64", True),
+        ("/usr/bin/git push origin main", True),
+        ("git -C dir push", True),
+        ("git -c user.name=x push origin main", True),
+        # --- env(1) wrappers: the form the system instructions tell the agent to use ---
+        ("env GIT_TERMINAL_PROMPT=0 git push origin main", True),
+        ("env -u SSH_AUTH_SOCK git push origin main", True),
+        ("env -- git push origin main", True),
+        ("/usr/bin/env GIT_TERMINAL_PROMPT=0 git push origin main", True),
+        # --- Bare KEY=val prefixes ---
+        ("GIT_AUTHOR_NAME=x git push origin main", True),
+        ("A=1 B=2 git push origin main", True),
+        # --- Compound commands where git is not the leading token ---
+        ("ls && git push origin main", True),
+        ("git status && git push origin main", True),
+        ("uv run pytest || git push origin main", True),
+        ("git add -A && env FOO=1 git push origin main", True),
+        # --- Must stay allowed ---
+        ("git status", False),
+        ("git pull", False),
+        ("git pushup", False),
+        ("git fetch origin pull/90/head:pr-90", False),
+        ("git merge origin/main", False),
+        ("echo push", False),
+        ("env FOO=bar uv sync", False),
+        ("uv run pytest && ruff check .", False),
+        ("git commit -m push", False),
+        ("env FOO=push git status", False),
+        ("", False),
+    ],
+)
+def test_dry_run_push_guard_resists_wrappers(command_line: str, *, blocked: bool) -> None:
+    """Verify the dry-run push guard cannot be evaded by env or compound wrappers.
+
+    The agent is instructed to prefix commands with ``env KEY=val`` (see
+    ``get_system_instructions``), so a guard that only inspects ``argv[0]``
+    would let real pushes through during a dry run.
+    """
+    block_push = next(p for p in get_dry_run_policies() if p.name == "dry_run_block_push")
+    assert block_push.when({"command_line": command_line}) is blocked
+
+
+def test_dry_run_push_guard_covers_both_arg_spellings() -> None:
+    """Verify the guard reads both 'command_line' and legacy 'CommandLine' args."""
+    block_push = next(p for p in get_dry_run_policies() if p.name == "dry_run_block_push")
+    assert block_push.when({"CommandLine": "env FOO=1 git push origin main"}) is True
+    assert block_push.when({}) is False
+
+
+def test_dry_run_push_guard_applies_to_sandboxed_tool() -> None:
+    """Verify the sandboxed runner is guarded identically to the builtin runner."""
+    policies = get_dry_run_policies()
+    sandboxed = next(p for p in policies if p.name == "dry_run_block_push_sandboxed")
+    assert sandboxed.when({"command_line": "env FOO=1 git push origin main"}) is True
+    assert sandboxed.when({"command_line": "git status"}) is False
+
+
+def test_dry_run_push_guard_handles_unparseable_quoting() -> None:
+    """Verify an unbalanced quote fails closed when it mentions a push."""
+    block_push = next(p for p in get_dry_run_policies() if p.name == "dry_run_block_push")
+    assert block_push.when({"command_line": 'git push origin "unclosed'}) is True
+
+
 @pytest.mark.asyncio
 async def test_workspace_cleanup_on_start(
     mock_agent_class: MagicMock,
@@ -351,6 +541,80 @@ async def test_agent_config_no_vertex_excludes_project(mock_agent_class: MagicMo
     assert config_passed.vertex is not True
     assert config_passed.project is None
     assert config_passed.location is None
+
+
+@pytest.mark.asyncio
+async def test_agent_workspaces_exclude_our_own_source_tree(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """The workspace list bounds the file tools, so our checkout must not be in it.
+
+    PROJECT_ROOT holds this project's own source and the .env our template tells
+    users to create there, holding GITHUB_TOKEN and GEMINI_API_KEY. The skill
+    loads from skills_paths, a separate mechanism, so listing the whole root
+    buys nothing and exposes credentials to read and the source to rewrite.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+    workspaces = mock_agent_class.call_args[1]["config"].workspaces
+    assert str(PROJECT_ROOT) not in workspaces
+    assert str(SKILLS_PATH) in workspaces
+    # Nothing listed may contain our own source, however it is spelled.
+    our_source = Path(main.__file__).resolve()
+    assert not any(our_source.is_relative_to(Path(ws).resolve()) for ws in workspaces)
+
+
+@pytest.mark.asyncio
+async def test_file_tools_are_denied_outside_the_workspace(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """The workspace list is inert on its own; a policy has to enforce it.
+
+    srt sandboxes run_command_sandboxed, but the SDK's built-in view/edit/create
+    file tools do not go through it. Under a bare allow("*") they reach any path
+    on the host — ~/.ssh, ~/.aws/credentials, our own .env. Only
+    policy.workspace_only() actually bounds them.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+    config_passed = mock_agent_class.call_args[1]["config"]
+    guarded = {p.tool: p for p in config_passed.policies if p.name == "workspace_only"}
+    assert {t.value for t in BuiltinTools.file_tools()} <= guarded.keys()
+
+    workspace = next(ws for ws in config_passed.workspaces if "dependency-director-" in ws)
+    for tool_policy in guarded.values():
+        assert tool_policy.decision is policy.Decision.DENY
+        assert tool_policy.when(types.ToolCall(name="view_file", args={}, canonical_path="/etc/passwd"))
+        assert tool_policy.when(
+            types.ToolCall(name="view_file", args={}, canonical_path=str(Path(main.__file__).resolve())),
+        )
+        assert not tool_policy.when(
+            types.ToolCall(name="view_file", args={}, canonical_path=f"{workspace}/repo/setup.py"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -481,6 +745,104 @@ async def test_run_agent_for_repo_processes_chunks(mock_agent_class: MagicMock, 
     )
 
 
+async def _empty_chunks() -> AsyncGenerator[types.Text]:
+    """Yield no chunks, as a turn that produced nothing renderable does."""
+    return
+    yield types.Text(text="", step_index=0)
+
+
+def _chat_that_logs(logger: logging.Logger, message: str, *args: object) -> AsyncMock:
+    """Build a chat stub whose turn logs one warning and renders nothing.
+
+    The %-style args are forwarded unformatted, so the stub exercises the same
+    lazy-interpolation path the SDK's own records take.
+    """
+
+    async def chat(_prompt: str) -> MagicMock:
+        logger.warning(message, *args)
+        response = MagicMock()
+        response.chunks = _empty_chunks()
+        return response
+
+    return AsyncMock(side_effect=chat)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_reports_a_clean_turn_as_completed(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify a turn that logs nothing is still reported as a clean completion."""
+    _ = mock_agent_class
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+    assert "Agent execution completed for test-owner/test-repo" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_surfaces_errors_the_sdk_only_logged(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The SDK reports some terminal failures by logging, not raising or yielding a chunk.
+
+    A model-output loop is the case seen in practice: the turn ends early with
+    truncated output while the run still claims to have completed.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    mock_agent_class.return_value.chat = _chat_that_logs(
+        logging.getLogger(),
+        "System step error (HTTP %s): %s",
+        0,
+        "Detected a loop in the model's output.",
+    )
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+    output = capsys.readouterr().out
+    assert "Detected a loop in the model's output." in output
+    assert "Agent execution completed" not in output
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_ignores_its_own_log_records(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Our own warnings are already on screen; re-reporting them would double up."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    mock_agent_class.return_value.chat = _chat_that_logs(
+        logging.getLogger("dependency_director.main"),
+        "A warning we emitted ourselves",
+    )
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+    assert "Agent execution completed for test-owner/test-repo" in capsys.readouterr().out
+
+
 @pytest.mark.asyncio
 async def test_run_agent_for_repo_tool_error_hook(mock_agent_class: MagicMock, github_token: str) -> None:
     """Verify the agent triggers the error hook callback when a tool fails."""
@@ -525,7 +887,7 @@ async def test_agent_config_no_mcp_servers(mock_agent_class: MagicMock, github_t
 
 @pytest.mark.asyncio
 async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock, github_token: str) -> None:
-    """All 13 host tools (+ optional run_command) should be registered."""
+    """All 15 host tools (+ optional run_command) should be registered."""
     settings = Settings()
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
@@ -542,20 +904,22 @@ async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock
     config_passed = mock_agent_class.call_args[1]["config"]
     tool_names = {t.__name__ for t in config_passed.tools}
     expected = {
-        "list_bot_prs",
-        "merge_bot_pr",
-        "rebase_bot_pr",
-        "wait_for_reviews",
-        "get_pr_status",
-        "wait_for_ci",
-        "get_pr_workflow_run_logs",
+        "create_pr",
+        "get_branch_ci_status",
+        "get_commit_details",
+        "get_file_contents",
         "get_pr_diff",
         "get_pr_files",
-        "get_file_contents",
-        "list_commits",
-        "get_commit_details",
+        "get_pr_status",
+        "get_pr_workflow_run_logs",
+        "list_bot_prs",
         "list_branches",
+        "list_commits",
+        "merge_bot_pr",
+        "rebase_bot_pr",
         "run_command_sandboxed",
+        "wait_for_ci",
+        "wait_for_reviews",
     }
     assert tool_names == expected
 
@@ -584,6 +948,13 @@ async def test_run_agent_for_repo_early_halt(
 # --- Issue #7: _check_open_bot_prs uses provided client ---
 
 
+def _pr(number: int, title: str, author: str) -> PullRequest:
+    """Build the parsed pull request that list_open_prs now returns."""
+    return PullRequest.model_validate(
+        {"number": number, "title": title, "user": {"login": author}, "created_at": "2026-01-01"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_check_open_bot_prs_uses_provided_client() -> None:
     """_check_open_bot_prs must use the provided GitHubClient, not create its own.
@@ -593,9 +964,9 @@ async def test_check_open_bot_prs_uses_provided_client() -> None:
     mock_client = MagicMock(spec=GitHubClient)
     mock_client.list_open_prs = AsyncMock(
         return_value=[
-            {"number": 1, "title": "bump foo", "author": "dependabot[bot]", "created_at": "2026-01-01"},
-            {"number": 2, "title": "bump bar", "author": "human-user", "created_at": "2026-01-02"},
-            {"number": 3, "title": "bump baz", "author": "renovate[bot]", "created_at": "2026-01-03"},
+            _pr(1, "bump foo", "dependabot[bot]"),
+            _pr(2, "bump bar", "human-user"),
+            _pr(3, "bump baz", "renovate[bot]"),
         ],
     )
 
@@ -603,8 +974,8 @@ async def test_check_open_bot_prs_uses_provided_client() -> None:
 
     mock_client.list_open_prs.assert_called_once_with("owner", "repo")
     assert len(result) == 2
-    assert result[0]["number"] == 1
-    assert result[1]["number"] == 3
+    assert result[0].number == 1
+    assert result[1].number == 3
 
 
 @pytest.mark.asyncio
@@ -613,8 +984,8 @@ async def test_check_open_bot_prs_filters_by_custom_bots() -> None:
     mock_client = MagicMock(spec=GitHubClient)
     mock_client.list_open_prs = AsyncMock(
         return_value=[
-            {"number": 1, "title": "bump foo", "author": "dependabot[bot]", "created_at": "2026-01-01"},
-            {"number": 2, "title": "bump bar", "author": "custom[bot]", "created_at": "2026-01-02"},
+            _pr(1, "bump foo", "dependabot[bot]"),
+            _pr(2, "bump bar", "custom[bot]"),
         ],
     )
     custom_bots = [BotConfig(author="custom[bot]", rebase_command="@custom rebase")]
@@ -622,7 +993,7 @@ async def test_check_open_bot_prs_filters_by_custom_bots() -> None:
     result = await _check_open_bot_prs("owner", "repo", mock_client, custom_bots)
 
     assert len(result) == 1
-    assert result[0]["number"] == 2
+    assert result[0].number == 2
 
 
 # --- Issue #3: agent.chat error does not crash multi-repo sweep ---

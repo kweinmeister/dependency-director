@@ -1,6 +1,7 @@
 """dependency-director: Autonomous dependency triage and patching agent."""
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import shutil
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 import click
 import httpx
 from google.antigravity import Agent, LocalAgentConfig, types
-from google.antigravity.hooks import hooks
+from google.antigravity.hooks import hooks, policy
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -27,6 +28,7 @@ from dependency_director.config import (
     get_safety_policies,
 )
 from dependency_director.instructions import get_system_instructions
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
     GitHubClient,
     GitHubClientError,
@@ -95,10 +97,49 @@ async def _check_open_bot_prs(
     repo_name: str,
     client: GitHubClient,
     bots: list[BotConfig],
-) -> list[dict[str, Any]]:
+) -> list[PullRequest]:
     open_prs = await client.list_open_prs(owner, repo_name)
     allowed_authors = {b.author for b in bots}
-    return [pr for pr in open_prs if pr.get("author") in allowed_authors]
+    return [pr for pr in open_prs if pr.author in allowed_authors]
+
+
+# The repository whose run the current task belongs to. Each repo runs in its
+# own asyncio task, which copies the context, so a set() inside one run is
+# invisible to the others and needs no locking.
+_current_repo: contextvars.ContextVar[str] = contextvars.ContextVar("current_repo", default="")
+
+
+class _SdkIssueCollector(logging.Handler):
+    """Collect warning-or-worse log records emitted by anything but us.
+
+    The SDK reports some terminal conditions by logging rather than raising or
+    yielding a chunk — a loop detected in the model's output arrives as
+    'System step error (HTTP 0): ...' on the root logger. The turn then ends
+    quietly with truncated output, and the caller has no way to tell it apart
+    from a clean run.
+
+    The root logger is process-wide, so with concurrency > 1 several collectors
+    are attached at once. Each keeps only the records raised while its own
+    repository was the one in context.
+    """
+
+    def __init__(self, repo: str) -> None:
+        """Collect at WARNING and above, for one repository's run."""
+        super().__init__(level=logging.WARNING)
+        self.repo = repo
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Record the message unless we logged it or another repo caused it."""
+        if record.name.startswith("dependency_director"):
+            return
+        emitting_repo = _current_repo.get()
+        # A record from a thread or callback that never inherited the context
+        # reaches every collector. Duplicating a warning is better than
+        # dropping one, which is the failure this handler exists to prevent.
+        if emitting_repo and emitting_repo != self.repo:
+            return
+        self.messages.append(record.getMessage())
 
 
 async def _render_agent_response(response: types.ChatResponse) -> None:
@@ -157,6 +198,11 @@ async def _prepare_agent_environment(
     )
     await asyncio.to_thread(_prepare_workspace, workspace_tmp)
 
+    # srt only sandboxes run_command_sandboxed. The SDK's own view/edit/create
+    # file tools bypass it, so under allow("*") they can reach any path on the
+    # host. Listing workspaces does not bound them; this policy does.
+    policies = [*policy.workspace_only([str(SKILLS_PATH), workspace_tmp]), *policies]
+
     if settings.no_sandbox:
         run_command = None
     else:
@@ -165,6 +211,8 @@ async def _prepare_agent_environment(
             srt_settings_path=settings.srt_settings,
             github_token=settings.github_token,
             command_timeout=settings.command_timeout,
+            output_limits=settings.output_limits,
+            cache_dir=settings.cache_dir,
         )
     return workspace_tmp, policies, run_command
 
@@ -199,42 +247,28 @@ async def run_agent_for_repo(
     auto_merge: bool = False,
     verify_all: bool = False,
     standalone_fix: bool = False,
+    fix_base: bool = False,
     review_wait: int = 0,
     hint: str | None = None,
     model: str | None = None,
 ) -> None:
     """Run the triage agent for a single GitHub repository."""
+    # Claims the root-logger records raised by this run; see _SdkIssueCollector.
+    _current_repo.set(repo)
     client = GitHubClient(token=settings.github_token)
-    (
-        merge_bot_pr,
-        rebase_bot_pr,
-        wait_for_reviews,
-        get_pr_status,
-        wait_for_ci,
-        get_pr_workflow_run_logs,
-        list_bot_prs,
-        get_pr_diff,
-        get_pr_files,
-        get_file_contents,
-        list_commits,
-        get_commit_details,
-        list_branches,
-    ) = create_agent_tools(
+    tools = create_agent_tools(
         client=client,
         bots=settings.bots,
         dry_run=dry_run,
         review_wait=review_wait,
+        log_limits=settings.log_limits,
     )
 
     workspace_tmp: str | None = None
     run_command: Any | None = None
     try:
-        workspace_tmp, policies, run_command = await _prepare_agent_environment(
-            repo,
-            settings,
-            dry_run=dry_run,
-        )
-
+        # Check for work before building anything: a repo with no bot PRs should
+        # cost one API call, not a workspace and a sandbox configuration.
         owner, repo_name = repo.split("/", 1)
         bot_prs = await _check_open_bot_prs(owner, repo_name, client, settings.bots)
 
@@ -243,6 +277,12 @@ async def run_agent_for_repo(
             click.echo(f" • No open dependency update PRs were found for {repo}.\n")
             return
 
+        workspace_tmp, policies, run_command = await _prepare_agent_environment(
+            repo,
+            settings,
+            dry_run=dry_run,
+        )
+
         # Get agent system instructions
         system_instructions = get_system_instructions(
             max_attempts=max_attempts,
@@ -250,6 +290,7 @@ async def run_agent_for_repo(
             auto_merge=auto_merge,
             dry_run=dry_run,
             standalone_fix=standalone_fix,
+            fix_base=fix_base,
             review_wait=review_wait,
             bots=settings.bots,
             no_sandbox=settings.no_sandbox,
@@ -263,24 +304,9 @@ async def run_agent_for_repo(
             async def __call__(self, error: Exception) -> None:
                 await self.run(None, error)
 
-        project_root = str(PROJECT_ROOT)
         skills_path = str(SKILLS_PATH)
 
-        agent_tools: list[Any] = [
-            list_bot_prs,
-            merge_bot_pr,
-            rebase_bot_pr,
-            wait_for_reviews,
-            get_pr_status,
-            wait_for_ci,
-            get_pr_workflow_run_logs,
-            get_pr_diff,
-            get_pr_files,
-            get_file_contents,
-            list_commits,
-            get_commit_details,
-            list_branches,
-        ]
+        agent_tools: list[Any] = [*tools]
         if run_command is not None:
             agent_tools.append(run_command)
 
@@ -294,7 +320,11 @@ async def run_agent_for_repo(
             hooks=[RepoToolErrorHook()],
             tools=agent_tools,
             skills_paths=[skills_path],
-            workspaces=[project_root, workspace_tmp],
+            # Workspaces are what file tools may touch. Grant the clone and the
+            # skill, not PROJECT_ROOT: our checkout holds this project's source
+            # and the .env our template puts there, and the skill is loaded via
+            # skills_paths regardless.
+            workspaces=[skills_path, workspace_tmp],
             capabilities=types.CapabilitiesConfig(
                 enable_subagents=False,
                 disabled_tools=[types.BuiltinTools.RUN_COMMAND],
@@ -325,6 +355,9 @@ async def run_agent_for_repo(
             )
             click.secho(wrapped_prompt, fg="blue")
 
+            issues = _SdkIssueCollector(repo)
+            root_logger = logging.getLogger()
+            root_logger.addHandler(issues)
             try:
                 response = await agent.chat(prompt)
                 await _render_agent_response(response)
@@ -334,10 +367,21 @@ async def run_agent_for_repo(
                     f"\n[bold red]❌ Agent execution failed for {repo} (see log above).[/bold red]",
                 )
                 return
+            finally:
+                root_logger.removeHandler(issues)
 
-            console.print(
-                f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
-            )
+            if issues.messages:
+                console.print(
+                    f"\n[bold yellow]⚠ Agent execution for {repo} ended with "
+                    f"{len(issues.messages)} error(s) the SDK only logged; "
+                    f"the run may be incomplete.[/bold yellow]",
+                )
+                for message in issues.messages:
+                    console.print(f"  [yellow]{message}[/yellow]")
+            else:
+                console.print(
+                    f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
+                )
 
             usage = agent.conversation.total_usage
             cached = usage.cached_content_token_count or 0
@@ -386,8 +430,6 @@ def _check_api_keys(settings: Settings) -> None:
 
 
 async def _validate_repo_accessibility(repo: str, token: str | None) -> None:
-    if "pytest" in sys.modules:
-        return
     owner_name, repo_name = repo.split("/", 1)
     client = GitHubClient(token=token)
     try:
@@ -415,6 +457,7 @@ async def run_agent(
     auto_merge: bool = False,
     verify_all: bool = False,
     standalone_fix: bool = False,
+    fix_base: bool = False,
     review_wait: int = 0,
     hint: str | None = None,
     no_sandbox: bool = False,
@@ -449,6 +492,7 @@ async def run_agent(
             "auto_merge": auto_merge,
             "verify_all": verify_all,
             "standalone_fix": standalone_fix,
+            "fix_base": fix_base,
             "review_wait": review_wait,
             "hint": hint,
         }
@@ -496,6 +540,7 @@ async def run_agent(
                         "auto_merge": auto_merge,
                         "verify_all": verify_all,
                         "standalone_fix": standalone_fix,
+                        "fix_base": fix_base,
                         "review_wait": review_wait,
                         "hint": hint,
                     }
@@ -659,7 +704,7 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     "-m",
     type=int,
     default=None,
-    help="Maximum troubleshooting attempts per repository chunk.",
+    help="Maximum fix-and-test attempts per failing PR before it is skipped.",
 )
 @click.option(
     "--dry-run",
@@ -683,6 +728,14 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     "--standalone-fix",
     is_flag=True,
     help="Run in standalone fix mode (bypasses dependency checker and attempts directly).",
+)
+@click.option(
+    "--fix-base",
+    is_flag=True,
+    help=(
+        "When the base branch is already failing CI, fix it in a separate PR "
+        "against the base instead of only reporting it. Never merged automatically."
+    ),
 )
 @click.option(
     "--review-wait",
@@ -718,6 +771,7 @@ def cli(
     auto_merge: bool,
     verify_all: bool,
     standalone_fix: bool,
+    fix_base: bool,
     review_wait: int | None,
     hint: str | None,
     no_sandbox: bool,
@@ -745,6 +799,7 @@ def cli(
             "auto_merge": auto_merge,
             "verify_all": verify_all,
             "standalone_fix": standalone_fix,
+            "fix_base": fix_base,
             "review_wait": review_wait_val,
             "hint": hint,
             "no_sandbox": no_sandbox_val,

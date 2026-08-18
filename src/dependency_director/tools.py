@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import copy
+import functools
 import json
 import os
 import re
@@ -16,20 +17,47 @@ from typing import Any, NamedTuple, cast
 
 import httpx
 
-from dependency_director.config import DEFAULT_COMMAND_TIMEOUT, DEFAULT_SRT_SETTINGS_PATH, SAFE_ENV_ALLOWLIST, BotConfig
-
-
-class CompoundPart(NamedTuple):
-    """A sub-command extracted from a compound argv list.
-
-    Attributes:
-        argv: The sub-command argument list.
-        operator: The operator preceding this sub-command (None for the first).
-
-    """
-
-    argv: list[str]
-    operator: str | None
+from dependency_director.argv import (
+    resolve_exe,
+    split_compound_argv,
+)
+from dependency_director.config import (
+    DEFAULT_CACHE_DIR,
+    DEFAULT_COMMAND_TIMEOUT,
+    DEFAULT_LOG_LIMITS,
+    DEFAULT_OUTPUT_LIMITS,
+    DEFAULT_SRT_SETTINGS_PATH,
+    OUTPUT_HEAD_FRACTION,
+    PASSING_RUN_CONCLUSIONS,
+    RATE_LIMIT_BASE_DELAY_SECONDS,
+    RATE_LIMIT_MAX_ATTEMPTS,
+    RATE_LIMIT_MAX_DELAY_SECONDS,
+    SAFE_ENV_ALLOWLIST,
+    BotConfig,
+    LogLimits,
+    OutputLimits,
+)
+from dependency_director.schemas import (
+    BotPrList,
+    BotPrSummary,
+    BranchCiStatus,
+    ChangedFile,
+    CheckRunsResponse,
+    CheckSummary,
+    CommitDetails,
+    CommitStatusResponse,
+    CommitSummary,
+    FileContents,
+    PatchedFile,
+    PrStatus,
+    PullRequest,
+    WorkflowJob,
+    WorkflowJobsResponse,
+    WorkflowRun,
+    WorkflowRunsResponse,
+    json_payload,
+    summarize_checks,
+)
 
 
 class CommandResult(NamedTuple):
@@ -47,7 +75,6 @@ class CommandResult(NamedTuple):
 
 OWNER_RE = re.compile(r"^[a-zA-Z0-9-]{1,39}$")
 REPO_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
-_ENV_FLAGS_WITH_ARG = {"-u", "--unset"}
 
 
 class GitHubClientError(Exception):
@@ -60,6 +87,47 @@ class GitHubAuthenticationError(GitHubClientError):
 
 class GitHubNotFoundError(GitHubClientError):
     """Exception raised for 404 errors."""
+
+
+class GitHubRateLimitError(GitHubClientError):
+    """Exception raised when GitHub refuses a request for rate-limit reasons.
+
+    Attributes:
+        retry_after: Seconds GitHub asked the caller to wait, or None when it
+            gave no advice and the caller should back off on its own schedule.
+
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        """Record the message and the pause GitHub requested, if any."""
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Return the pause GitHub asked for, or None if it named none."""
+    raw = response.headers.get("retry-after", "")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        # GitHub may spell Retry-After as an HTTP date. Treat that the same as
+        # an absent header and let exponential backoff pick the delay.
+        return None
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """Report whether a refusal is a rate limit rather than a permission problem.
+
+    A 429 always is. A 403 only counts when GitHub says so — a secondary limit
+    sends 'Retry-After' and an exhausted primary limit sends
+    'x-ratelimit-remaining: 0'. A missing-scope 403 sends neither, and retrying
+    it would stall the run without ever succeeding.
+    """
+    if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+        return True
+    if response.status_code != HTTPStatus.FORBIDDEN:
+        return False
+    return "retry-after" in response.headers or response.headers.get("x-ratelimit-remaining") == "0"
 
 
 def _validate_repo_params(owner: str, repo: str) -> None:
@@ -85,6 +153,10 @@ class GitHubClient:
             self.headers["Authorization"] = f"Bearer {token}"
 
         async def check_api_errors(response: httpx.Response) -> None:
+            if _is_rate_limited(response):
+                msg = f"GitHub API error {response.status_code} on {response.url} - Rate limited."
+                raise GitHubRateLimitError(msg, _retry_after_seconds(response))
+
             if response.status_code in (
                 HTTPStatus.UNAUTHORIZED,
                 HTTPStatus.FORBIDDEN,
@@ -111,6 +183,28 @@ class GitHubClient:
 
         self.client = httpx.AsyncClient(event_hooks={"response": [check_api_errors]})
 
+    async def _send_with_backoff(
+        self,
+        send: Callable[[], Awaitable[httpx.Response]],
+    ) -> httpx.Response:
+        """Issue a request, retrying while GitHub reports a rate limit.
+
+        Honours the pause GitHub asks for and otherwise doubles its own, giving
+        up once the attempts run out or the requested wait exceeds the ceiling.
+        Every other failure propagates untouched on the first attempt.
+        """
+        attempt = 0
+        while True:
+            try:
+                return await send()
+            except GitHubRateLimitError as exc:
+                attempt += 1
+                backoff = RATE_LIMIT_BASE_DELAY_SECONDS * 2 ** (attempt - 1)
+                wait = exc.retry_after if exc.retry_after is not None else backoff
+                if attempt >= RATE_LIMIT_MAX_ATTEMPTS or wait > RATE_LIMIT_MAX_DELAY_SECONDS:
+                    raise
+                await asyncio.sleep(wait)
+
     async def _request(
         self,
         method: str,
@@ -124,7 +218,9 @@ class GitHubClient:
         follow_redirects: bool = False,
     ) -> httpx.Response:
         _validate_repo_params(owner, repo)
-        url = f"https://api.github.com/repos/{owner}/{repo}/{path.lstrip('/')}"
+        # rstrip so an empty path addresses the repository itself rather than
+        # a trailing-slash URL.
+        url = f"https://api.github.com/repos/{owner}/{repo}/{path.lstrip('/')}".rstrip("/")
         req_headers = {**self.headers, **(headers or {})}
 
         method_upper = method.upper()
@@ -132,24 +228,27 @@ class GitHubClient:
         if follow_redirects:
             kwargs["follow_redirects"] = True
 
+        send: Callable[[], Awaitable[httpx.Response]]
         if method_upper == "GET":
             if params is not None:
                 kwargs["params"] = params
-            response = await self.client.get(url, **kwargs)
+            send = functools.partial(self.client.get, url, **kwargs)
         elif method_upper == "PUT":
             if json_data is not None:
                 kwargs["json"] = json_data
-            response = await self.client.put(url, **kwargs)
+            send = functools.partial(self.client.put, url, **kwargs)
         elif method_upper == "POST":
             if json_data is not None:
                 kwargs["json"] = json_data
-            response = await self.client.post(url, **kwargs)
+            send = functools.partial(self.client.post, url, **kwargs)
         else:
             if params is not None:
                 kwargs["params"] = params
             if json_data is not None:
                 kwargs["json"] = json_data
-            response = await self.client.request(method, url, **kwargs)
+            send = functools.partial(self.client.request, method, url, **kwargs)
+
+        response = await self._send_with_backoff(send)
         response.raise_for_status()
         return response
 
@@ -226,12 +325,7 @@ class GitHubClient:
     async def get_pr_author(self, owner: str, repo: str, pr_number: int) -> str:
         """Get the GitHub username/login of a pull request author."""
         data = await self.get_pr_details(owner, repo, pr_number)
-        user = data.get("user")
-        if isinstance(user, dict):
-            login = user.get("login")
-            if isinstance(login, str):
-                return login
-        return ""
+        return PullRequest.model_validate(data).author
 
     async def merge_pr(self, owner: str, repo: str, pr_number: int) -> dict[str, Any]:
         """Merge a pull request using the squash-and-merge method."""
@@ -258,6 +352,41 @@ class GitHubClient:
             json_data={"body": body},
         )
         return cast("dict[str, Any]", response.json())
+
+    async def create_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+    ) -> dict[str, Any]:
+        """Open a pull request from ``head`` into ``base``."""
+        response = await self._post(
+            "pulls",
+            owner,
+            repo,
+            json_data={"title": title, "head": head, "base": base, "body": body},
+        )
+        return cast("dict[str, Any]", response.json())
+
+    async def get_default_branch(self, owner: str, repo: str) -> str:
+        """Fetch the repository's default branch, falling back to ``main``."""
+        response = await self._get("", owner, repo)
+        data = cast("dict[str, Any]", response.json())
+        branch = data.get("default_branch")
+        return branch if isinstance(branch, str) and branch else "main"
+
+    async def list_pr_commits(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the commits on a pull request's head branch."""
+        return [c async for c in self._list_paginated(f"pulls/{pr_number}/commits", owner, repo)]
 
     async def get_pr_reviews(
         self,
@@ -332,18 +461,19 @@ class GitHubClient:
             repo,
             follow_redirects=True,
         )
-        return str(response.text)
+        return response.text
 
     async def list_open_prs(
         self,
         owner: str,
         repo: str,
-    ) -> list[dict[str, Any]]:
-        """Fetch all open pull requests with minimal fields.
+    ) -> list[PullRequest]:
+        """Fetch all open pull requests, parsed into the slice we read.
 
-        Returns a compact list of dicts with only number, title, author, and
-        created_at. This avoids pulling in the huge body/changelog payloads
-        that dependency bots typically produce.
+        Validating here rather than passing raw dicts on keeps the fields this
+        project depends on — the base ref above all — declared in one place
+        instead of re-derived at every call site. The huge body/changelog
+        payloads dependency bots produce are dropped by the model.
         """
         params = {
             "state": "open",
@@ -351,13 +481,7 @@ class GitHubClient:
             "direction": "asc",
         }
         return [
-            {
-                "number": pr["number"],
-                "title": pr.get("title", ""),
-                "author": pr.get("user", {}).get("login", ""),
-                "created_at": pr.get("created_at", ""),
-            }
-            async for pr in self._list_paginated("pulls", owner, repo, params=params)
+            PullRequest.model_validate(pr) async for pr in self._list_paginated("pulls", owner, repo, params=params)
         ]
 
     async def get_pr_diff(
@@ -373,22 +497,22 @@ class GitHubClient:
             repo,
             headers={"Accept": "application/vnd.github.v3.diff"},
         )
-        return str(response.text)
+        return response.text
 
     async def get_pr_files(
         self,
         owner: str,
         repo: str,
         pr_number: int,
-    ) -> list[dict[str, Any]]:
+    ) -> list[ChangedFile]:
         """Fetch the list of files changed in a pull request."""
         return [
-            {
-                "filename": f["filename"],
-                "status": f.get("status", ""),
-                "additions": f.get("additions", 0),
-                "deletions": f.get("deletions", 0),
-            }
+            ChangedFile(
+                filename=f["filename"],
+                status=f.get("status", ""),
+                additions=f.get("additions", 0),
+                deletions=f.get("deletions", 0),
+            )
             async for f in self._list_paginated(f"pulls/{pr_number}/files", owner, repo)
         ]
 
@@ -413,7 +537,7 @@ class GitHubClient:
         repo: str,
         sha: str | None = None,
         per_page: int = 30,
-    ) -> list[dict[str, Any]]:
+    ) -> list[CommitSummary]:
         """Fetch recent commits for a repository or branch."""
         params: dict[str, Any] = {"per_page": per_page}
         if sha:
@@ -421,12 +545,12 @@ class GitHubClient:
         response = await self._get("commits", owner, repo, params=params)
         data = response.json()
         return [
-            {
-                "sha": c["sha"][:7],
-                "message": c.get("commit", {}).get("message", "").split("\n")[0],
-                "author": c.get("commit", {}).get("author", {}).get("name", ""),
-                "date": c.get("commit", {}).get("author", {}).get("date", ""),
-            }
+            CommitSummary(
+                sha=c["sha"][:7],
+                message=c.get("commit", {}).get("message", "").split("\n")[0],
+                author=c.get("commit", {}).get("author", {}).get("name", ""),
+                date=c.get("commit", {}).get("author", {}).get("date", ""),
+            )
             for c in data
         ]
 
@@ -435,24 +559,24 @@ class GitHubClient:
         owner: str,
         repo: str,
         sha: str,
-    ) -> dict[str, Any]:
+    ) -> CommitDetails:
         """Fetch details of a specific commit."""
         response = await self._get(f"commits/{sha}", owner, repo)
         data = response.json()
-        return {
-            "sha": data["sha"],
-            "message": data.get("commit", {}).get("message", ""),
-            "author": data.get("commit", {}).get("author", {}).get("name", ""),
-            "date": data.get("commit", {}).get("author", {}).get("date", ""),
-            "files": [
-                {
-                    "filename": f["filename"],
-                    "status": f.get("status", ""),
-                    "patch": f.get("patch", ""),
-                }
+        return CommitDetails(
+            sha=data["sha"],
+            message=data.get("commit", {}).get("message", ""),
+            author=data.get("commit", {}).get("author", {}).get("name", ""),
+            date=data.get("commit", {}).get("author", {}).get("date", ""),
+            files=[
+                PatchedFile(
+                    filename=f["filename"],
+                    status=f.get("status", ""),
+                    patch=f.get("patch", ""),
+                )
                 for f in data.get("files", [])
             ],
-        }
+        )
 
     async def list_branches(
         self,
@@ -472,9 +596,12 @@ class GitHubClient:
             return bool(cached_login and cached_login.lower() == owner.lower())
 
         try:
-            response = await self.client.get(
-                "https://api.github.com/user",
-                headers=self.headers,
+            response = await self._send_with_backoff(
+                functools.partial(
+                    self.client.get,
+                    "https://api.github.com/user",
+                    headers=self.headers,
+                ),
             )
             response.raise_for_status()
             user_data = response.json()
@@ -482,7 +609,10 @@ class GitHubClient:
                 login = str(user_data.get("login") or "")
                 self._user_cache[token] = login
                 return login.lower() == owner.lower()
-        except GitHubAuthenticationError:
+        except (GitHubAuthenticationError, GitHubRateLimitError):
+            # A rate limit says nothing about who the token belongs to.
+            # Swallowing it here would silently fall back to the public
+            # endpoint and hide half the owner's repositories.
             raise
         except (httpx.HTTPError, GitHubClientError):
             pass
@@ -502,7 +632,7 @@ class GitHubClient:
             url = f"{endpoint_prefix}?type=owner&per_page=100&page={page}"
 
         try:
-            response = await self.client.get(url, headers=self.headers)
+            response = await self._send_with_backoff(functools.partial(self.client.get, url, headers=self.headers))
             response.raise_for_status()
             return is_authenticated_user, endpoint_prefix, response.json()
         except (httpx.HTTPStatusError, GitHubNotFoundError) as e:
@@ -528,13 +658,17 @@ class GitHubClient:
             ):
                 endpoint_prefix = f"https://api.github.com/orgs/{owner}/repos"
                 url = f"{endpoint_prefix}?type=sources&per_page=100&page={page}"
-                response = await self.client.get(url, headers=self.headers)
+                response = await self._send_with_backoff(functools.partial(self.client.get, url, headers=self.headers))
                 response.raise_for_status()
                 return is_authenticated_user, endpoint_prefix, response.json()
             raise
 
     async def get_repositories(self, owner: str) -> list[str]:
-        """Fetch non-forked repositories from GitHub API.
+        """Fetch active, non-forked repositories from GitHub API.
+
+        Forks are skipped because their dependency PRs belong upstream.
+        Archived and disabled repositories are skipped because they reject
+        pushes and merges, so scanning them can only waste a run.
 
         Uses pagination to get all repositories for the given owner.
         """
@@ -559,7 +693,11 @@ class GitHubClient:
             if not repos_data:
                 break
 
-            repos.extend(f"{owner}/{repo['name']}" for repo in repos_data if not repo.get("fork", False))
+            repos.extend(
+                f"{owner}/{repo['name']}"
+                for repo in repos_data
+                if not any(repo.get(flag, False) for flag in ("fork", "archived", "disabled"))
+            )
             page += 1
 
         return repos
@@ -601,6 +739,38 @@ class LegacyTools(NamedTuple):
     list_branches: ToolFn
 
 
+class WriteTools(NamedTuple):
+    """Container for the tool functions that change state on GitHub."""
+
+    merge_bot_pr: ToolFn
+    rebase_bot_pr: ToolFn
+    wait_for_reviews: ToolFn
+
+
+class AgentTools(NamedTuple):
+    """Every tool function handed to the agent, named rather than positional.
+
+    Alphabetical, so the insertion point for a new tool is obvious. Iterating
+    the tuple yields them in that order, which is what the agent config wants.
+    """
+
+    create_pr: ToolFn
+    get_branch_ci_status: ToolFn
+    get_commit_details: ToolFn
+    get_file_contents: ToolFn
+    get_pr_diff: ToolFn
+    get_pr_files: ToolFn
+    get_pr_status: ToolFn
+    get_pr_workflow_run_logs: ToolFn
+    list_bot_prs: ToolFn
+    list_branches: ToolFn
+    list_commits: ToolFn
+    merge_bot_pr: ToolFn
+    rebase_bot_pr: ToolFn
+    wait_for_ci: ToolFn
+    wait_for_reviews: ToolFn
+
+
 def _make_merge_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run: bool) -> ToolFn:
     async def merge_bot_pr(owner: str, repo: str, pr_number: int) -> str:
         """Merge a pull request authored by a configured bot.
@@ -629,14 +799,47 @@ def _make_merge_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run: 
     return merge_bot_pr
 
 
+async def _find_foreign_commit_author(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    bots: list[BotConfig],
+) -> str | None:
+    """Return a description of the first commit on the PR the bot did not author.
+
+    Returns None when every commit is attributable to a configured bot.
+    """
+    bot_authors = {b.author for b in bots}
+    for commit in await client.list_pr_commits(owner, repo, pr_number):
+        gh_author = commit.get("author")
+        login = gh_author.get("login") if isinstance(gh_author, dict) else None
+        if not login:
+            return "an unattributed commit (no GitHub account on record)"
+        if login not in bot_authors:
+            return f"a commit by '{login}'"
+    return None
+
+
 def _make_rebase_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run: bool) -> ToolFn:
     async def rebase_bot_pr(owner: str, repo: str, pr_number: int) -> str:
         """Post a rebase comment on a pull request.
 
-        Author must be a configured bot.
+        Author must be a configured bot. Refuses when the branch carries
+        commits the bot did not author, because a bot rebase force-pushes the
+        branch from scratch and would discard them.
         """
         author = await client.get_pr_author(owner, repo, pr_number)
         bot = _check_bot_author(author, bots)
+
+        foreign = await _find_foreign_commit_author(client, owner, repo, pr_number, bots)
+        if foreign:
+            return (
+                f"Refused to rebase PR #{pr_number} in {owner}/{repo}: its branch contains "
+                f"{foreign}. Commenting '{bot.rebase_command}' force-pushes the branch from "
+                "scratch and would discard that work. Resolve the conflict locally and push "
+                "to the branch instead, or close this PR and open a standalone one."
+            )
 
         if dry_run:
             return f"[DRY-RUN] Would have commented '{bot.rebase_command}' on PR #{pr_number} in {owner}/{repo}."
@@ -647,6 +850,48 @@ def _make_rebase_bot_pr(client: GitHubClient, bots: list[BotConfig], *, dry_run:
         )
 
     return rebase_bot_pr
+
+
+def _make_create_pr(client: GitHubClient, *, dry_run: bool) -> ToolFn:
+    async def create_pr(
+        owner: str,
+        repo: str,
+        title: str,
+        head_branch: str,
+        body: str,
+        base_branch: str = "",
+    ) -> str:
+        """Open a pull request from an already-pushed branch.
+
+        Args:
+            owner: The owner of the repository.
+            repo: The repository name.
+            title: The pull request title.
+            head_branch: The branch holding the fix, already pushed to origin.
+            body: The pull request description. Reference the original PR here.
+            base_branch: Target branch. When fixing a branch on behalf of a bot
+                PR, pass that PR's 'base_ref' — the fix must land on the branch
+                the PR actually targets. Only defaults to the repository's
+                default branch when omitted.
+
+        """
+        _validate_repo_params(owner, repo)
+        base = base_branch or await client.get_default_branch(owner, repo)
+
+        if dry_run:
+            return f"[DRY-RUN] Would have opened a PR '{title}' from {head_branch} into {base} in {owner}/{repo}."
+
+        result = await client.create_pull_request(
+            owner,
+            repo,
+            title=title,
+            head=head_branch,
+            base=base,
+            body=body,
+        )
+        return f"Opened PR #{result.get('number')} in {owner}/{repo}: {result.get('html_url', '')}"
+
+    return create_pr
 
 
 def _make_wait_for_reviews(client: GitHubClient, review_wait: int) -> ToolFn:
@@ -719,12 +964,12 @@ def _make_write_tools(
     *,
     dry_run: bool,
     review_wait: int,
-) -> tuple[ToolFn, ToolFn, ToolFn]:
+) -> WriteTools:
     """Create agent tool functions with config bound via closure."""
-    return (
-        _make_merge_bot_pr(client, bots, dry_run=dry_run),
-        _make_rebase_bot_pr(client, bots, dry_run=dry_run),
-        _make_wait_for_reviews(client, review_wait),
+    return WriteTools(
+        merge_bot_pr=_make_merge_bot_pr(client, bots, dry_run=dry_run),
+        rebase_bot_pr=_make_rebase_bot_pr(client, bots, dry_run=dry_run),
+        wait_for_reviews=_make_wait_for_reviews(client, review_wait),
     )
 
 
@@ -740,6 +985,57 @@ def _make_get_pr_status(client: GitHubClient) -> ToolFn:
     return get_pr_status
 
 
+async def _checks_for_ref(client: GitHubClient, owner: str, repo: str, ref: str) -> tuple[str, list[CheckSummary]]:
+    """Fetch and reduce both check APIs for one commit ref."""
+    check_runs_data, commit_status_data = await asyncio.gather(
+        client.get_commit_check_runs(owner, repo, ref),
+        client.get_commit_status(owner, repo, ref),
+    )
+    return summarize_checks(
+        CheckRunsResponse.model_validate(check_runs_data),
+        CommitStatusResponse.model_validate(commit_status_data),
+    )
+
+
+def _make_get_branch_ci_status(client: GitHubClient) -> ToolFn:
+    # A base branch is checked once and the verdict reused for every red PR
+    # sharing it. The cache lives in this closure, which is built once per
+    # repository run, so its lifetime is exactly one run and nothing has to
+    # invalidate it. The lock keeps two PRs asking about the same base at the
+    # same moment from both paying for the round trip.
+    cache: dict[tuple[str, str, str], str] = {}
+    lock = asyncio.Lock()
+
+    async def get_branch_ci_status(owner: str, repo: str, branch: str = "") -> str:
+        """Report CI health for a branch, without cloning it.
+
+        Use this to tell whether a PR's CI failure is the PR's fault or was
+        already broken on the branch it targets.
+
+        Args:
+            owner: The owner of the repository.
+            repo: The repository name.
+            branch: Branch to check. Pass the PR's 'base_ref' — the branch it
+                actually targets, reported by 'list_bot_prs' and
+                'get_pr_status'. Only defaults to the repository's default
+                branch when omitted, which is the wrong branch for any PR
+                aimed elsewhere.
+
+        """
+        target = branch or await client.get_default_branch(owner, repo)
+        key = (owner, repo, target)
+        async with lock:
+            if key not in cache:
+                # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
+                # An exception leaves the cache untouched: a transient API failure
+                # must not become this run's permanent answer for the branch.
+                ci_status, checks = await _checks_for_ref(client, owner, repo, target)
+                cache[key] = json_payload(BranchCiStatus(branch=target, ci_status=ci_status, checks=checks))
+            return cache[key]
+
+    return get_branch_ci_status
+
+
 async def _check_ci(
     client: GitHubClient,
     owner: str,
@@ -753,73 +1049,33 @@ async def _check_ci(
     These are independent — a PR can be GREEN + CONFLICT (CI passes but
     has merge conflicts from a prior merge).
     """
-    pr_details = await client.get_pr_details(owner, repo, pr_number)
-    head_sha = pr_details.get("head", {}).get("sha", "")
-    mergeable = pr_details.get("mergeable")
-    mergeable_state = pr_details.get("mergeable_state")
+    pr = PullRequest.model_validate(await client.get_pr_details(owner, repo, pr_number))
 
-    checks_summary: list[dict[str, Any]] = []
+    checks_summary: list[CheckSummary] = []
     ci_status = "NONE"
-
-    if head_sha:
-        check_runs_data, commit_status_data = await asyncio.gather(
-            client.get_commit_check_runs(owner, repo, head_sha),
-            client.get_commit_status(owner, repo, head_sha),
-        )
-        check_runs = check_runs_data.get("check_runs", [])
-        checks_summary.extend(
-            {
-                "name": run.get("name"),
-                "status": run.get("status"),
-                "conclusion": run.get("conclusion"),
-            }
-            for run in check_runs
-        )
-
-        legacy_statuses = commit_status_data.get("statuses", [])
-        legacy_state = commit_status_data.get("state") if legacy_statuses else None
-        checks_summary.extend(
-            {
-                "name": status.get("context"),
-                "status": "completed",
-                "conclusion": "success"
-                if status.get("state") == "success"
-                else ("failure" if status.get("state") in ("failure", "error") else None),
-            }
-            for status in legacy_statuses
-        )
-
-        has_failures = any(
-            r.get("conclusion") in ("failure", "action_required", "cancelled", "timed_out") for r in checks_summary
-        )
-        has_pending = any(r.get("status") not in ("completed", "success") for r in checks_summary)
-
-        if has_failures or legacy_state in ("failure", "error"):
-            ci_status = "RED"
-        elif has_pending or legacy_state == "pending":
-            ci_status = "PENDING"
-        elif checks_summary or legacy_state == "success":
-            ci_status = "GREEN"
+    if pr.head.sha:
+        ci_status, checks_summary = await _checks_for_ref(client, owner, repo, pr.head.sha)
 
     # Merge status is independent of CI status
-    if mergeable is False or mergeable_state in ("dirty", "conflict"):
+    if pr.mergeable is False or pr.mergeable_state in ("dirty", "conflict"):
         merge_status = "CONFLICT"
-    elif mergeable is True and mergeable_state in ("clean", "has_hooks", "unstable"):
+    elif pr.mergeable is True and pr.mergeable_state in ("clean", "has_hooks", "unstable"):
         merge_status = "CLEAN"
     else:
         merge_status = "UNKNOWN"
 
-    summary = {
-        "pr_number": pr_number,
-        "title": pr_details.get("title"),
-        "head_sha": head_sha,
-        "mergeable": mergeable,
-        "mergeable_state": mergeable_state,
-        "ci_status": ci_status,
-        "merge_status": merge_status,
-        "checks": checks_summary,
-    }
-    return ci_status, merge_status, json.dumps(summary, indent=2)
+    summary = PrStatus(
+        pr_number=pr_number,
+        title=pr.title,
+        head_sha=pr.head.sha,
+        base_ref=pr.base.ref,
+        mergeable=pr.mergeable,
+        mergeable_state=pr.mergeable_state,
+        ci_status=ci_status,
+        merge_status=merge_status,
+        checks=checks_summary,
+    )
+    return ci_status, merge_status, json_payload(summary)
 
 
 def _make_wait_for_ci(client: GitHubClient) -> ToolFn:
@@ -850,67 +1106,126 @@ def _make_wait_for_ci(client: GitHubClient) -> ToolFn:
     return wait_for_ci
 
 
-def _make_get_pr_workflow_run_logs(client: GitHubClient) -> ToolFn:
+def _select_candidate_runs(runs: list[WorkflowRun]) -> list[WorkflowRun]:
+    """Pick the newest non-passing run for each distinct workflow.
+
+    A commit usually triggers several workflows, and re-running one adds
+    another run with the same name on the same SHA. Keep one run per workflow
+    name so every failing workflow is represented exactly once, by its most
+    recent attempt. Timestamps are aware UTC by the time they arrive here, so
+    a re-run recorded with a numeric offset still orders against a 'Z' one.
+    """
+    ordered = sorted(runs, key=lambda r: r.created_at, reverse=True)
+
+    selected: list[WorkflowRun] = []
+    seen_workflows: set[str] = set()
+    for run in ordered:
+        # Fall back to the run id so unnamed runs are never merged together.
+        workflow = run.name or str(run.id)
+        if workflow in seen_workflows:
+            continue
+        seen_workflows.add(workflow)
+        if (run.conclusion or "").lower() in PASSING_RUN_CONCLUSIONS:
+            continue
+        selected.append(run)
+    return selected
+
+
+def _make_get_pr_workflow_run_logs(client: GitHubClient, log_limits: LogLimits) -> ToolFn:
     async def get_pr_workflow_run_logs(owner: str, repo: str, pr_number: int) -> str:
         """Fetch raw logs for failed GitHub Actions workflow runs on a pull request.
 
-        Returns log text for failed jobs, keeping only the last 50 lines of logs per job.
+        Covers every failing workflow on the PR's head commit, not just one.
+        Returns the tail of each failed job's log, capped at a few jobs; the
+        cap is stated in the output when it is reached.
         """
-        pr_details = await client.get_pr_details(owner, repo, pr_number)
-        head_sha = pr_details.get("head", {}).get("sha", "")
+        pr = PullRequest.model_validate(await client.get_pr_details(owner, repo, pr_number))
+        head_sha = pr.head.sha
         if not head_sha:
             return f"Error: No head SHA found for PR #{pr_number}."
 
-        runs_data = await client.get_workflow_runs_for_commit(owner, repo, head_sha)
-        runs = runs_data.get("workflow_runs", [])
+        runs_data = WorkflowRunsResponse.model_validate(
+            await client.get_workflow_runs_for_commit(owner, repo, head_sha),
+        )
+        runs = runs_data.workflow_runs
         if not runs:
             return f"No workflow runs found for commit {head_sha}."
 
-        latest_run = runs[0]
-        run_id = latest_run["id"]
+        failed_jobs_logs: list[str] = []
+        total_failed = 0
 
-        jobs_data = await client.get_workflow_run_jobs(owner, repo, run_id)
-        jobs = jobs_data.get("jobs", [])
-
-        failed_jobs_logs = []
-        for job in jobs:
-            if job.get("conclusion") == "failure":
-                job_id = job["id"]
-                job_name = job["name"]
-                try:
-                    log_text = await client.get_job_logs(owner, repo, job_id)
-                    lines = log_text.splitlines()
-                    truncated_log = "\n".join(lines[-50:])
-                    failed_jobs_logs.append(
-                        f"--- FAILED JOB: {job_name} (ID: {job_id}) ---\n{truncated_log}\n",
-                    )
-                except (httpx.HTTPError, GitHubClientError) as e:
-                    failed_jobs_logs.append(
-                        f"--- FAILED JOB: {job_name} (ID: {job_id}) ---\nFailed to retrieve log: {e}\n",
-                    )
+        for run in _select_candidate_runs(runs):
+            workflow = run.name or f"run {run.id}"
+            jobs_data = WorkflowJobsResponse.model_validate(
+                await client.get_workflow_run_jobs(owner, repo, run.id),
+            )
+            for job in jobs_data.jobs:
+                if job.conclusion != "failure":
+                    continue
+                total_failed += 1
+                if len(failed_jobs_logs) >= log_limits.max_failed_jobs:
+                    continue
+                failed_jobs_logs.append(
+                    await _format_failed_job(client, owner, repo, workflow, job, log_limits.tail_lines),
+                )
 
         if not failed_jobs_logs:
-            return "No failed jobs found for the latest workflow run."
+            return f"No failed jobs found across {len(runs)} workflow run(s) for commit {head_sha}."
 
-        return "\n".join(failed_jobs_logs)
+        output = "\n".join(failed_jobs_logs)
+        omitted = total_failed - len(failed_jobs_logs)
+        if omitted:
+            output += f"\n--- {omitted} more failed job(s) omitted (cap: {log_limits.max_failed_jobs}) ---\n"
+        return output
 
     return get_pr_workflow_run_logs
+
+
+async def _format_failed_job(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    workflow: str,
+    job: WorkflowJob,
+    tail_lines: int,
+) -> str:
+    """Render one failed job as a labelled tail of its log.
+
+    The workflow name is part of the label because job names collide across
+    workflows ("build" in CI and in Release are different failures).
+    """
+    header = f"--- FAILED JOB: {workflow} / {job.name} (ID: {job.id}) ---"
+    try:
+        log_text = await client.get_job_logs(owner, repo, job.id)
+    except (httpx.HTTPError, GitHubClientError) as e:
+        return f"{header}\nFailed to retrieve log: {e}\n"
+    tail = "\n".join(log_text.splitlines()[-tail_lines:])
+    return f"{header}\n{tail}\n"
 
 
 def _make_list_bot_prs(client: GitHubClient, bots: list[BotConfig]) -> ToolFn:
     async def list_bot_prs(owner: str, repo: str) -> str:
         """List open dependency-bot pull requests for a repository.
 
-        Returns a compact JSON list with only the essential fields:
-        number, title, author, and created_at. Sorted oldest first.
-        Only PRs authored by configured bots are included.
+        Returns a compact JSON list with only the essential fields: number,
+        title, author, created_at, and base_ref — the branch the PR targets,
+        which is what 'get_branch_ci_status' should be asked about. Sorted
+        oldest first. Only PRs authored by configured bots are included.
         """
         allowed_authors = {b.author for b in bots}
         all_prs = await client.list_open_prs(owner, repo)
-        bot_prs = [pr for pr in all_prs if pr["author"] in allowed_authors]
-        if not bot_prs:
-            return json.dumps({"bot_prs": [], "count": 0})
-        return json.dumps({"bot_prs": bot_prs, "count": len(bot_prs)}, indent=2)
+        bot_prs = [
+            BotPrSummary(
+                number=pr.number,
+                title=pr.title,
+                author=pr.author,
+                created_at=pr.created_at,
+                base_ref=pr.base.ref,
+            )
+            for pr in all_prs
+            if pr.author in allowed_authors
+        ]
+        return json_payload(BotPrList(bot_prs=bot_prs, count=len(bot_prs)))
 
     return list_bot_prs
 
@@ -930,7 +1245,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
         additions count, and deletions count for each file.
         """
         files = await client.get_pr_files(owner, repo, pr_number)
-        return json.dumps(files, indent=2)
+        return json.dumps([f.model_dump() for f in files], indent=2)
 
     async def get_file_contents(
         owner: str,
@@ -951,16 +1266,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
 
         """
         data = await client.get_file_contents(owner, repo, path, ref)
-        return json.dumps(
-            {
-                "name": data.get("name"),
-                "path": data.get("path"),
-                "size": data.get("size"),
-                "content": data.get("content"),
-                "encoding": data.get("encoding"),
-            },
-            indent=2,
-        )
+        return json_payload(FileContents.model_validate(data))
 
     async def list_commits(
         owner: str,
@@ -980,7 +1286,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
 
         """
         commits = await client.list_commits(owner, repo, sha, per_page)
-        return json.dumps(commits, indent=2)
+        return json.dumps([c.model_dump() for c in commits], indent=2)
 
     async def get_commit_details(owner: str, repo: str, sha: str) -> str:
         """Get details of a specific commit including changed files and patches.
@@ -994,8 +1300,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
         (each with filename, status, and patch).
 
         """
-        data = await client.get_commit(owner, repo, sha)
-        return json.dumps(data, indent=2)
+        return json_payload(await client.get_commit(owner, repo, sha))
 
     async def list_branches(owner: str, repo: str) -> str:
         """List branch names for a repository.
@@ -1021,35 +1326,33 @@ def create_agent_tools(
     *,
     dry_run: bool,
     review_wait: int,
-) -> tuple[ToolFn, ...]:
+    log_limits: LogLimits = DEFAULT_LOG_LIMITS,
+) -> AgentTools:
     """Create all agent tool functions, including legacy tools, status tools, and workflow log tools."""
-    merge_bot_pr, rebase_bot_pr, wait_for_reviews = _make_write_tools(
+    write = _make_write_tools(
         client=client,
         bots=bots,
         dry_run=dry_run,
         review_wait=review_wait,
     )
-
-    get_pr_status = _make_get_pr_status(client)
-    wait_for_ci = _make_wait_for_ci(client)
-    get_pr_workflow_run_logs = _make_get_pr_workflow_run_logs(client)
-    list_bot_prs = _make_list_bot_prs(client, bots)
     legacy = _make_legacy_tools(client)
 
-    return (
-        merge_bot_pr,
-        rebase_bot_pr,
-        wait_for_reviews,
-        get_pr_status,
-        wait_for_ci,
-        get_pr_workflow_run_logs,
-        list_bot_prs,
-        legacy.get_pr_diff,
-        legacy.get_pr_files,
-        legacy.get_file_contents,
-        legacy.list_commits,
-        legacy.get_commit_details,
-        legacy.list_branches,
+    return AgentTools(
+        create_pr=_make_create_pr(client, dry_run=dry_run),
+        get_branch_ci_status=_make_get_branch_ci_status(client),
+        get_commit_details=legacy.get_commit_details,
+        get_file_contents=legacy.get_file_contents,
+        get_pr_diff=legacy.get_pr_diff,
+        get_pr_files=legacy.get_pr_files,
+        get_pr_status=_make_get_pr_status(client),
+        get_pr_workflow_run_logs=_make_get_pr_workflow_run_logs(client, log_limits),
+        list_bot_prs=_make_list_bot_prs(client, bots),
+        list_branches=legacy.list_branches,
+        list_commits=legacy.list_commits,
+        merge_bot_pr=write.merge_bot_pr,
+        rebase_bot_pr=write.rebase_bot_pr,
+        wait_for_ci=_make_wait_for_ci(client),
+        wait_for_reviews=write.wait_for_reviews,
     )
 
 
@@ -1222,50 +1525,6 @@ def _check_git_command(tokens: list[str], idx: int, operators: set[str]) -> str 
     return None
 
 
-def _extract_env_command_exe(tokens: list[str], idx: int) -> str:
-    exe_name = "env"
-    if len(tokens) > idx + 1:
-        j = idx + 1
-        while j < len(tokens):
-            t = tokens[j]
-            if t == "--":
-                j += 1
-                if j < len(tokens):
-                    exe_name = Path(tokens[j]).name.lower()
-                break
-            if t in _ENV_FLAGS_WITH_ARG:
-                j += 2
-            elif t.startswith("-") or "=" in t:
-                j += 1
-            else:
-                exe_name = Path(t).name.lower()
-                break
-    return exe_name
-
-
-def split_compound_argv(argv: list[str]) -> list[CompoundPart]:
-    """Split an argv list on ``&&`` and ``||`` tokens into sub-commands.
-
-    Returns a list of CompoundPart(argv, operator) tuples.  The first
-    part has operator=None; subsequent parts record the joining operator.
-    """
-    compound_ops = {"&&", "||"}
-    parts: list[CompoundPart] = []
-    current: list[str] = []
-    current_op: str | None = None
-
-    for token in argv:
-        if token in compound_ops:
-            parts.append(CompoundPart(argv=current, operator=current_op))
-            current = []
-            current_op = token
-        else:
-            current.append(token)
-
-    parts.append(CompoundPart(argv=current, operator=current_op))
-    return parts
-
-
 def _check_shell_operators(argv: list[str]) -> str | None:
     """Return an error if dangerous shell operators are present as tokens."""
     dangerous_operators = {";", "|", "&"}
@@ -1277,28 +1536,41 @@ def _check_shell_operators(argv: list[str]) -> str | None:
     return None
 
 
-def _resolve_exe(argv: list[str]) -> tuple[int, str] | str:
-    """Return (exe_idx, exe_name) or an error string.
+class CheckedExe(NamedTuple):
+    """The executable a command runs, once its env assignments have passed.
 
-    Walk leading ``KEY=val`` env-var assignments, validate each, then
-    identify the executable index and normalized name.
+    Attributes:
+        idx: Index of the executable token in the argv list.
+        name: Basename of that executable, lowercased.
+
     """
-    for i, token in enumerate(argv):
-        if "=" in token and not token.startswith("-"):
-            err = _check_env_var_token(token)
-            if err:
-                return err
-            continue
-        exe_idx = i
-        exe_name = Path(argv[exe_idx]).name.lower()
-        # Unwrap `env` wrapper
-        if exe_name == "env":
-            for j in range(exe_idx + 1, len(argv)):
-                if argv[j] in ("-S", "--split-string"):
-                    return "Security Error: 'env -S/--split-string' is blocked."
-            exe_name = _extract_env_command_exe(argv, exe_idx)
-        return exe_idx, exe_name
-    return "Security Error: No executable found in command."
+
+    idx: int
+    name: str
+
+
+def _resolve_exe(argv: list[str]) -> CheckedExe | str:
+    """Return the executable a command runs, or an error string.
+
+    Identify the executable index and normalized name, then validate every
+    ``KEY=val`` assignment attached to it — whether written bare or passed
+    through ``env``, since both reach the process the same way.
+    """
+    resolved = resolve_exe(argv)
+    if resolved is None:
+        return "Security Error: No executable found in command."
+
+    for token in resolved.env_assignments:
+        err = _check_env_var_token(token)
+        if err:
+            return err
+
+    if Path(argv[resolved.wrapper_idx]).name.lower() == "env":
+        for token in argv[resolved.wrapper_idx + 1 :]:
+            if token in ("-S", "--split-string"):
+                return "Security Error: 'env -S/--split-string' is blocked."
+
+    return CheckedExe(idx=resolved.wrapper_idx, name=resolved.name)
 
 
 def _check_exec_pivots(exe_name: str, argv: list[str], exe_idx: int) -> str | None:
@@ -1333,15 +1605,15 @@ def _check_git_extended(argv: list[str], exe_idx: int) -> str | None:
     return None
 
 
-def _check_per_exe(exe_name: str, argv: list[str], exe_idx: int, workspace_dir: str) -> str | None:
+def _check_per_exe(exe: CheckedExe, argv: list[str], workspace_dir: str) -> str | None:
     """Dispatch per-executable security checks (pivots, denylist, rm, git)."""
-    err = _check_exec_pivots(exe_name, argv, exe_idx) or _check_blocked_executables(exe_name)
+    err = _check_exec_pivots(exe.name, argv, exe.idx) or _check_blocked_executables(exe.name)
     if err:
         return err
-    if exe_name == "rm":
-        return _check_rm_command(argv, exe_idx, workspace_dir, set())
-    if exe_name == "git":
-        return _check_git_command(argv, exe_idx, set()) or _check_git_extended(argv, exe_idx)
+    if exe.name == "rm":
+        return _check_rm_command(argv, exe.idx, workspace_dir, set())
+    if exe.name == "git":
+        return _check_git_command(argv, exe.idx, set()) or _check_git_extended(argv, exe.idx)
     return None
 
 
@@ -1357,19 +1629,18 @@ def _validate_single_argv(argv: list[str], workspace_dir: str) -> str | None:
         return err
 
     # Find the executable (skip leading FOO=bar env assignments)
-    result = _resolve_exe(argv)
-    if isinstance(result, str):
-        return result
-    exe_idx, exe_name = result
+    exe = _resolve_exe(argv)
+    if isinstance(exe, str):
+        return exe
 
     # Block SHELL interpreters only (no legitimate use after Phase 2).
     # Language runtimes (python3, node, ruby, etc.) are allowed —
     # agent needs them for test execution; srt OS sandbox is the boundary.
     blocked_shells = {"bash", "sh", "dash", "zsh", "ksh"}
-    if exe_name in blocked_shells:
-        return f"Security Error: Shell interpreter '{exe_name}' is blocked."
+    if exe.name in blocked_shells:
+        return f"Security Error: Shell interpreter '{exe.name}' is blocked."
 
-    return _check_per_exe(exe_name, argv, exe_idx, workspace_dir)
+    return _check_per_exe(exe, argv, workspace_dir)
 
 
 def validate_argv(argv: list[str], workspace_dir: str) -> str | None:
@@ -1390,15 +1661,56 @@ def validate_argv(argv: list[str], workspace_dir: str) -> str | None:
     return None
 
 
+def _splice_middle[T: (str, list[str])](units: T, cap: int, marker_for: Callable[[int], T]) -> T:
+    """Keep the head and tail of ``units``, naming what was dropped between.
+
+    ``units`` is measured in whatever the cap counts: a string for a character
+    budget, a list of lines for a line budget. ``marker_for`` returns the
+    replacement for the middle in the same currency, so its own size is
+    charged against the cap rather than added on top of it — otherwise every
+    truncated stream comes back over the limit the caller configured.
+    """
+    if cap <= 0 or len(units) <= cap:
+        return units
+
+    # Reserve against the longest the marker can get. Its length only grows
+    # with the omitted count, so sizing on the whole input can never underrun.
+    budget = max(cap - len(marker_for(len(units))), 0)
+    head_n = int(budget * OUTPUT_HEAD_FRACTION)
+    tail_n = budget - head_n
+    head = units[:head_n]
+    tail = units[len(units) - tail_n :] if tail_n else units[:0]
+    return (head + marker_for(len(units) - budget) + tail)[:cap]
+
+
+def _truncate_middle(text: str, limits: OutputLimits) -> str:
+    """Trim the middle out of ``text`` to fit within ``limits``.
+
+    Keeps a head and a tail because each answers a different question: the
+    head shows what ran, the tail shows how it ended. The line cap runs first
+    so ordinary logs are trimmed on line boundaries; the character cap then
+    catches output that is short on lines but enormous on one of them.
+    """
+    if limits.max_lines > 0:
+        text = "\n".join(
+            _splice_middle(text.splitlines(), limits.max_lines, lambda n: [f"... [{n} lines omitted] ..."]),
+        )
+
+    return _splice_middle(text, limits.max_chars, lambda n: f"\n... [{n} characters omitted] ...\n")
+
+
 def _format_command_result(
     stdout: bytes,
     stderr: bytes,
     returncode: int,
+    limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
 ) -> str:
     stdout_str = stdout.decode(errors="replace")
     stderr_str = stderr.decode(errors="replace")
 
     diagnostics = []
+    # Read diagnostics off the full text: a blocked request lands wherever it
+    # happened, which for a long install is nowhere near either end.
     combined = stdout_str + stderr_str
     if returncode != 0:
         if "Connection blocked by network allowlist" in combined or "X-Proxy-Error: blocked-by-allowlist" in combined:
@@ -1415,9 +1727,9 @@ def _format_command_result(
 
     parts = [
         "--- STDOUT ---",
-        stdout_str,
+        _truncate_middle(stdout_str, limits),
         "--- STDERR ---",
-        stderr_str,
+        _truncate_middle(stderr_str, limits),
         f"--- EXIT CODE: {returncode} ---",
     ]
     if diagnostics:
@@ -1425,8 +1737,8 @@ def _format_command_result(
     return "\n".join(parts)
 
 
-def _setup_cache_env(workspace_dir: str, env: dict[str, str]) -> None:
-    cache_base = Path(workspace_dir) / ".cache"
+def _setup_cache_env(cache_dir: str, env: dict[str, str]) -> None:
+    cache_base = Path(cache_dir)
     env["BUN_INSTALL"] = str(cache_base / "bun")
     env["CARGO_HOME"] = str(cache_base / "cargo")
     env["COMPOSER_CACHE_DIR"] = str(cache_base / "composer")
@@ -1479,6 +1791,8 @@ class SandboxConfig(NamedTuple):
         srt_config: Parsed srt settings dict (filesystem, network rules).
         github_token: Token for authenticated git operations.
         command_timeout: Max seconds per sandboxed command.
+        output_limits: Caps on the output returned to the model.
+        cache_dir: Shared package cache, outside the workspace so it persists.
 
     """
 
@@ -1486,6 +1800,8 @@ class SandboxConfig(NamedTuple):
     srt_config: dict[str, Any]
     github_token: str | None = None
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT
+    output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS
+    cache_dir: str = DEFAULT_CACHE_DIR
 
 
 class SandboxedCommandRunner:
@@ -1580,7 +1896,7 @@ class SandboxedCommandRunner:
     ) -> CommandResult:
         """Execute a single (non-compound) argv array through srt."""
         env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
-        _setup_cache_env(self.cfg.workspace_dir, env)
+        _setup_cache_env(self.cfg.cache_dir, env)
 
         is_git_command = _is_git_command_argv(argv)
 
@@ -1641,7 +1957,7 @@ class SandboxedCommandRunner:
                 await process.wait()
                 return CommandResult(f"Error: Command timed out after {self.cfg.command_timeout} seconds.", -1)
             rc = process.returncode if process.returncode is not None else -1
-            return CommandResult(_format_command_result(stdout, stderr, rc), rc)
+            return CommandResult(_format_command_result(stdout, stderr, rc, self.cfg.output_limits), rc)
         finally:
             if git_config_temp_path:
                 with contextlib.suppress(Exception):
@@ -1653,11 +1969,16 @@ def create_run_command_tool(
     srt_settings_path: str | Path = "",
     github_token: str | None = None,
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
+    cache_dir: str = DEFAULT_CACHE_DIR,
 ) -> Callable[..., Awaitable[str]]:
     """Create a sandboxed run_command tool bound to a workspace."""
     config_path = None
     init_error = None
     srt_config = {}
+
+    # The cache outlives the workspace, so it may already exist from an earlier repo.
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
     base_path = srt_settings_path or DEFAULT_SRT_SETTINGS_PATH
     try:
@@ -1668,12 +1989,12 @@ def create_run_command_tool(
         fs_config["allowGitConfig"] = False
 
         allow_write = fs_config.setdefault("allowWrite", [])
-        if workspace_dir not in allow_write:
-            allow_write.append(workspace_dir)
-
         allow_read = fs_config.setdefault("allowRead", [])
-        if workspace_dir not in allow_read:
-            allow_read.append(workspace_dir)
+        for path in (workspace_dir, cache_dir):
+            if path not in allow_write:
+                allow_write.append(path)
+            if path not in allow_read:
+                allow_read.append(path)
 
         with tempfile.NamedTemporaryFile(
             suffix=".json",
@@ -1694,6 +2015,8 @@ def create_run_command_tool(
             srt_config=srt_config,
             github_token=github_token,
             command_timeout=command_timeout,
+            output_limits=output_limits,
+            cache_dir=cache_dir,
         ),
         config_path=config_path,
         init_error=init_error,

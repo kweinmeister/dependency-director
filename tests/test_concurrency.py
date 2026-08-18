@@ -1,12 +1,16 @@
 """Tests for concurrent operations and lock management in dependency-director."""
 
+import asyncio
+import logging
+from collections.abc import AsyncGenerator
 from typing import Any, Never
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx as httpx_mod
 import pytest
 
-from dependency_director.main import get_repositories, run_agent
+from dependency_director.config import Settings
+from dependency_director.main import get_repositories, run_agent, run_agent_for_repo
 from dependency_director.tools import GitHubAuthenticationError, GitHubClient
 
 
@@ -36,6 +40,31 @@ async def test_get_repositories_filters_forks(github_token: str) -> None:
         _, kwargs = mock_get.call_args_list[1]
         assert "Authorization" in kwargs["headers"]
         assert kwargs["headers"]["Authorization"] == f"Bearer {github_token}"
+
+
+@pytest.mark.asyncio
+async def test_get_repositories_filters_archived_and_disabled(github_token: str) -> None:
+    """Verify that get_repositories skips archived and disabled repositories."""
+    mock_repos_page1 = [
+        {"name": "repo-1", "fork": False},
+        {"name": "repo-archived", "fork": False, "archived": True},
+        {"name": "repo-disabled", "fork": False, "disabled": True},
+        {"name": "repo-2", "fork": False, "archived": False, "disabled": False},
+    ]
+    mock_repos_page2: list[dict[str, Any]] = []
+    with patch("httpx.AsyncClient.get") as mock_get:
+        mock_user = MagicMock()
+        mock_user.status_code = 200
+        mock_user.json.return_value = {"login": "not-test-owner"}
+        mock_response1 = MagicMock()
+        mock_response1.status_code = 200
+        mock_response1.json.return_value = mock_repos_page1
+        mock_response2 = MagicMock()
+        mock_response2.status_code = 200
+        mock_response2.json.return_value = mock_repos_page2
+        mock_get.side_effect = [mock_user, mock_response1, mock_response2]
+        repos = await get_repositories(owner="test-owner", token=github_token)
+        assert repos == ["test-owner/repo-1", "test-owner/repo-2"]
 
 
 @pytest.mark.asyncio
@@ -87,6 +116,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
         )
         mock_get_repos.assert_called_once_with("test-owner", "placeholder")
@@ -99,6 +129,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
         )
@@ -110,6 +141,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
         )
@@ -121,6 +153,7 @@ async def test_run_agent_concurrency(
             auto_merge=True,
             verify_all=True,
             standalone_fix=False,
+            fix_base=False,
             review_wait=5,
             hint=None,
         )
@@ -232,9 +265,62 @@ async def test_run_agent_worker_error_isolates(
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
         assert mock_run_agent_for_repo.call_count == 2
+
+
+async def _no_chunks() -> AsyncGenerator[None]:
+    """Yield nothing, as a turn whose only output was a log record does."""
+    return
+    yield
+
+
+@pytest.mark.asyncio
+async def test_sdk_issues_are_reported_under_the_repo_that_caused_them(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An SDK error logged during one repo's run must not be blamed on another's.
+
+    The collector attaches to the root logger, which is process-wide, so with
+    concurrency > 1 every in-flight repo used to collect every other repo's
+    warnings. The barrier holds both runs inside 'chat' at once, which is the
+    only arrangement in which the interleaving happens.
+    """
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    both_inside_chat = asyncio.Barrier(2)
+
+    async def _chat_that_logs_for_its_own_repo(prompt: str) -> MagicMock:
+        repo = "repo-a" if "repo-a" in prompt else "repo-b"
+        # Both collectors are attached before either record is emitted, and
+        # neither run finishes before both have emitted.
+        await both_inside_chat.wait()
+        logging.getLogger().warning("System step error in %s", repo)
+        await both_inside_chat.wait()
+        response = MagicMock()
+        response.chunks = _no_chunks()
+        return response
+
+    mock_agent_class.return_value.chat = AsyncMock(side_effect=_chat_that_logs_for_its_own_repo)
+
+    await asyncio.gather(
+        *(
+            run_agent_for_repo(repo=f"test-owner/{name}", settings=settings, max_attempts=3, dry_run=True)
+            for name in ("repo-a", "repo-b")
+        ),
+    )
+
+    output = capsys.readouterr().out
+    for name in ("repo-a", "repo-b"):
+        assert f"Agent execution for test-owner/{name} ended with 1 error(s)" in output
+        # Reported once, by the run that caused it — not echoed under the other.
+        assert output.count(f"System step error in {name}") == 1
 
 
 @pytest.mark.asyncio
@@ -255,14 +341,55 @@ async def test_run_agent_no_repos_found(mock_get_repos: MagicMock, github_token:
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
 
 
 @pytest.mark.asyncio
 @patch("dependency_director.main.run_agent_for_repo", new_callable=AsyncMock)
-async def test_run_agent_vertex_no_api_key_succeeds(mock_run_agent_for_repo: MagicMock, github_token: str) -> None:
+async def test_run_agent_single_repo_checks_accessibility_before_spawning(
+    mock_run_agent_for_repo: MagicMock,
+    github_token: str,
+) -> None:
+    """An unreachable repository must fail the pre-check in any process, tests included."""
+    request = httpx_mod.Request("GET", "https://api.github.com/repos/test-owner/missing")
+    with (
+        patch("dependency_director.main.Settings") as mock_settings_cls,
+        patch("httpx.AsyncClient.get") as mock_get,
+    ):
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.gemini_api_key = "placeholder-key"
+        mock_settings.github_token = github_token
+        mock_settings.vertex = False
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = httpx_mod.HTTPStatusError(
+            "404 Not Found",
+            request=request,
+            response=httpx_mod.Response(404, request=request),
+        )
+        mock_get.return_value = mock_response
+        with pytest.raises(SystemExit):
+            await run_agent(
+                "test-owner",
+                concurrency=1,
+                max_attempts=3,
+                repo="test-owner/missing",
+                dry_run=True,
+            )
+    mock_run_agent_for_repo.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("dependency_director.main._validate_repo_accessibility", new_callable=AsyncMock)
+@patch("dependency_director.main.run_agent_for_repo", new_callable=AsyncMock)
+async def test_run_agent_vertex_no_api_key_succeeds(
+    mock_run_agent_for_repo: MagicMock,
+    mock_validate_repo: MagicMock,
+    github_token: str,
+) -> None:
     """Vertex AI mode with project+location should not require GEMINI_API_KEY."""
+    _ = mock_validate_repo
     with patch("dependency_director.main.Settings") as mock_settings_cls:
         mock_settings = mock_settings_cls.return_value
         mock_settings.gemini_api_key = ""
@@ -279,6 +406,7 @@ async def test_run_agent_vertex_no_api_key_succeeds(mock_run_agent_for_repo: Mag
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
         mock_run_agent_for_repo.assert_called_once()
@@ -302,6 +430,7 @@ async def test_run_agent_no_api_key_no_vertex_exits(github_token: str) -> None:
                 auto_merge=False,
                 verify_all=False,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
             )
 
@@ -326,6 +455,7 @@ async def test_run_agent_vertex_missing_project_exits(github_token: str) -> None
                 auto_merge=False,
                 verify_all=False,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
             )
 
@@ -351,6 +481,7 @@ async def test_run_agent_no_github_token_warns(mock_get_repos: MagicMock, mock_r
             auto_merge=False,
             verify_all=False,
             standalone_fix=False,
+            fix_base=False,
             review_wait=0,
         )
         mock_run_agent_for_repo.assert_called_once()
@@ -376,6 +507,7 @@ async def test_run_agent_get_repos_exception(mock_get_repos: MagicMock, github_t
                 auto_merge=False,
                 verify_all=False,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
             )
         assert exc_info.value.code == 1
@@ -400,6 +532,7 @@ async def test_run_agent_verify_all_no_sandbox_incompatible(github_token: str) -
                 auto_merge=False,
                 verify_all=True,
                 standalone_fix=False,
+                fix_base=False,
                 review_wait=0,
                 no_sandbox=True,
             )

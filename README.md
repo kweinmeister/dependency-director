@@ -96,6 +96,35 @@ flowchart TD
     verify -- Fail --> escalate["Log & Escalate"]:::red
 ```
 
+### Broken base branches
+
+A dependency PR fails CI for one of two reasons: the bump broke
+something, or the base branch was already red before the bump
+landed. These need opposite responses, so before cloning for a RED
+PR the agent calls `get_branch_ci_status` once per run to tell them
+apart.
+
+A red base does not excuse every red PR, so the comparison is per
+check name: the base only takes the blame for checks it is failing
+too. A PR that fails a check the base passes introduced that failure
+itself and is fixed as normal — otherwise one unrelated broken job
+(a deploy step, say) would quietly stop every fix in the repository.
+
+When the base is failing the same checks, no dependency PR in that
+repository can go green on its own. By default the agent reports the
+cause once and skips the remaining RED PRs rather than attempting
+fixes that cannot succeed — a repo-wide fix does not belong in a
+`dependabot/*` branch, where it would be poor review hygiene and
+would make Dependabot stop managing the PR.
+
+Passing `--fix-base` lets the agent repair the base instead. The fix
+goes into its own PR against the base branch, scoped to only what
+the failing checks complain about, and is never merged
+automatically — not even under `--auto-merge`, since merging the
+agent's own change to a default branch is a larger step than merging
+a dependency bump. The dependency PRs stay blocked until that PR is
+reviewed, merged, and the bots rebase.
+
 ---
 
 ## Safety Guardrails
@@ -112,12 +141,10 @@ The agent operates under two modes of programmatic safety:
      the active workspace. Sensitive files like `.env`,
      `.git/hooks`, and `.git/config` are always protected.
    - **Network restriction** — All inbound and outbound traffic
-     is blocked except for allowlisted VCS hosts
-     (`github.com`, `api.github.com`,
-     `raw.githubusercontent.com`, `codeload.github.com`,
-     `objects.githubusercontent.com`, `gitlab.com`,
-     `bitbucket.org`). Known exfiltration endpoints are
-     explicitly denied.
+     is blocked except for an allowlist of VCS hosts and package
+     registries (see
+     [Network allowlist](#network-allowlist) below). Known
+     exfiltration endpoints are explicitly denied.
    - **Argv-mode invocation** — Commands are parsed via
      `shlex.split` and passed to srt as an argv array (`srt
      -- *argv`). srt's POSIX quoter ensures each argument is
@@ -154,6 +181,13 @@ The agent operates under two modes of programmatic safety:
    - **GitHub token scoped** — The token env vars are only present
      in the subprocess environment when running git commands.
 
+1. **File tools bounded to the workspace** — srt sandboxes command
+   execution, but the SDK's built-in `view_file`, `edit_file` and
+   `create_file` tools do not go through it. A `workspace_only`
+   policy confines all three to the per-repo clone and the agent
+   skill directory, so they cannot reach the rest of the host —
+   including this project's own checkout and `.env`.
+
 1. **No-Sandbox Fallback (`--no-sandbox`)** — When sandboxing is
    explicitly bypassed, the agent falls back to GitHub-only
    operations. No command execution tool is registered.
@@ -169,6 +203,58 @@ See
 and
 [`src/dependency_director/tools.py`](src/dependency_director/tools.py)
 for the full policy and validation implementation.
+
+### Network allowlist
+
+Verifying a dependency bump means installing it, so the sandbox has
+to reach the registry the bumped package lives in. Anything not on
+this list is blocked outbound. The list lives in
+[`srt-settings.json`](src/dependency_director/srt-settings.json);
+point `DEPDIRECTOR_SRT_SETTINGS` at your own copy to change it.
+
+<!-- markdownlint-disable MD013 MD060 -->
+
+| Purpose            | Hosts                                                                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git hosting        | `github.com`, `api.github.com`, `codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, `gitlab.com`, `api.gitlab.com`, `bitbucket.org`, `api.bitbucket.org`, `ssh.dev.azure.com` |
+| Python             | `pypi.org`, `files.pythonhosted.org`                                                                                                        |
+| JavaScript         | `registry.npmjs.org`, `registry.yarnpkg.com`                                                                                                |
+| Rust               | `*.crates.io` (covers the `index.crates.io` sparse index and `static.crates.io` downloads), `crates.io`                                     |
+| Go                 | `proxy.golang.org`                                                                                                                          |
+| Container images   | `*.docker.io`, `production.cloudflare.docker.com`, `ghcr.io`, `pkg-containers.githubusercontent.com`, `quay.io`, `mcr.microsoft.com`, `public.ecr.aws`, `*.pkg.dev` |
+
+<!-- markdownlint-enable MD013 MD060 -->
+
+Two entries are worth calling out:
+
+- **`*.crates.io`** — Cargo's sparse protocol (the default since
+  Rust 1.70) resolves the index at `index.crates.io`, which is a
+  different host from `crates.io`. Without it, any repository with
+  a compiled Rust extension fails at dependency resolution before a
+  single crate is fetched.
+- **Container registries** — Dependabot's `docker` ecosystem bumps
+  base-image tags, and the only way to verify such a PR is to pull
+  the new image. Each registry serves manifests and layer blobs from
+  different hosts (Docker Hub authenticates at `auth.docker.io` and
+  serves blobs from `production.cloudflare.docker.com`; GHCR serves
+  blobs from `pkg-containers.githubusercontent.com`), so both are
+  needed for a pull to complete. If you do not review Docker PRs,
+  removing these tightens the sandbox at no cost.
+
+### Package cache
+
+Every sandboxed command runs with its package caches (`UV_CACHE_DIR`,
+`CARGO_HOME`, `NPM_CONFIG_CACHE`, `GOMODCACHE`, and ~20 others) pointed
+at a single shared directory, granted read and write inside the
+sandbox. It deliberately lives outside the per-repo workspace, which is
+deleted before and after every repository — a cache inside the
+workspace would make every repo re-download every dependency.
+
+The trade-off is that repositories in a run share a cache. That is what
+makes it useful, and it is the same trust boundary as a developer
+machine, but it does mean a package installed while reviewing one repo
+is visible to the next. Point `DEPDIRECTOR_CACHE_DIR` at a fresh
+directory per run if you would rather not share.
 
 > [!TIP]
 > **DependencyDirector works best on repositories with good test
@@ -193,17 +279,23 @@ file. A template is provided in [`.env.template`](.env.template).
 | :------------------------------ | :----------------------------------------------------------------------------------------- | :------------------------------------------------------------------------ |
 | `GEMINI_API_KEY`                | API Key for accessing Gemini Developer API models (not needed if using Vertex).             | _(Required)_                                                              |
 | `GITHUB_TOKEN`                  | GitHub Personal Access Token. Required to perform merges, comments, or scan private repos.  | _(Recommended)_                                                           |
-| `DEPDIRECTOR_OWNER`             | Default GitHub user or organization to scan (can be overridden by CLI argument).            | _(Optional)_                                                              |
-| `DEPDIRECTOR_MAX_FIX_ATTEMPTS`  | Maximum iterative edit-and-test loops per failing repository.                               | `3`                                                                       |
-| `DEPDIRECTOR_CONCURRENCY`       | Maximum concurrent repository operations (1 = sequential).                                  | `1`                                                                       |
-| `DEPDIRECTOR_REVIEW_WAIT`       | Minutes to poll for review bot comments after pushing a fix (0 = disabled).                 | `0`                                                                       |
-| `DEPDIRECTOR_BOTS`              | JSON array of bot configs (`[{"author":"...","rebase_command":"..."}]`).                    | Default bots (automated dependency update tools like Renovate/Dependabot) |
-| `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.7-flash`).                                  | `gemini-3.7-flash`                                                        |
-| `GOOGLE_GENAI_USE_VERTEXAI`     | Set to `true` to use Google Cloud Vertex AI instead of Gemini Developer API.                | `false`                                                                   |
-| `GOOGLE_CLOUD_PROJECT`          | Google Cloud project ID (required if using Vertex AI).                                      | _(Optional)_                                                              |
 | `GOOGLE_CLOUD_LOCATION`         | Google Cloud region/location (required if using Vertex AI).                                 | _(Optional)_                                                              |
+| `GOOGLE_CLOUD_PROJECT`          | Google Cloud project ID (required if using Vertex AI).                                      | _(Optional)_                                                              |
+| `GOOGLE_GENAI_USE_VERTEXAI`     | Set to `true` to use Google Cloud Vertex AI instead of Gemini Developer API.                | `false`                                                                   |
+| `DEPDIRECTOR_BOTS`              | JSON array of bot configs (`[{"author":"...","rebase_command":"..."}]`).                    | Default bots (automated dependency update tools like Renovate/Dependabot) |
+| `DEPDIRECTOR_CACHE_DIR`         | Package cache shared by every repository and run (see [Package cache](#package-cache)).     | `<tmp>/dependency-director-cache`                                         |
+| `DEPDIRECTOR_COMMAND_TIMEOUT`   | Seconds allowed per sandboxed command before it is killed (minimum 10).                     | `300`                                                                     |
+| `DEPDIRECTOR_CONCURRENCY`       | Maximum concurrent repository operations (1 = sequential).                                  | `1`                                                                       |
+| `DEPDIRECTOR_MAX_FAILED_JOBS`   | Failed CI jobs whose logs are fetched per red PR; the rest are counted and reported.        | `3`                                                                       |
+| `DEPDIRECTOR_MAX_FIX_ATTEMPTS`  | Maximum iterative fix-and-test attempts per failing PR.                                     | `3`                                                                       |
+| `DEPDIRECTOR_MAX_OUTPUT_CHARS`  | Characters kept per stream from each command's output (0 = unlimited).                      | `24000`                                                                   |
+| `DEPDIRECTOR_MAX_OUTPUT_LINES`  | Lines kept per stream from each command's output; the middle is dropped (0 = unlimited).    | `200`                                                                     |
+| `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.7-flash`).                                  | `gemini-3.7-flash`                                                        |
 | `DEPDIRECTOR_NO_SANDBOX`        | Set to `true` to disable sandbox-runtime (srt) sandboxing.                                  | `false`                                                                   |
+| `DEPDIRECTOR_OWNER`             | Default GitHub user or organization to scan (can be overridden by CLI argument).            | _(Optional)_                                                              |
+| `DEPDIRECTOR_REVIEW_WAIT`       | Minutes to poll for review bot comments after pushing a fix (0 = disabled).                 | `0`                                                                       |
 | `DEPDIRECTOR_SRT_SETTINGS`      | Custom settings JSON path for sandbox-runtime (srt).                                        | Bundled `srt-settings.json`                                               |
+| `DEPDIRECTOR_WORKFLOW_LOG_TAIL_LINES` | Lines kept from the end of each failed job's log.                                     | `50`                                                                      |
 
 <!-- markdownlint-enable MD013 MD060 -->
 
@@ -300,11 +392,12 @@ depdirector --help
 | Flag                 | Description                                                                                                  |
 | :------------------- | :----------------------------------------------------------------------------------------------------------- |
 | `-d, --dry-run`      | Simulate execution without merging or pushing fixes.                                                         |
-| `-a, --auto-merge`   | Enable native GitHub auto-merge on any created patch PRs.                                                    |
+| `-a, --auto-merge`   | Squash-merge fix PRs via the GitHub API once CI is green, instead of leaving them for manual review.         |
 | `-v, --verify-all`   | Force local test verification of all PRs (including green ones) before merging.                               |
 | `--standalone-fix`   | Create fixes on a new branch with a separate PR instead of pushing to the original dependency update branch.  |
+| `--fix-base`         | When the base branch is already failing CI, repair it in a separate PR against the base (see [Broken base branches](#broken-base-branches)). |
 | `-c, --concurrency`  | Override the maximum concurrent repository scans.                                                            |
-| `-m, --max-attempts` | Override the maximum edit-test attempts per failure.                                                          |
+| `-m, --max-attempts` | Override the maximum fix-and-test attempts per failing PR.                                                    |
 | `-w, --review-wait`  | Minutes to wait for review comments after pushing a fix (overrides env).                                     |
 | `-H, --hint`         | Extra context appended to the agent prompt (e.g. skip a PR or supply target guidance).                       |
 | `--no-sandbox`       | Disable sandbox-runtime (srt) sandboxing (restricts to GitHub-only API operations, no shell access).         |
@@ -337,6 +430,12 @@ depdirector your-org --verify-all
 depdirector your-org --concurrency 4
 ```
 
+**Unblock dependency PRs stuck behind a red base branch:**
+
+```bash
+depdirector your-org/your-repo --fix-base
+```
+
 ---
 
 ## Development & Testing
@@ -348,6 +447,28 @@ configuration, agent prompt generation, and tool safety policies:
 
 ```bash
 uv run pytest
+```
+
+### Live harness
+
+Some behaviour is decided by the model rather than by code — whether a
+red base branch excuses a red PR, for instance. Unit tests can only
+assert that the instructions say the right thing, not that the agent
+acts on it.
+
+The live harness closes that gap. It runs the real model, the real
+sandbox, and a real git repository built on disk, and substitutes only
+GitHub itself: a fake client serves scripted check results, so a
+scenario can put a base branch and a PR in any combination of red and
+green. The agent clones, edits, commits, and pushes for real, and
+assertions read back what landed on the remote.
+
+These tests are slow, consume tokens, and are not deterministic, so
+they are excluded from the default run and skipped without model
+credentials:
+
+```bash
+uv run pytest -m live
 ```
 
 ### Static Analysis & Linting

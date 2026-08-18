@@ -53,8 +53,13 @@ venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-addopts = "--cov=dependency_director --cov-report=term-missing --durations=10"
+# Live tests call the real model: slow, metered, and not deterministic. They
+# are opt-in via `pytest -m live`, so the default run stays fast and offline.
+addopts = "--cov=dependency_director --cov-report=term-missing --durations=10 -m 'not live'"
 asyncio_mode = "auto"
+markers = [
+    "live: exercises the real model against a faked GitHub and a local git remote",
+]
 
 [tool.ruff]
 line-length = 120

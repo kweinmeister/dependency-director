@@ -1,13 +1,16 @@
 """Tests for PR status tools and check suites in dependency-director."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx as httpx_mod
 import pytest
 
-from dependency_director.config import DEFAULT_BOTS
+from dependency_director.config import DEFAULT_BOTS, DEFAULT_MAX_FAILED_JOBS, LogLimits
+from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
+    AgentTools,
     GitHubClient,
     GitHubNotFoundError,
     ToolFn,
@@ -169,27 +172,21 @@ async def test_github_client_get_job_logs_redirect_handling(github_token: str) -
 
 
 @pytest.fixture
-def tools(mock_client: MagicMock) -> tuple[ToolFn, ...]:
+def tools(mock_client: MagicMock) -> AgentTools:
     """Fixture to set up write tools for status checking tests."""
     return create_agent_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
 
 
 @pytest.fixture
-def get_pr_status(tools: tuple[ToolFn, ...]) -> ToolFn:
+def get_pr_status(tools: AgentTools) -> ToolFn:
     """Fixture to retrieve the PR status checking tool."""
-    fn = tools[3]
-    fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_status", f"Unexpected tool at index 3: {fn_name!r}"
-    return fn
+    return tools.get_pr_status
 
 
 @pytest.fixture
-def get_pr_workflow_run_logs(tools: tuple[ToolFn, ...]) -> ToolFn:
+def get_pr_workflow_run_logs(tools: AgentTools) -> ToolFn:
     """Fixture to retrieve the PR workflow run log fetching tool."""
-    fn = tools[5]
-    fn_name = getattr(fn, "__name__", "")
-    assert fn_name == "get_pr_workflow_run_logs", f"Unexpected tool at index 5: {fn_name!r}"
-    return fn
+    return tools.get_pr_workflow_run_logs
 
 
 @pytest.mark.asyncio
@@ -296,7 +293,7 @@ async def test_tool_get_pr_workflow_run_logs(mock_client: MagicMock, get_pr_work
     """Verify get_pr_workflow_run_logs tool retrieves logs correctly."""
     mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
     mock_client.get_workflow_runs_for_commit = AsyncMock(
-        return_value={"total_count": 1, "workflow_runs": [{"id": 98765}]},
+        return_value={"total_count": 1, "workflow_runs": [{"id": 98765, "name": "CI", "conclusion": "failure"}]},
     )
     mock_client.get_workflow_run_jobs = AsyncMock(
         return_value={
@@ -319,7 +316,7 @@ async def test_tool_get_pr_workflow_run_logs(mock_client: MagicMock, get_pr_work
     large_log = "\n".join(f"log line {i}" for i in range(1, 100))
     mock_client.get_job_logs = AsyncMock(return_value=large_log)
     result = await get_pr_workflow_run_logs("owner", "repo", 22)
-    assert "--- FAILED JOB: build (ID: 111) ---" in result
+    assert "--- FAILED JOB: CI / build (ID: 111) ---" in result
     assert "log line 99" in result
     assert "log line 1" not in result
     assert "log line 50" in result
@@ -333,7 +330,7 @@ async def test_tool_get_pr_workflow_run_logs_api_error_on_logs(
     """Verify get_pr_workflow_run_logs handles API errors gracefully."""
     mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
     mock_client.get_workflow_runs_for_commit = AsyncMock(
-        return_value={"total_count": 1, "workflow_runs": [{"id": 98765}]},
+        return_value={"total_count": 1, "workflow_runs": [{"id": 98765, "name": "CI", "conclusion": "failure"}]},
     )
     mock_client.get_workflow_run_jobs = AsyncMock(
         return_value={
@@ -349,8 +346,171 @@ async def test_tool_get_pr_workflow_run_logs_api_error_on_logs(
     )
     mock_client.get_job_logs = AsyncMock(side_effect=GitHubNotFoundError("GitHub API error 404"))
     result = await get_pr_workflow_run_logs("owner", "repo", 22)
-    assert "--- FAILED JOB: build (ID: 111) ---" in result
+    assert "--- FAILED JOB: CI / build (ID: 111) ---" in result
     assert "Failed to retrieve log: GitHub API error 404" in result
+
+
+def _run(run_id: int, name: str, conclusion: str = "failure", created_at: str = "") -> dict[str, object]:
+    """Build a minimal workflow-run payload for the log-fetching tests."""
+    return {"id": run_id, "name": name, "conclusion": conclusion, "created_at": created_at}
+
+
+def _job(job_id: int, name: str, conclusion: str = "failure") -> dict[str, object]:
+    """Build a minimal job payload for the log-fetching tests."""
+    return {"id": job_id, "name": name, "status": "completed", "conclusion": conclusion}
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_covers_every_failing_workflow(
+    mock_client: MagicMock,
+    get_pr_workflow_run_logs: ToolFn,
+) -> None:
+    """Verify logs are read from all failing workflow runs, not only the first.
+
+    A commit routinely triggers several workflows. Reading only runs[0] means
+    the agent sees one failure, fixes it, and is surprised when CI is still
+    red for a reason it was never shown.
+    """
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(
+        return_value={
+            "workflow_runs": [
+                _run(1, "CI"),
+                _run(2, "CodeQL"),
+            ],
+        },
+    )
+    jobs_by_run = {1: {"jobs": [_job(111, "pytest")]}, 2: {"jobs": [_job(222, "analyze")]}}
+    mock_client.get_workflow_run_jobs = AsyncMock(side_effect=lambda _o, _r, run_id: jobs_by_run[run_id])
+    mock_client.get_job_logs = AsyncMock(return_value="boom")
+
+    result = await get_pr_workflow_run_logs("owner", "repo", 22)
+
+    assert "CI / pytest" in result
+    assert "CodeQL / analyze" in result
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_keeps_newest_run_per_workflow(
+    mock_client: MagicMock,
+    get_pr_workflow_run_logs: ToolFn,
+) -> None:
+    """Verify a re-run supersedes its earlier attempt instead of being shown twice.
+
+    Re-running a failed workflow produces a second run with the same name on
+    the same SHA. Only the newest one reflects reality.
+    """
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(
+        return_value={
+            "workflow_runs": [
+                _run(9, "CI", created_at="2026-08-17T10:00:00Z"),
+                _run(1, "CI", created_at="2026-08-17T09:00:00Z"),
+            ],
+        },
+    )
+    jobs_by_run = {9: {"jobs": [_job(999, "newest")]}, 1: {"jobs": [_job(111, "stale")]}}
+    mock_client.get_workflow_run_jobs = AsyncMock(side_effect=lambda _o, _r, run_id: jobs_by_run[run_id])
+    mock_client.get_job_logs = AsyncMock(return_value="boom")
+
+    result = await get_pr_workflow_run_logs("owner", "repo", 22)
+
+    assert "newest" in result
+    assert "stale" not in result
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_skips_successful_runs(
+    mock_client: MagicMock,
+    get_pr_workflow_run_logs: ToolFn,
+) -> None:
+    """Verify a passing run is not fetched, so the extra API calls are not spent."""
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(
+        return_value={
+            "workflow_runs": [
+                _run(1, "CI", conclusion="success"),
+                _run(2, "Lint", conclusion="failure"),
+            ],
+        },
+    )
+    mock_client.get_workflow_run_jobs = AsyncMock(return_value={"jobs": [_job(222, "ruff")]})
+    mock_client.get_job_logs = AsyncMock(return_value="boom")
+
+    result = await get_pr_workflow_run_logs("owner", "repo", 22)
+
+    assert "Lint / ruff" in result
+    mock_client.get_workflow_run_jobs.assert_awaited_once_with("owner", "repo", 2)
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_caps_jobs_and_reports_the_cap(
+    mock_client: MagicMock,
+    get_pr_workflow_run_logs: ToolFn,
+) -> None:
+    """Verify the job cap holds and says what it dropped.
+
+    A silent cap reads as 'these are all the failures', which is exactly the
+    wrong impression when the agent is deciding whether its fix is complete.
+    """
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(return_value={"workflow_runs": [_run(1, "CI")]})
+    mock_client.get_workflow_run_jobs = AsyncMock(
+        return_value={"jobs": [_job(100 + i, f"job{i}") for i in range(5)]},
+    )
+    mock_client.get_job_logs = AsyncMock(return_value="boom")
+
+    result = await get_pr_workflow_run_logs("owner", "repo", 22)
+
+    assert result.count("--- FAILED JOB:") == DEFAULT_MAX_FAILED_JOBS
+    assert "job0" in result
+    assert f"{5 - DEFAULT_MAX_FAILED_JOBS} more failed job" in result
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_honour_configured_caps(mock_client: MagicMock) -> None:
+    """Verify both CI-log caps come from configuration, not from constants.
+
+    A repo whose failure only makes sense with more jobs or a longer tail has
+    no way to say so while the caps are baked in.
+    """
+    tools = create_agent_tools(
+        client=mock_client,
+        bots=DEFAULT_BOTS,
+        dry_run=False,
+        review_wait=0,
+        log_limits=LogLimits(max_failed_jobs=1, tail_lines=2),
+    )
+    get_logs = tools.get_pr_workflow_run_logs
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(return_value={"workflow_runs": [_run(1, "CI")]})
+    mock_client.get_workflow_run_jobs = AsyncMock(
+        return_value={"jobs": [_job(100 + i, f"job{i}") for i in range(3)]},
+    )
+    mock_client.get_job_logs = AsyncMock(return_value="setup\nline1\nline2")
+
+    result = await get_logs("owner", "repo", 22)
+
+    assert result.count("--- FAILED JOB:") == 1
+    assert "2 more failed job" in result
+    assert "setup" not in result
+    assert "line1\nline2" in result
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_logs_reports_no_failures_across_all_runs(
+    mock_client: MagicMock,
+    get_pr_workflow_run_logs: ToolFn,
+) -> None:
+    """Verify the empty case names every run examined, not just the latest one."""
+    mock_client.get_pr_details = AsyncMock(return_value={"number": 22, "head": {"sha": "sha123"}})
+    mock_client.get_workflow_runs_for_commit = AsyncMock(
+        return_value={"workflow_runs": [_run(1, "CI", conclusion="success")]},
+    )
+
+    result = await get_pr_workflow_run_logs("owner", "repo", 22)
+
+    assert "No failed jobs" in result
 
 
 @pytest.mark.asyncio
@@ -516,3 +676,200 @@ async def test_check_ci_includes_head_sha() -> None:
     result = json.loads(result_json)
     assert "head_sha" in result, "head_sha must be present in _check_ci response"
     assert result["head_sha"] == "deadbeef123"
+
+
+@pytest.fixture
+def get_branch_ci_status(tools: AgentTools) -> ToolFn:
+    """Fixture to retrieve the branch CI status tool."""
+    return tools.get_branch_ci_status
+
+
+@pytest.mark.parametrize(
+    ("check_runs", "expected"),
+    [
+        ([{"name": "ci", "status": "completed", "conclusion": "success"}], "GREEN"),
+        ([{"name": "ci", "status": "completed", "conclusion": "failure"}], "RED"),
+        ([{"name": "ci", "status": "in_progress", "conclusion": None}], "PENDING"),
+        ([], "NONE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_verdicts(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+    check_runs: list[dict[str, object]],
+    expected: str,
+) -> None:
+    """Verify branch health is classified with the same verdicts used for PRs."""
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": check_runs})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_branch_ci_status("owner", "repo", "main"))
+    assert result["branch"] == "main"
+    assert result["ci_status"] == expected
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_costs_one_round_of_calls(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """The whole point is answering before a clone, so it must not resolve a SHA first.
+
+    GitHub accepts a branch name as a commit ref, so the branch is queried directly.
+    """
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    await get_branch_ci_status("owner", "repo", "main")
+    mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "main")
+    mock_client.get_commit_status.assert_awaited_once_with("owner", "repo", "main")
+    mock_client.get_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_is_checked_once_per_branch(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """Every red PR on a base asks about it, but the answer is fetched once.
+
+    Instructions alone cannot stop the model re-checking, and a repo with a
+    dozen red PRs would otherwise pay for a dozen identical round trips.
+    """
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    first, second = await asyncio.gather(
+        get_branch_ci_status("owner", "repo", "main"),
+        get_branch_ci_status("owner", "repo", "main"),
+    )
+
+    assert first == second
+    mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "main")
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_caches_each_branch_separately(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """A second base branch is a different question and must be asked."""
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    await get_branch_ci_status("owner", "repo", "main")
+    await get_branch_ci_status("owner", "repo", "develop")
+
+    assert mock_client.get_commit_check_runs.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_does_not_cache_failures(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """A transient API error must not become this run's permanent answer."""
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    mock_client.get_commit_check_runs = AsyncMock(
+        side_effect=[GitHubNotFoundError("boom"), {"check_runs": []}],
+    )
+
+    with pytest.raises(GitHubNotFoundError):
+        await get_branch_ci_status("owner", "repo", "main")
+    result = json.loads(await get_branch_ci_status("owner", "repo", "main"))
+
+    assert result["ci_status"] == "NONE"
+    assert mock_client.get_commit_check_runs.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_defaults_to_the_default_branch(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """Callers asking 'is the base broken?' should not have to know the base's name."""
+    mock_client.get_default_branch = AsyncMock(return_value="trunk")
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_branch_ci_status("owner", "repo"))
+    assert result["branch"] == "trunk"
+    mock_client.get_commit_check_runs.assert_awaited_once_with("owner", "repo", "trunk")
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_reports_which_checks_failed(
+    mock_client: MagicMock,
+    get_branch_ci_status: ToolFn,
+) -> None:
+    """A bare RED is not actionable; the agent needs to know what to go fix."""
+    mock_client.get_commit_check_runs = AsyncMock(
+        return_value={
+            "check_runs": [
+                {"name": "lint", "status": "completed", "conclusion": "failure"},
+                {"name": "test", "status": "completed", "conclusion": "success"},
+            ],
+        },
+    )
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_branch_ci_status("owner", "repo", "main"))
+    assert result["ci_status"] == "RED"
+    failed = [c["name"] for c in result["checks"] if c["conclusion"] == "failure"]
+    assert failed == ["lint"]
+
+
+# --- The base branch the agent is told about must be the PR's own ---
+
+
+@pytest.fixture
+def list_bot_prs(tools: AgentTools) -> ToolFn:
+    """Fixture to retrieve the bot PR listing tool."""
+    return tools.list_bot_prs
+
+
+@pytest.mark.asyncio
+async def test_list_bot_prs_reports_the_branch_each_pr_targets(
+    mock_client: MagicMock,
+    list_bot_prs: ToolFn,
+) -> None:
+    """The listing must name each PR's base, so the agent can check the right branch.
+
+    Without it the agent has nothing to pass to 'get_branch_ci_status' and
+    silently falls back to the repository default, diagnosing a branch the PR
+    does not target.
+    """
+    mock_client.list_open_prs = AsyncMock(
+        return_value=[
+            PullRequest.model_validate(
+                {
+                    "number": 5,
+                    "title": "bump lib",
+                    "user": {"login": DEFAULT_BOTS[0].author},
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "base": {"ref": "develop"},
+                },
+            ),
+        ],
+    )
+    result = json.loads(await list_bot_prs("owner", "repo"))
+    assert result["bot_prs"][0]["base_ref"] == "develop"
+
+
+@pytest.mark.asyncio
+async def test_pr_status_reports_the_branch_the_pr_targets(
+    mock_client: MagicMock,
+    get_pr_status: ToolFn,
+) -> None:
+    """A PR's status must carry its base, so a RED verdict can be attributed."""
+    mock_client.get_pr_details = AsyncMock(
+        return_value={
+            "number": 42,
+            "title": "bump",
+            "head": {"sha": "sha123"},
+            "base": {"ref": "release/2.0"},
+            "mergeable": True,
+            "mergeable_state": "clean",
+        },
+    )
+    mock_client.get_commit_check_runs = AsyncMock(return_value={"check_runs": []})
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    result = json.loads(await get_pr_status("owner", "repo", 42))
+    assert result["base_ref"] == "release/2.0"

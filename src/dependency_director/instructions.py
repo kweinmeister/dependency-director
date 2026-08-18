@@ -12,6 +12,7 @@ def get_system_instructions(
     auto_merge: bool = False,
     dry_run: bool = False,
     standalone_fix: bool = False,
+    fix_base: bool = False,
     review_wait: int = 0,
     bots: list[BotConfig] = DEFAULT_BOTS,
     no_sandbox: bool = False,
@@ -34,8 +35,10 @@ def get_system_instructions(
     if standalone_fix:
         fix_strategy = (
             "commit to local branch, push using 'git push origin "
-            "pr-<pr-number>:dependency-director/fix-<pr-pr_number>', "
-            "and open PR targeting main referencing original."
+            "pr-<pr-number>:dependency-director/fix-<pr-number>', then call "
+            "'create_pr(owner, repo, title, head_branch, body)' with "
+            "head_branch='dependency-director/fix-<pr-number>' and a body "
+            "referencing the original PR."
         )
     else:
         fix_strategy = (
@@ -44,6 +47,33 @@ def get_system_instructions(
             "using 'git push origin pr-<pr-number>:<remote-pr-branch>'. "
             "Do NOT create new branch/PR."
         )
+
+    if fix_base:
+        base_red_action = (
+            "the base is broken: follow the 'fix_base_branch' section, then log "
+            "'⚠ #<n> not fixed: blocked on base branch fix PR' for this and every "
+            "remaining RED PR on that base."
+        )
+    else:
+        base_red_action = (
+            "the dependency PRs cannot go green on their own: do NOT clone, and log "
+            "'⚠ #<n> not fixed: base branch <branch> is already failing CI (<failing checks>)' "
+            "for this and every remaining RED PR on that base."
+        )
+
+    base_health_check = (
+        "Before cloning, call 'get_branch_ci_status(owner, repo, branch)' with branch set to "
+        "the 'base_ref' that 'list_bot_prs' reported for this PR — never omit it, since the "
+        "tool then falls back to the repository default, which is the wrong branch for any PR "
+        "targeting elsewhere. Call it ONCE per distinct base_ref and reuse that one result for "
+        "every RED PR sharing that base — do NOT re-check the same base per PR. "
+        "If the base is GREEN, the failure belongs to the PR: continue. "
+        "If it reports ci_status='RED', compare check names: a base failure only excuses "
+        "the PR for the same check. If every check failing on the PR is also failing on "
+        f"the base, {base_red_action} "
+        "If the PR fails a check that is passing on the base, the PR introduced that "
+        "failure: continue and fix it as normal. "
+    )
 
     if no_sandbox:
         guardrails_content = (
@@ -100,6 +130,7 @@ def get_system_instructions(
             "resolve conflicts, test, push.\n"
             "   - RED: Get logs via 'get_pr_workflow_run_logs', "
             "then 'get_pr_diff' and 'get_pr_files' to understand scope before cloning. "
+            f"{base_health_check}"
             "Clone (if not already) to '<workspace_dir>/<repo_name>', "
             "then 'git fetch origin pull/<pr_number>/head:pr-<pr_number>' "
             "and 'git checkout pr-<pr_number>' (two separate calls). "
@@ -108,7 +139,10 @@ def get_system_instructions(
             "Run 'uv sync' as a separate step (avoids hidden timeouts inside 'uv run'). "
             "If sync times out or fails with network error/401, "
             "skip and log: '✗ #<n> skipped: dependency registry unavailable in sandbox'. "
-            f"Then test, fix, verify, and: {fix_strategy}\n"
+            "Then run the failing tests. If they pass locally with no edits, the CI failure "
+            "does not reproduce: make no changes, log '⚠ #<n> not fixed: CI failure did not "
+            "reproduce locally', and move to the next PR — do NOT report failed fix attempts "
+            f"you did not make. Otherwise fix, verify, and: {fix_strategy}\n"
             f"4. Max {max_attempts} fix attempts per RED PR before skipping.\n"
             "5. Before commit: re-run linter AND tests to verify all edits. "
             "Self-review: no suppressed errors (type: ignore, noqa), "
@@ -187,6 +221,32 @@ def get_system_instructions(
             ),
         )
 
+    if fix_base:
+        sections.append(
+            types.SystemInstructionSection(
+                title="fix_base_branch",
+                content=(
+                    "When 'get_branch_ci_status' reports a base branch RED, repair that "
+                    "base — the PR's 'base_ref', not the repository default — before "
+                    "skipping the dependency PRs on it:\n"
+                    "- Clone, check out that base_ref, and reproduce the failing checks.\n"
+                    "- Fix ONLY what those checks fail on. No unrelated changes, refactors, "
+                    "reformatting, or drive-by cleanups, even if you notice other problems.\n"
+                    "- If the failure does not reproduce on that branch, make no changes "
+                    "and report it — do not guess at a fix.\n"
+                    "- Push to 'dependency-director/fix-base-<base_ref>' and call "
+                    "'create_pr(..., base_branch=<base_ref>)' so the fix targets the branch "
+                    "that is actually broken, with a body listing the failing checks.\n"
+                    "- MUST NOT push base fixes to a dependency PR branch, and MUST NOT mix "
+                    "them into a dependency update commit.\n"
+                    "- MUST NOT merge the base fix PR, even in auto-merge mode. Leave it for "
+                    "human review.\n"
+                    "- Open at most one base fix PR per run. Afterwards the RED dependency PRs "
+                    "stay blocked until it merges and they rebase, so do not attempt them."
+                ),
+            ),
+        )
+
     if dry_run:
         sections.append(
             types.SystemInstructionSection(
@@ -222,10 +282,14 @@ def get_system_instructions(
                 "- Emit output sequentially as you work (not as one block at the end). Format CLI output as:\n"
                 "  1. Initial list of open PRs with statuses (GREEN/RED/CONFLICT).\n"
                 "  2. Execution prefix: '→ Merging #12 (green)' or '→ Fixing #14 (failing CI)'.\n"
-                "  3. Completion prefix: '✓ #12 merged', '⏭ #23 skipped (rebase requested)', or "
-                "'✗ #14 failed after N attempts'.\n"
+                "  3. Completion prefix: '✓ #12 merged', '⏭ #23 skipped (rebase requested)', "
+                "'⚠ #14 not fixed: <reason>', or '✗ #14 failed after N attempts'.\n"
                 "  4. Final markdown summary list of all processed PRs.\n"
-                f"- Log '✗ #<n> could not be fixed after {max_attempts} attempts' if RED PR fixes fail."
+                f"- Log '✗ #<n> could not be fixed after <k> attempts' (k = attempts actually made, "
+                f"max {max_attempts}) only when at least one fix was attempted and failed. "
+                "Never report more attempts than you made.\n"
+                "- Log '⚠ #<n> not fixed: <reason>' when no fix was attempted — for example the "
+                "failure did not reproduce locally, or the cause lies outside the dependency update."
             ),
         ),
     )

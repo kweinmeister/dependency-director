@@ -32,7 +32,7 @@ def instructions() -> types.TemplatedSystemInstructions:
 def _section_content(inst: types.TemplatedSystemInstructions, title: str) -> str:
     for s in inst.sections:
         if s.title == title:
-            return str(s.content)
+            return s.content
     return ""
 
 
@@ -163,6 +163,38 @@ def test_output_format(instructions: types.TemplatedSystemInstructions) -> None:
     assert "GREEN" in content
     assert "RED" in content
     assert str(3) in content
+
+
+def test_output_format_has_a_state_for_no_fix_attempted(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Verify there is a terminal state for a RED PR nobody tried to fix.
+
+    With only 'merged', 'skipped' and 'failed after N attempts' available, a
+    PR whose failure never reproduced gets reported as N exhausted attempts —
+    a claim about work that did not happen.
+    """
+    content = _section_content(instructions, "output_format")
+    assert "⚠" in content
+    assert "not fixed" in content.lower()
+
+
+def test_output_format_reports_attempts_actually_made(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Verify the failure line reports real attempt counts rather than always the maximum."""
+    content = _section_content(instructions, "output_format")
+    assert "actually made" in content.lower()
+
+
+def test_workflow_handles_a_failure_that_does_not_reproduce() -> None:
+    """Verify the agent is told what to do when local tests pass on a RED PR.
+
+    Without a branch for this case the agent invents one, which is how a PR
+    that passed locally on the first try was reported as three failed fixes.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert "reproduce" in content.lower()
 
 
 # --- max_attempts ---
@@ -322,6 +354,26 @@ def test_standalone_fix_creates_new_branch() -> None:
     inst = _get_instructions(standalone_fix=True)
     content = _section_content(inst, "workflow")
     assert "dependency-director/fix-" in content
+
+
+def test_standalone_fix_branch_placeholder_is_substitutable() -> None:
+    """Verify the fix branch uses the same placeholder as the source branch.
+
+    'fix-<pr-pr_number>' is not a placeholder the agent can fill in, so it
+    ends up in the branch name verbatim.
+    """
+    content = _section_content(_get_instructions(standalone_fix=True), "workflow")
+    assert "dependency-director/fix-<pr-number>" in content
+    assert "pr-pr_number" not in content
+
+
+def test_standalone_fix_names_the_pr_creation_tool() -> None:
+    """Verify the standalone strategy points at the tool that opens the PR.
+
+    Pushing a branch nobody opens a PR for leaves the fix invisible.
+    """
+    content = _section_content(_get_instructions(standalone_fix=True), "workflow")
+    assert "create_pr" in content
 
 
 # --- Flag interactions ---
@@ -706,3 +758,109 @@ def test_sandbox_workflow_uv_sync_first() -> None:
     inst = _get_instructions()
     workflow = _section_content(inst, "workflow")
     assert "uv sync" in workflow
+
+
+# --- Base branch health ---
+
+
+def test_workflow_checks_base_health_before_cloning() -> None:
+    """The base check must be instructed, and must come before the clone.
+
+    On fast-diff-mcp the model happened to run 'git checkout main && ruff check'
+    on its own, which is luck rather than behaviour. Nothing in the workflow
+    asked for it, so on another repo it may clone and grind through every PR
+    before noticing the base was already red.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert "get_branch_ci_status" in content
+    assert content.index("get_branch_ci_status") < content.index("Clone (if not already)")
+
+
+def test_workflow_reports_a_broken_base_once_not_per_pr() -> None:
+    """Five PRs blocked on one cause should be diagnosed once, then skipped."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "ONCE per distinct base_ref" in content
+    assert "do NOT re-check the same base" in content
+    assert "every remaining RED PR" in content
+
+
+def test_base_check_uses_the_prs_own_base_ref() -> None:
+    """The branch checked must be the one the PR targets, not the repo default.
+
+    'get_branch_ci_status' falls back to the default branch when no branch is
+    passed, so an instruction that omits the argument silently diagnoses the
+    wrong branch for any PR aimed at 'develop' or a release line.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    assert "base_ref" in content
+    assert "list_bot_prs" in content
+    assert content.index("get_branch_ci_status(owner, repo, branch)") < content.index("Clone (if not already)")
+
+
+def test_base_check_is_reused_per_base_not_across_unrelated_bases() -> None:
+    """Two PRs on different bases need two checks; two on one base need one."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "distinct base_ref" in content
+    assert "sharing that base" in content
+
+
+def test_base_fix_pr_targets_the_base_that_was_diagnosed() -> None:
+    """The fix must land on the branch that is actually broken.
+
+    Opening the fix against the repository default when the diagnosed base was
+    'develop' repairs a branch nobody reported as failing and leaves the
+    dependency PRs just as blocked.
+    """
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    assert "base_ref" in content
+
+
+def test_base_blame_requires_the_same_checks_to_be_failing() -> None:
+    """A red base does not excuse every red PR.
+
+    kweinmeister/voting-agent has a failing 'Deploy Frontend' job on main while
+    lint and tests pass. A PR that breaks lint there is the PR's own fault, so
+    blaming any RED PR on a merely-RED base would silently stop fixing them.
+    """
+    content = _section_content(_get_instructions(), "workflow")
+    lowered = content.lower()
+    assert "check names" in lowered
+    assert "also failing on the base" in lowered
+
+
+def test_pr_only_failures_are_still_fixed_when_the_base_is_red() -> None:
+    """The escape hatch: a check the PR fails but the base passes is the PR's."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "passing on the base" in content
+    assert "the PR introduced that failure" in content
+
+
+def test_base_fix_section_absent_by_default() -> None:
+    """Opening unrelated PRs is a surprise, so it must be opt-in."""
+    assert "fix_base_branch" not in _section_titles(_get_instructions())
+
+
+def test_base_fix_section_opens_a_separate_pr_against_the_base() -> None:
+    """A base fix must never land on a dependency branch.
+
+    Pushing repo-wide changes to 'dependabot/...' is bad review hygiene and
+    makes Dependabot stop managing the PR.
+    """
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    assert "create_pr" in content
+    assert "MUST NOT" in content
+    assert "dependency" in content.lower()
+
+
+def test_base_fix_scope_is_bounded_to_what_ci_fails_on() -> None:
+    """'Fix the base' must not become 'clean up the whole repo'."""
+    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    lowered = content.lower()
+    assert "only" in lowered
+    assert "unrelated" in lowered
+
+
+def test_base_fix_is_excluded_from_auto_merge() -> None:
+    """Merging the agent's own change to main is a bigger deal than a dep bump."""
+    content = _section_content(_get_instructions(fix_base=True, auto_merge=True), "fix_base_branch")
+    assert "MUST NOT merge" in content

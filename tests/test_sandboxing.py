@@ -1,8 +1,10 @@
 """Tests for command and filesystem sandboxing in dependency-director."""
 
 import contextlib
+import fnmatch
 import inspect
 import json
+import re
 import shlex
 import tempfile
 from pathlib import Path
@@ -12,14 +14,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.antigravity import LocalAgentConfig
 
-from dependency_director.config import DEFAULT_SRT_SETTINGS_PATH
+from dependency_director.argv import split_compound_argv
+from dependency_director.config import DEFAULT_CACHE_DIR, DEFAULT_SRT_SETTINGS_PATH, OutputLimits
 from dependency_director.tools import (
     CommandResult,
     SandboxedCommandRunner,
+    _format_command_result,
+    _truncate_middle,
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
-    split_compound_argv,
     validate_argv,
 )
 
@@ -658,43 +662,95 @@ async def test_sandbox_diagnostics_formatting(tmp_path: Path, async_fs: type[Asy
         assert "[Sandbox Diagnostic] Filesystem access failed with 'Permission denied'" not in output
 
 
+# Cache environment variable -> path relative to the cache base ("" means the base itself).
+CACHE_ENV_SUBPATHS = {
+    "BUN_INSTALL": "bun",
+    "CARGO_HOME": "cargo",
+    "COMPOSER_CACHE_DIR": "composer",
+    "DENO_DIR": "deno",
+    "DOTNET_CLI_HOME": "dotnet",
+    "GEM_HOME": "gems",
+    "GEM_PATH": "gems",
+    "GOMODCACHE": "go/pkg/mod",
+    "GRADLE_USER_HOME": "gradle",
+    "MIX_HOME": "mix",
+    "NPM_CONFIG_CACHE": "npm",
+    "NUGET_PACKAGES": "nuget",
+    "PIP_CACHE_DIR": "pip",
+    "PIPENV_CACHE_DIR": "pipenv",
+    "PNPM_HOME": "pnpm",
+    "POETRY_CACHE_DIR": "poetry",
+    "PUB_CACHE": "pub-cache",
+    "UV_CACHE_DIR": "uv",
+    "UV_PYTHON_INSTALL_DIR": "uv/python",
+    "UV_TOOL_DIR": "uv/tools",
+    "XDG_CACHE_HOME": "",
+    "YARN_CACHE_FOLDER": "yarn",
+}
+
+
+async def _capture_sandbox_exec(run_command: Any, command: str = "echo hello") -> Any:
+    """Run a command with the subprocess mocked out and return the mock's call."""
+    mock_process = AsyncMock()
+    mock_process.communicate.return_value = (b"", b"")
+    mock_process.returncode = 0
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+        await run_command(command)
+    mock_exec.assert_called_once()
+    return mock_exec.call_args
+
+
 @pytest.mark.asyncio
 async def test_sandbox_cache_env_overrides(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
-    """Verify cache environment variables can override defaults."""
+    """Verify cache environment variables point at the configured cache directory."""
+    workspace = str(tmp_path / "workspace")
+    cache_dir = str(tmp_path / "shared-cache")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), cache_dir=cache_dir)
+    env = (await _capture_sandbox_exec(run_command)).kwargs.get("env", {})
+    for var, subpath in CACHE_ENV_SUBPATHS.items():
+        expected = str(Path(cache_dir).joinpath(*subpath.split("/"))) if subpath else cache_dir
+        assert env.get(var) == expected, var
+
+
+@pytest.mark.asyncio
+async def test_sandbox_cache_dir_survives_workspace_cleanup(
+    tmp_path: Path,
+    async_fs: type[AsyncFSHelper],
+) -> None:
+    """Verify caches live outside the workspace, which is deleted before and after every repo."""
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     settings_file = tmp_path / "settings.json"
     settings_file.write_text('{"filesystem": {}}')
     run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
-    mock_process = AsyncMock()
-    mock_process.communicate.return_value = (b"", b"")
-    mock_process.returncode = 0
-    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
-        await run_command("echo hello")
-        mock_exec.assert_called_once()
-        kwargs = mock_exec.call_args.kwargs
-        env = kwargs.get("env", {})
-        cache_base = str(Path(workspace) / ".cache")
-        assert env.get("NPM_CONFIG_CACHE") == str(Path(cache_base) / "npm")
-        assert env.get("YARN_CACHE_FOLDER") == str(Path(cache_base) / "yarn")
-        assert env.get("PNPM_HOME") == str(Path(cache_base) / "pnpm")
-        assert env.get("BUN_INSTALL") == str(Path(cache_base) / "bun")
-        assert env.get("DENO_DIR") == str(Path(cache_base) / "deno")
-        assert env.get("PIP_CACHE_DIR") == str(Path(cache_base) / "pip")
-        assert env.get("UV_CACHE_DIR") == str(Path(cache_base) / "uv")
-        assert env.get("POETRY_CACHE_DIR") == str(Path(cache_base) / "poetry")
-        assert env.get("PIPENV_CACHE_DIR") == str(Path(cache_base) / "pipenv")
-        assert env.get("GOMODCACHE") == str(Path(cache_base) / "go" / "pkg" / "mod")
-        assert env.get("CARGO_HOME") == str(Path(cache_base) / "cargo")
-        assert env.get("GEM_HOME") == str(Path(cache_base) / "gems")
-        assert env.get("GEM_PATH") == str(Path(cache_base) / "gems")
-        assert env.get("COMPOSER_CACHE_DIR") == str(Path(cache_base) / "composer")
-        assert env.get("GRADLE_USER_HOME") == str(Path(cache_base) / "gradle")
-        assert env.get("NUGET_PACKAGES") == str(Path(cache_base) / "nuget")
-        assert env.get("DOTNET_CLI_HOME") == str(Path(cache_base) / "dotnet")
-        assert env.get("PUB_CACHE") == str(Path(cache_base) / "pub-cache")
-        assert env.get("MIX_HOME") == str(Path(cache_base) / "mix")
-        assert env.get("XDG_CACHE_HOME") == cache_base
+    env = (await _capture_sandbox_exec(run_command)).kwargs.get("env", {})
+    for var in CACHE_ENV_SUBPATHS:
+        value = env.get(var, "")
+        assert value.startswith(DEFAULT_CACHE_DIR), var
+        assert not value.startswith(workspace), var
+
+
+@pytest.mark.asyncio
+async def test_sandbox_cache_dir_is_created_and_granted_read_write(
+    tmp_path: Path,
+    async_fs: type[AsyncFSHelper],
+) -> None:
+    """Verify the shared cache directory exists and the sandbox may read and write it."""
+    workspace = str(tmp_path / "workspace")
+    cache_dir = str(tmp_path / "shared-cache")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), cache_dir=cache_dir)
+    assert await async_fs.exists(cache_dir)
+    args = (await _capture_sandbox_exec(run_command)).args
+    config_path = args[args.index("--settings") + 1]
+    filesystem = json.loads(await async_fs.read_text(config_path))["filesystem"]
+    assert cache_dir in filesystem["allowRead"]
+    assert cache_dir in filesystem["allowWrite"]
 
 
 @pytest.mark.asyncio
@@ -830,6 +886,43 @@ def test_validate_sandboxed_command_git_config() -> None:
     assert validate_argv(shlex.split("git status"), temp_dir) is None
 
 
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        "env LD_PRELOAD=evil.so git status",
+        "env DYLD_INSERT_LIBRARIES=evil.dylib git status",
+        "env GIT_SSH_COMMAND=evil git fetch origin",
+        "env GIT_CONFIG_PARAMETERS=core.sshcommand=evil git status",
+        "env -u PATH LD_PRELOAD=evil.so git status",
+        "/usr/bin/env LD_LIBRARY_PATH=/evil python3 -m pytest",
+    ],
+)
+def test_validate_argv_blocks_env_passed_variables(command_line: str) -> None:
+    """Verify blocked env vars are caught when passed through ``env`` too.
+
+    A bare ``LD_PRELOAD=x cmd`` was already rejected, but the same assignment
+    written as ``env LD_PRELOAD=x cmd`` reaches the process identically and
+    must be rejected on the same terms.
+    """
+    res = validate_argv(shlex.split(command_line), tempfile.gettempdir())
+    assert res is not None
+    assert "Security Error" in res
+
+
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        "env DATABASE_URL=sqlite:///:memory: pytest",
+        "env SECRET_KEY=dummy YOUTUBE_API_KEY=dummy uv run pytest",
+        "env GIT_TERMINAL_PROMPT=0 git fetch origin",
+        "env CI=true uv sync",
+    ],
+)
+def test_validate_argv_allows_ordinary_env_usage(command_line: str) -> None:
+    """Verify the env-var check does not block the form the agent is told to use."""
+    assert validate_argv(shlex.split(command_line), tempfile.gettempdir()) is None
+
+
 @pytest.mark.asyncio
 async def test_create_run_command_tool_agent_registration(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
     """Verify that create_run_command_tool successfully registers with the Agent config.
@@ -902,6 +995,48 @@ def test_srt_settings_policy_assertions() -> None:
     expected_exfil_patterns = ["*.ngrok.io", "*.pipedream.com", "*.webhook.site", "*.requestbin.com"]
     for pattern in expected_exfil_patterns:
         assert pattern in denied_domains, f"network.deniedDomains missing exfil pattern: {pattern}"
+
+
+@pytest.mark.parametrize(
+    ("host", "why"),
+    [
+        # Cargo's sparse protocol (default since Rust 1.70) resolves the index
+        # here, not at crates.io. Without it every `uv sync` for a project with
+        # a Rust extension fails before a single crate is downloaded.
+        ("index.crates.io", "cargo sparse registry index"),
+        ("static.crates.io", "cargo crate downloads"),
+        ("crates.io", "cargo registry API"),
+        # Dependabot's docker ecosystem bumps base-image tags; verifying such a
+        # PR means pulling the new image.
+        ("registry-1.docker.io", "docker hub registry API"),
+        ("auth.docker.io", "docker hub token auth"),
+        ("index.docker.io", "docker hub index"),
+        ("production.cloudflare.docker.com", "docker hub layer blobs"),
+        ("ghcr.io", "github container registry"),
+        ("pkg-containers.githubusercontent.com", "ghcr layer blobs"),
+        ("quay.io", "quay registry"),
+        ("mcr.microsoft.com", "microsoft container registry"),
+        ("public.ecr.aws", "aws public ecr"),
+        # Pre-existing entries, asserted so a future edit cannot silently drop
+        # them while reshaping the list.
+        ("pypi.org", "python package index"),
+        ("files.pythonhosted.org", "python wheel downloads"),
+        ("registry.npmjs.org", "npm registry"),
+        ("proxy.golang.org", "go module proxy"),
+        ("api.github.com", "github api"),
+    ],
+)
+def test_srt_settings_allows_package_registries(host: str, why: str) -> None:
+    """Verify each registry host the agent must reach is covered by the allowlist.
+
+    Matches with fnmatch so a wildcard entry counts, which is how a single
+    ``*.crates.io`` covers both the index and the download host.
+    """
+    with Path(DEFAULT_SRT_SETTINGS_PATH).open() as f:
+        config = json.load(f)
+
+    patterns = config.get("network", {}).get("allowedDomains", [])
+    assert any(fnmatch.fnmatch(host, p) for p in patterns), f"network.allowedDomains does not cover {host} ({why})"
 
 
 # --- Compound && / || support (TDD) ---
@@ -1064,3 +1199,108 @@ async def test_compound_runner_error_string_is_failure(tmp_path: Path, async_fs:
     assert "echo second" not in result  # second command output must not appear
     assert call_count == 1  # second command was never called
     assert call_args == [["echo", "first"]]
+
+
+# --- Command output caps ---
+
+
+def _lines(n: int, prefix: str = "line") -> bytes:
+    """Build n newline-separated numbered lines as bytes."""
+    return "\n".join(f"{prefix}{i}" for i in range(n)).encode()
+
+
+def test_command_output_under_the_cap_is_untouched() -> None:
+    """Verify short output passes through with no truncation marker."""
+    out = _format_command_result(_lines(10), b"", 0, OutputLimits(max_lines=200, max_chars=24000))
+    assert "line0" in out
+    assert "line9" in out
+    assert "omitted" not in out
+
+
+def test_command_output_line_cap_keeps_head_and_tail() -> None:
+    """Verify a long log is trimmed from the middle, not the end.
+
+    The head carries the command being run and the tail carries the failure;
+    a plain tail loses the former and a plain head loses the latter.
+    """
+    out = _format_command_result(_lines(1000), b"", 0, OutputLimits(max_lines=200, max_chars=0))
+    assert "line0" in out
+    assert "line999" in out
+    assert "line500" not in out
+    # 199 lines survive: the marker occupies the 200th against the cap.
+    assert "801 lines omitted" in out
+
+
+def test_command_output_char_cap_bounds_a_single_long_line() -> None:
+    """Verify one enormous line is capped, which the line cap alone cannot do."""
+    out = _format_command_result(b"x" * 100_000, b"", 0, OutputLimits(max_lines=200, max_chars=24_000))
+    stdout_section = out.split("--- STDOUT ---\n", 1)[1].split("\n--- STDERR ---", 1)[0]
+    assert len(stdout_section) <= 24_000
+    assert "characters omitted" in out
+
+
+@pytest.mark.parametrize("max_chars", [100, 1_000, 24_000])
+@pytest.mark.parametrize("size", [1_000, 100_000])
+def test_truncation_stays_within_the_char_cap(size: int, max_chars: int) -> None:
+    """Verify the cap bounds the result, marker included.
+
+    The marker and its newlines are part of what the model has to read, so a
+    budget spent entirely on head and tail before splicing the marker in
+    overshoots the cap the caller configured.
+    """
+    out = _truncate_middle("x" * size, OutputLimits(max_lines=0, max_chars=max_chars))
+    assert len(out) <= max_chars
+
+
+@pytest.mark.parametrize("max_lines", [3, 50, 200])
+def test_truncation_stays_within_the_line_cap(max_lines: int) -> None:
+    """Verify the marker line counts against the line cap rather than adding to it."""
+    text = "\n".join(f"line{i}" for i in range(1_000))
+    out = _truncate_middle(text, OutputLimits(max_lines=max_lines, max_chars=0))
+    assert len(out.splitlines()) <= max_lines
+
+
+def test_truncation_reports_how_much_it_actually_dropped() -> None:
+    """Verify the omitted count matches what is missing, so the agent can trust it."""
+    text = "\n".join(f"line{i}" for i in range(1_000))
+    out = _truncate_middle(text, OutputLimits(max_lines=100, max_chars=0))
+    kept = [line for line in out.splitlines() if "omitted" not in line]
+    match = re.search(r"\[(\d+) lines omitted\]", out)
+    assert match is not None
+    assert int(match.group(1)) == 1_000 - len(kept)
+
+
+@pytest.mark.parametrize(
+    ("limits", "marker_expected"),
+    [
+        (OutputLimits(max_lines=0, max_chars=0), False),
+        (OutputLimits(max_lines=0, max_chars=24_000), False),
+        (OutputLimits(max_lines=200, max_chars=0), True),
+    ],
+)
+def test_command_output_cap_of_zero_disables_it(limits: OutputLimits, *, marker_expected: bool) -> None:
+    """Verify a limit of 0 turns that cap off, so a user can opt out."""
+    out = _format_command_result(_lines(1000), b"", 0, limits)
+    assert ("omitted" in out) is marker_expected
+
+
+def test_command_output_truncation_preserves_sandbox_diagnostics() -> None:
+    """Verify a sandbox violation buried mid-output still raises its diagnostic.
+
+    The network-block marker appears wherever the failing request happened,
+    which for a long dependency install is nowhere near either end. Reading
+    diagnostics off the truncated text would hide exactly the failures the
+    agent most needs explained.
+    """
+    noisy = _lines(500, "before") + b"\nConnection blocked by network allowlist\n" + _lines(500, "after")
+    out = _format_command_result(noisy, b"", 1, OutputLimits(max_lines=50, max_chars=0))
+    assert "Connection blocked by network allowlist" not in out.split("[Sandbox Violation]")[0]
+    assert "[Sandbox Violation]" in out
+
+
+def test_command_output_caps_stdout_and_stderr_separately() -> None:
+    """Verify a flood on one stream cannot crowd the other out entirely."""
+    out = _format_command_result(_lines(1000, "out"), _lines(1000, "err"), 1, OutputLimits(max_lines=100, max_chars=0))
+    assert "out0" in out
+    assert "err0" in out
+    assert "err999" in out

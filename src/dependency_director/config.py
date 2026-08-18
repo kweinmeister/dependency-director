@@ -2,12 +2,15 @@
 
 import importlib.resources
 import shlex
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from google.antigravity.hooks import policy
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from dependency_director.argv import is_git_push_argv
 
 
 class BotConfig(BaseModel):
@@ -25,6 +28,89 @@ DEFAULT_BOTS: list[BotConfig] = [
     BotConfig(author="renovate[bot]", rebase_command="@renovatebot rebase"),
 ]
 DEFAULT_COMMAND_TIMEOUT = 300
+
+# Caps on the command output handed back to the model. A dependency install
+# can emit tens of thousands of lines whose middle says nothing; the head names
+# what ran and the tail carries the failure. Either cap may be set to 0 to
+# disable it.
+DEFAULT_MAX_OUTPUT_LINES = 200
+DEFAULT_MAX_OUTPUT_CHARS = 24000
+
+# Share of each cap spent on the head. The tail gets the rest, because that is
+# where errors land.
+OUTPUT_HEAD_FRACTION = 0.2
+
+
+class OutputLimits(NamedTuple):
+    """Caps applied to a single command's stdout and stderr.
+
+    Each cap applies per stream, so a command that floods both can return
+    twice ``max_chars`` in total. That is deliberate: halving the budget would
+    cost a stdout-only failure half its output to guard against a case that
+    only arises when both streams are already saturated.
+
+    Attributes:
+        max_lines: Maximum lines kept per stream; 0 disables the line cap.
+        max_chars: Maximum characters kept per stream; 0 disables the char cap.
+
+    """
+
+    max_lines: int = DEFAULT_MAX_OUTPUT_LINES
+    max_chars: int = DEFAULT_MAX_OUTPUT_CHARS
+
+
+DEFAULT_OUTPUT_LIMITS = OutputLimits()
+
+# Failed CI jobs whose logs are returned for a single PR. Several workflows can
+# fail on one commit, and they usually fail for the same underlying reason, so
+# a handful of tails is enough to diagnose without flooding the context window.
+DEFAULT_MAX_FAILED_JOBS = 3
+
+# Lines kept from the end of each failed job's log. Failures report at the
+# bottom; the setup output above it is noise.
+DEFAULT_WORKFLOW_LOG_TAIL_LINES = 50
+
+
+class LogLimits(NamedTuple):
+    """Caps applied to the CI logs fetched for one pull request.
+
+    Neither may be 0: a run that fetches logs and then returns none of them is
+    a wasted round trip, and 'no failures found' would be a lie.
+
+    Attributes:
+        max_failed_jobs: Failed jobs whose logs are returned; the rest are
+            counted and reported, never dropped silently.
+        tail_lines: Lines kept from the end of each job's log.
+
+    """
+
+    max_failed_jobs: int = DEFAULT_MAX_FAILED_JOBS
+    tail_lines: int = DEFAULT_WORKFLOW_LOG_TAIL_LINES
+
+
+DEFAULT_LOG_LIMITS = LogLimits()
+
+# Bounded retry for GitHub's rate limiters. A scan of a large owner issues
+# hundreds of requests, and GitHub answers a tripped limit with 429 or 403 plus
+# a Retry-After header. Waiting the requested pause is nearly always cheaper
+# than failing the repository, but only within limits: a run that sleeps
+# unboundedly is indistinguishable from one that has hung, so a wait longer
+# than the ceiling is reported instead of slept through.
+RATE_LIMIT_MAX_ATTEMPTS = 4
+RATE_LIMIT_BASE_DELAY_SECONDS = 1.0
+RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
+
+# Workflow run conclusions that cannot contain a failed job, so the run's jobs
+# are never fetched. Everything else — including an unset conclusion on a run
+# still in progress — is examined, since the per-job conclusion is the real
+# filter and an extra API call is cheaper than a missed failure.
+PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+
+# Shared package cache for every sandboxed command. It deliberately sits outside
+# the per-repo workspace, which is deleted before and after each repository —
+# a cache inside it would make every repo re-download every dependency.
+DEFAULT_CACHE_DIR: str = str(Path(tempfile.gettempdir()) / "dependency-director-cache")
+
 DEFAULT_SRT_SETTINGS_PATH: str = str(
     importlib.resources.files("dependency_director") / "srt-settings.json",
 )
@@ -131,6 +217,40 @@ class Settings(BaseSettings):
         default="gemini-3.7-flash",
         validation_alias="depdirector_model",
     )
+    max_output_lines: int = Field(
+        default=DEFAULT_MAX_OUTPUT_LINES,
+        ge=0,
+        validation_alias="depdirector_max_output_lines",
+    )
+    max_output_chars: int = Field(
+        default=DEFAULT_MAX_OUTPUT_CHARS,
+        ge=0,
+        validation_alias="depdirector_max_output_chars",
+    )
+    max_failed_jobs: int = Field(
+        default=DEFAULT_MAX_FAILED_JOBS,
+        ge=1,
+        validation_alias="depdirector_max_failed_jobs",
+    )
+    workflow_log_tail_lines: int = Field(
+        default=DEFAULT_WORKFLOW_LOG_TAIL_LINES,
+        ge=1,
+        validation_alias="depdirector_workflow_log_tail_lines",
+    )
+    cache_dir: str = Field(
+        default=DEFAULT_CACHE_DIR,
+        validation_alias="depdirector_cache_dir",
+    )
+
+    @property
+    def output_limits(self) -> OutputLimits:
+        """Return the configured command output caps."""
+        return OutputLimits(max_lines=self.max_output_lines, max_chars=self.max_output_chars)
+
+    @property
+    def log_limits(self) -> LogLimits:
+        """Return the configured CI-log caps."""
+        return LogLimits(max_failed_jobs=self.max_failed_jobs, tail_lines=self.workflow_log_tail_lines)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -157,13 +277,9 @@ def get_dry_run_policies() -> list[Any]:
         try:
             tokens = shlex.split(cmd_stripped)
         except ValueError:
+            # Unparseable quoting: fail closed rather than guess.
             return "git" in cmd_stripped and "push" in cmd_stripped
-        if not tokens:
-            return False
-        exe_name = Path(tokens[0]).name.lower()
-        if exe_name == "git":
-            return "push" in [t.lower() for t in tokens[1:]]
-        return False
+        return is_git_push_argv(tokens)
 
     return [
         policy.deny("run_command", when=is_git_push, name="dry_run_block_push"),
