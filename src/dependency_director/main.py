@@ -180,6 +180,15 @@ async def _render_agent_response(response: types.ChatResponse) -> None:
     _flush_text()
 
 
+def _agent_workspaces(workspace_tmp: str) -> list[str]:
+    """Return the only directories the agent's file tools may touch.
+
+    workspace_only() marks the file tools as workspace-bounded; the boundary
+    itself is the config's workspace list, so both have to be built from here.
+    """
+    return [str(SKILLS_PATH), workspace_tmp]
+
+
 async def _prepare_agent_environment(
     repo: str,
     settings: Settings,
@@ -200,8 +209,9 @@ async def _prepare_agent_environment(
 
     # srt only sandboxes run_command_sandboxed. The SDK's own view/edit/create
     # file tools bypass it, so under allow("*") they can reach any path on the
-    # host. Listing workspaces does not bound them; this policy does.
-    policies = [*policy.workspace_only([str(SKILLS_PATH), workspace_tmp]), *policies]
+    # host. This policy puts them under workspace containment, which the
+    # harness enforces against the config's workspace list.
+    policies = [*policy.workspace_only(_agent_workspaces(workspace_tmp)), *policies]
 
     if settings.no_sandbox:
         run_command = None
@@ -324,7 +334,7 @@ async def run_agent_for_repo(
             # skill, not PROJECT_ROOT: our checkout holds this project's source
             # and the .env our template puts there, and the skill is loaded via
             # skills_paths regardless.
-            workspaces=[skills_path, workspace_tmp],
+            workspaces=_agent_workspaces(workspace_tmp),
             capabilities=types.CapabilitiesConfig(
                 enable_subagents=False,
                 disabled_tools=[types.BuiltinTools.RUN_COMMAND],
