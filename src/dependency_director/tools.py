@@ -18,6 +18,7 @@ from typing import Any, NamedTuple, cast
 import httpx
 
 from dependency_director.argv import (
+    is_forced_git_push_argv,
     resolve_exe,
     split_compound_argv,
 )
@@ -48,6 +49,7 @@ from dependency_director.schemas import (
     CommitStatusResponse,
     CommitSummary,
     FileContents,
+    OpenPrSummary,
     PatchedFile,
     PrStatus,
     PullRequest,
@@ -56,6 +58,7 @@ from dependency_director.schemas import (
     WorkflowRun,
     WorkflowRunsResponse,
     json_payload,
+    json_payload_list,
     summarize_checks,
 )
 
@@ -128,6 +131,51 @@ def _is_rate_limited(response: httpx.Response) -> bool:
     if response.status_code != HTTPStatus.FORBIDDEN:
         return False
     return "retry-after" in response.headers or response.headers.get("x-ratelimit-remaining") == "0"
+
+
+def _github_error_detail(response: httpx.Response) -> str:
+    """Summarize GitHub's own explanation of a refusal, or '' when it gave none.
+
+    GitHub puts the actionable part of a 4xx in the body: 'message' names the
+    class of problem and 'errors' names the specific one. A 422 on the pulls
+    endpoint means 'a pull request already exists', 'no commits between', or
+    an invalid head, and the status code alone distinguishes none of them.
+    """
+    try:
+        payload = response.json()
+    except (ValueError, httpx.ResponseNotRead):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    parts: list[str] = []
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        parts.append(message)
+
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for error in errors:
+            detail = error.get("message") or error.get("code") if isinstance(error, dict) else error
+            if isinstance(detail, str) and detail:
+                parts.append(detail)
+    return " — ".join(parts)
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """Raise on a 4xx/5xx, folding GitHub's explanation into the message.
+
+    Re-raises the same exception type so callers that branch on
+    ``exc.response.status_code`` keep working; only the message grows.
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = _github_error_detail(response)
+        if not detail:
+            raise
+        msg = f"{exc}\nGitHub said: {detail}"
+        raise httpx.HTTPStatusError(msg, request=exc.request, response=response) from exc
 
 
 def _validate_repo_params(owner: str, repo: str) -> None:
@@ -249,7 +297,7 @@ class GitHubClient:
             send = functools.partial(self.client.request, method, url, **kwargs)
 
         response = await self._send_with_backoff(send)
-        response.raise_for_status()
+        _raise_for_status(response)
         return response
 
     async def _get(
@@ -371,6 +419,32 @@ class GitHubClient:
             json_data={"title": title, "head": head, "base": base, "body": body},
         )
         return cast("dict[str, Any]", response.json())
+
+    async def find_open_pr_for_head(
+        self,
+        owner: str,
+        repo: str,
+        head_branch: str,
+    ) -> PullRequest | None:
+        """Return the open pull request whose head is ``head_branch``, if any.
+
+        GitHub permits only one open pull request per head branch, so this
+        answers the question a duplicate 'create' would otherwise answer with
+        an unexplained 422. A branch name may arrive already qualified as
+        'owner:branch'; a git ref cannot contain a colon, so the last segment
+        is the branch either way.
+        """
+        branch = head_branch.split(":")[-1]
+        response = await self._get(
+            "pulls",
+            owner,
+            repo,
+            params={"head": f"{owner}:{branch}", "state": "open"},
+        )
+        data = response.json()
+        if not isinstance(data, list) or not data:
+            return None
+        return PullRequest.model_validate(data[0])
 
     async def get_default_branch(self, owner: str, repo: str) -> str:
         """Fetch the repository's default branch, falling back to ``main``."""
@@ -755,6 +829,7 @@ class AgentTools(NamedTuple):
     """
 
     create_pr: ToolFn
+    find_open_pr_for_branch: ToolFn
     get_branch_ci_status: ToolFn
     get_commit_details: ToolFn
     get_file_contents: ToolFn
@@ -876,22 +951,79 @@ def _make_create_pr(client: GitHubClient, *, dry_run: bool) -> ToolFn:
 
         """
         _validate_repo_params(owner, repo)
+
+        # A branch that already carries a PR is the normal state of a second
+        # run over a fix that has not merged yet. Reporting that PR is the
+        # correct outcome; asking GitHub to open a duplicate only earns a 422.
+        existing = await client.find_open_pr_for_head(owner, repo, head_branch)
+        if existing is not None:
+            return _existing_pr_message(owner, repo, head_branch, existing)
+
         base = base_branch or await client.get_default_branch(owner, repo)
 
         if dry_run:
             return f"[DRY-RUN] Would have opened a PR '{title}' from {head_branch} into {base} in {owner}/{repo}."
 
-        result = await client.create_pull_request(
-            owner,
-            repo,
-            title=title,
-            head=head_branch,
-            base=base,
-            body=body,
-        )
+        try:
+            result = await client.create_pull_request(
+                owner,
+                repo,
+                title=title,
+                head=head_branch,
+                base=base,
+                body=body,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != HTTPStatus.UNPROCESSABLE_ENTITY:
+                raise
+            # The pre-check can lose a race, and 422 covers several unrelated
+            # causes, so re-ask before blaming anything on a duplicate.
+            raced = await client.find_open_pr_for_head(owner, repo, head_branch)
+            if raced is not None:
+                return _existing_pr_message(owner, repo, head_branch, raced)
+            return f"GitHub refused (422) to open a PR from {head_branch} into {base} in {owner}/{repo}: {exc}"
         return f"Opened PR #{result.get('number')} in {owner}/{repo}: {result.get('html_url', '')}"
 
     return create_pr
+
+
+def _existing_pr_message(owner: str, repo: str, head_branch: str, pr: PullRequest) -> str:
+    """Describe the pull request a branch already carries, and what not to do to it."""
+    return (
+        f"PR #{pr.number} is already open for {head_branch} in {owner}/{repo}: {pr.html_url}. "
+        "No new PR was opened. That branch already carries the fix and is waiting on "
+        "review — do NOT rebuild, re-push, or force-push it."
+    )
+
+
+def _make_find_open_pr_for_branch(client: GitHubClient) -> ToolFn:
+    async def find_open_pr_for_branch(owner: str, repo: str, branch: str) -> str:
+        """Report whether a branch already has an open pull request.
+
+        Call this before rebuilding any branch whose name this agent derives
+        rather than reads — a base fix branch above all. An open PR from an
+        earlier run means the work is done and awaiting review, so redoing it
+        wastes a clone and overwrites the branch under review.
+
+        Args:
+            owner: The owner of the repository.
+            repo: The repository name.
+            branch: The head branch to look up, without an 'owner:' prefix.
+
+        """
+        found = await client.find_open_pr_for_head(owner, repo, branch)
+        if found is None:
+            return f"No open pull request has '{branch}' as its head branch in {owner}/{repo}."
+        return json_payload(
+            OpenPrSummary(
+                number=found.number,
+                title=found.title,
+                html_url=found.html_url,
+                base_ref=found.base.ref,
+            ),
+        )
+
+    return find_open_pr_for_branch
 
 
 def _make_wait_for_reviews(client: GitHubClient, review_wait: int) -> ToolFn:
@@ -1245,7 +1377,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
         additions count, and deletions count for each file.
         """
         files = await client.get_pr_files(owner, repo, pr_number)
-        return json.dumps([f.model_dump() for f in files], indent=2)
+        return json_payload_list(files)
 
     async def get_file_contents(
         owner: str,
@@ -1286,7 +1418,7 @@ def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
 
         """
         commits = await client.list_commits(owner, repo, sha, per_page)
-        return json.dumps([c.model_dump() for c in commits], indent=2)
+        return json_payload_list(commits)
 
     async def get_commit_details(owner: str, repo: str, sha: str) -> str:
         """Get details of a specific commit including changed files and patches.
@@ -1339,6 +1471,7 @@ def create_agent_tools(
 
     return AgentTools(
         create_pr=_make_create_pr(client, dry_run=dry_run),
+        find_open_pr_for_branch=_make_find_open_pr_for_branch(client),
         get_branch_ci_status=_make_get_branch_ci_status(client),
         get_commit_details=legacy.get_commit_details,
         get_file_contents=legacy.get_file_contents,
@@ -1453,73 +1586,92 @@ def _check_blocked_executables(exe_name: str) -> str | None:
     return None
 
 
-def _check_rm_command(tokens: list[str], idx: int, workspace_dir: str, operators: set[str]) -> str | None:
+def _check_rm_command(tokens: list[str], idx: int, workspace_dir: str) -> str | None:
+    """Return an error if 'rm' names a path outside the workspace."""
     for j in range(idx + 1, len(tokens)):
-        arg = tokens[j]
-        if arg in operators:
-            break
-        err = _validate_target_path(arg, workspace_dir, "Command 'rm'")
+        err = _validate_target_path(tokens[j], workspace_dir, "Command 'rm'")
         if err:
             return err
     return None
 
 
-def _check_git_config_subcommand(
-    tokens: list[str],
-    idx: int,
-    operators: set[str],
-    blocked_config_prefixes: tuple[str, ...],
-) -> str | None:
+# git options that hand control of the transport or the repository location
+# to the caller. Matched against the token's pre-'=' half, so both the
+# '--opt=value' and '--opt value' spellings are covered.
+BLOCKED_GIT_OPTIONS = (
+    "--config-env",
+    "--git-dir",
+    "--receive-pack",
+    "--upload-pack",
+)
+
+# Configuration keys that turn a git invocation into arbitrary execution, a
+# credential leak, or a request to somewhere other than the intended remote.
+# Matched as prefixes, so 'url.' covers every 'url.<base>.insteadOf'.
+BLOCKED_GIT_CONFIG_PREFIXES = (
+    "core.hookspath",
+    "core.sshcommand",
+    "credential.helper",
+    "http.proxy",
+    "https.proxy",
+    "protocol.ext.allow",
+    "remote.",
+    "url.",
+)
+
+# 'git config' flags that take a separate value, which must not be mistaken
+# for the key being set.
+_GIT_CONFIG_FLAGS_WITH_ARG = ("-f", "--file", "--blob", "--type", "--default")
+
+
+def _blocked_config_key(key: str) -> str | None:
+    """Return the blocked prefix ``key`` falls under, or None if it is allowed."""
+    normalized = key.split("=", 1)[0].strip().lower()
+    return next(
+        (prefix for prefix in BLOCKED_GIT_CONFIG_PREFIXES if normalized.startswith(prefix)),
+        None,
+    )
+
+
+def _check_git_config_subcommand(tokens: list[str], idx: int) -> str | None:
+    """Return an error if 'git config' sets one of the blocked keys."""
     skip_next = False
-    for k in range(idx + 1, len(tokens)):
-        config_token = tokens[k]
-        if config_token in operators:
-            break
+    for config_token in tokens[idx + 1 :]:
         if skip_next:
             skip_next = False
             continue
-        if config_token in (
-            "-f",
-            "--file",
-            "--blob",
-            "--type",
-            "--default",
-        ):
+        if config_token in _GIT_CONFIG_FLAGS_WITH_ARG:
             skip_next = True
             continue
         if config_token.startswith("-"):
             continue
-        key = config_token.split("=", 1)[0].strip().lower()
-        for prefix in blocked_config_prefixes:
-            if key.startswith(prefix) or key == prefix:
-                return f"Security Error: Git configuration key '{prefix}' is blocked."
+        prefix = _blocked_config_key(config_token)
+        if prefix:
+            return f"Security Error: Git configuration key '{prefix}' is blocked."
         break
     return None
 
 
-def _check_git_command(tokens: list[str], idx: int, operators: set[str]) -> str | None:
-    blocked_git_options = ("--config-env", "--git-dir")
-    for tok in tokens[idx + 1 :]:
-        if tok.split("=", 1)[0].lower() in blocked_git_options:
-            return f"Security Error: Git option '{tok.split('=', 1)[0]}' is blocked."
+def _check_git_command(tokens: list[str], idx: int) -> str | None:
+    """Return an error if a git invocation sets a blocked option or config key.
 
-    blocked_config_prefixes = (
-        "credential.helper",
-        "core.hookspath",
-        "core.sshcommand",
-        "url.",
-        "http.proxy",
-        "https.proxy",
-    )
+    Covers both routes to the same capability: an option on the git command
+    itself, and a configuration key set either with '-c' or by the 'config'
+    subcommand. They are checked together because a key blocked on one route
+    and allowed on the other is not blocked at all.
+    """
+    for tok in tokens[idx + 1 :]:
+        option = tok.split("=", 1)[0].lower()
+        if option in BLOCKED_GIT_OPTIONS:
+            return f"Security Error: Git option '{option}' is blocked."
+
     for j, tok in enumerate(tokens[idx + 1 :], start=idx + 1):
         if tok in ("-c", "--config") and j + 1 < len(tokens):
-            config_expr = tokens[j + 1]
-            key = config_expr.split("=", 1)[0].strip().lower()
-            for prefix in blocked_config_prefixes:
-                if key.startswith(prefix) or key == prefix:
-                    return f"Security Error: Git configuration key '{prefix}' is blocked."
+            prefix = _blocked_config_key(tokens[j + 1])
+            if prefix:
+                return f"Security Error: Git configuration key '{prefix}' is blocked."
         elif tok == "config":
-            err = _check_git_config_subcommand(tokens, j, operators, blocked_config_prefixes)
+            err = _check_git_config_subcommand(tokens, j)
             if err:
                 return err
     return None
@@ -1584,25 +1736,17 @@ def _check_exec_pivots(exe_name: str, argv: list[str], exe_idx: int) -> str | No
     return None
 
 
-def _check_git_extended(argv: list[str], exe_idx: int) -> str | None:
-    """Additional git hardening: block --upload-pack/--receive-pack and extra config prefixes."""
-    blocked_git_flags = {"--upload-pack", "--receive-pack"}
-    for tok in argv[exe_idx + 1 :]:
-        flag = tok.split("=", 1)[0].lower()
-        if flag in blocked_git_flags:
-            return f"Security Error: Git flag '{flag}' is blocked."
-
-    blocked_config_prefixes_extra = (
-        "protocol.ext.allow",
-        "remote.",
+def _check_git_force_push(argv: list[str]) -> str | None:
+    """Refuse a forced push: it discards commits nobody agreed to lose."""
+    if not is_forced_git_push_argv(argv):
+        return None
+    return (
+        "Security Error: Forced push is blocked. It overwrites whatever the remote "
+        "branch already carried, including commits a reviewer or an earlier run "
+        "pushed there. Push without forcing; if the remote rejects that as "
+        "non-fast-forward, the branch already holds work you must not discard — "
+        "call 'find_open_pr_for_branch' and reconcile instead."
     )
-    for j, tok in enumerate(argv[exe_idx + 1 :], start=exe_idx + 1):
-        if tok in ("-c", "--config") and j + 1 < len(argv):
-            config_key = argv[j + 1].split("=", 1)[0].strip().lower()
-            for prefix in blocked_config_prefixes_extra:
-                if config_key.startswith(prefix):
-                    return f"Security Error: Git config '{prefix}' is blocked."
-    return None
 
 
 def _check_per_exe(exe: CheckedExe, argv: list[str], workspace_dir: str) -> str | None:
@@ -1611,9 +1755,9 @@ def _check_per_exe(exe: CheckedExe, argv: list[str], workspace_dir: str) -> str 
     if err:
         return err
     if exe.name == "rm":
-        return _check_rm_command(argv, exe.idx, workspace_dir, set())
+        return _check_rm_command(argv, exe.idx, workspace_dir)
     if exe.name == "git":
-        return _check_git_command(argv, exe.idx, set()) or _check_git_extended(argv, exe.idx)
+        return _check_git_command(argv, exe.idx) or _check_git_force_push(argv)
     return None
 
 

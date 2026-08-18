@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import hashlib
 import logging
+import re
 import shutil
 import sys
 import tempfile
@@ -39,6 +40,10 @@ from dependency_director.tools import (
 )
 
 MAX_ARGS_DISPLAY_LEN = 80
+
+# The glyphs the agent is told to open a per-PR status line with. A line
+# starting with one is a log entry, not prose, and belongs on its own line.
+STATUS_GLYPHS = ("✓", "⚠", "✗", "⏭", "→", "✅", "❌")
 
 # The hosts a target may name. Everything we do runs against api.github.com,
 # so a target pointing anywhere else is a mistake, not a destination.
@@ -146,13 +151,82 @@ class _SdkIssueCollector(logging.Handler):
         self.messages.append(record.getMessage())
 
 
+def _preserve_status_line_breaks(text: str) -> str:
+    """End each status log line with a markdown hard break so it keeps its own line.
+
+    Markdown reads a lone newline as a soft break, so the agent's per-PR
+    outcomes ('⚠ #51 not fixed: ...') arrive as one run-on paragraph. Two
+    trailing spaces make the break hard without touching prose, tables, or the
+    contents of a fenced block, where trailing whitespace would be content.
+    """
+    lines = text.split("\n")
+    in_fence = False
+    for index, line in enumerate(lines[:-1]):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not stripped.startswith(STATUS_GLYPHS) or line.endswith("  "):
+            continue
+        lines[index] = line + "  "
+    return "\n".join(lines)
+
+
+# A tool refused by a safety policy comes back as an ordinary text chunk
+# reading "Denied by policy 'name'." — usually with the harness's own restating
+# of it in parentheses, which holds no nested parens of its own. Anchored at the
+# start only: a sentence that merely quotes a denial stays prose, while a denial
+# the model's next sentence ran into is still recognised.
+_POLICY_DENIAL_RE = re.compile(r"Denied by policy '(?P<name>[^']+)'\.[ \t]*(\([^)]*\))?")
+
+
+def _split_policy_denial(text: str) -> tuple[str | None, str]:
+    """Split a leading policy refusal off ``text``, returning it and the remainder.
+
+    The refusal is a plain text chunk, so whatever the model says next joins it
+    in the same flush whenever no tool call falls between them. Taking only the
+    leading match keeps that trailing output instead of discarding it with the
+    denial.
+    """
+    leading = text.lstrip()
+    match = _POLICY_DENIAL_RE.match(leading)
+    if not match:
+        return None, text
+    return match.group("name"), leading[match.end() :]
+
+
+class ToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]
+    """Print the tool errors the SDK would otherwise only pass to the model.
+
+    Holds no per-run state — the repository is not part of the message — so
+    one class serves every run rather than being rebuilt inside each.
+    """
+
+    async def run(self, context: hooks.HookContext | None, data: Exception) -> None:
+        """Report the failure to the console, ignoring the hook context."""
+        _ = context
+        console.print(f"  [tool.fail]Tool error: {data!r}[/tool.fail]")
+
+    async def __call__(self, error: Exception) -> None:
+        """Accept the bare-callable form the SDK also invokes hooks through."""
+        await self.run(None, error)
+
+
 async def _render_agent_response(response: types.ChatResponse) -> None:
     text_buffer: list[str] = []
 
     def _flush_text() -> None:
-        if text_buffer:
-            console.print(Markdown("".join(text_buffer)))
-            text_buffer.clear()
+        if not text_buffer:
+            return
+        text = "".join(text_buffer)
+        text_buffer.clear()
+        # A refusal is an outcome of the tool call above it, so it reads as one
+        # of those lines rather than as the model having said something.
+        policy, text = _split_policy_denial(text)
+        if policy:
+            console.print(f"  ⏭ [tool.args]blocked by policy '{policy}'[/tool.args]")
+        if text.strip():
+            console.print(Markdown(_preserve_status_line_breaks(text)))
 
     async for chunk in response.chunks:
         match chunk:
@@ -310,28 +384,21 @@ async def run_agent_for_repo(
             no_sandbox=settings.no_sandbox,
         )
 
-        class RepoToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]
-            async def run(self, context: hooks.HookContext | None, data: Exception) -> None:
-                _ = context
-                console.print(f"  [tool.fail]Tool error: {data!r}[/tool.fail]")
-
-            async def __call__(self, error: Exception) -> None:
-                await self.run(None, error)
-
         skills_path = str(SKILLS_PATH)
 
         agent_tools: list[Any] = [*tools]
         if run_command is not None:
             agent_tools.append(run_command)
 
+        effective_model = model or settings.model
         config = LocalAgentConfig(
-            model=model or settings.model,
+            model=effective_model,
             vertex=settings.vertex or None,
             project=(settings.google_cloud_project or None) if settings.vertex else None,
             location=(settings.google_cloud_location or None) if settings.vertex else None,
             system_instructions=system_instructions,
             policies=policies,
-            hooks=[RepoToolErrorHook()],
+            hooks=[ToolErrorHook()],
             tools=agent_tools,
             skills_paths=[skills_path],
             # Workspaces are what file tools may touch. Grant the clone and the
@@ -345,7 +412,6 @@ async def run_agent_for_repo(
             ),
         )
 
-        effective_model = model or settings.model
         mode_str = "Vertex AI" if settings.vertex else "Developer API"
         click.secho(
             f"🚀 Spawning Agent for {repo} [model: {effective_model} | mode: {mode_str}]...",
@@ -493,6 +559,21 @@ async def run_agent(
             fg="yellow",
         )
 
+    # Built once: the single-repo and per-owner paths must not be able to
+    # disagree about what a run means, which is what two copies invite.
+    repo_kwargs: dict[str, Any] = {
+        "dry_run": dry_run,
+        "auto_merge": auto_merge,
+        "verify_all": verify_all,
+        "standalone_fix": standalone_fix,
+        "fix_base": fix_base,
+        "review_wait": review_wait,
+        "hint": hint,
+    }
+    # Absent rather than None, so run_agent_for_repo's own default applies.
+    if model is not None:
+        repo_kwargs["model"] = model
+
     if repo:
         click.secho(
             f"📦 Restricting triage run to repository: {repo}",
@@ -500,18 +581,6 @@ async def run_agent(
             bold=True,
         )
         await _validate_repo_accessibility(repo, settings.github_token)
-
-        repo_kwargs: dict[str, Any] = {
-            "dry_run": dry_run,
-            "auto_merge": auto_merge,
-            "verify_all": verify_all,
-            "standalone_fix": standalone_fix,
-            "fix_base": fix_base,
-            "review_wait": review_wait,
-            "hint": hint,
-        }
-        if model is not None:
-            repo_kwargs["model"] = model
 
         await run_agent_for_repo(
             repo,
@@ -549,23 +618,11 @@ async def run_agent(
             async with semaphore:
                 click.secho(f"▶️  Starting processing for repository: {r}", fg="yellow")
                 try:
-                    r_kwargs: dict[str, Any] = {
-                        "dry_run": dry_run,
-                        "auto_merge": auto_merge,
-                        "verify_all": verify_all,
-                        "standalone_fix": standalone_fix,
-                        "fix_base": fix_base,
-                        "review_wait": review_wait,
-                        "hint": hint,
-                    }
-                    if model is not None:
-                        r_kwargs["model"] = model
-
                     await run_agent_for_repo(
                         r,
                         settings,
                         max_attempts,
-                        **r_kwargs,
+                        **repo_kwargs,
                     )
                     click.secho(
                         f"✅ Finished processing for repository: {r}",
