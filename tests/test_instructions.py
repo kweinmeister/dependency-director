@@ -32,7 +32,7 @@ def instructions() -> types.TemplatedSystemInstructions:
 def _section_content(inst: types.TemplatedSystemInstructions, title: str) -> str:
     for s in inst.sections:
         if s.title == title:
-            return str(s.content)
+            return s.content
     return ""
 
 

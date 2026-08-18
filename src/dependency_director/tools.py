@@ -461,7 +461,7 @@ class GitHubClient:
             repo,
             follow_redirects=True,
         )
-        return str(response.text)
+        return response.text
 
     async def list_open_prs(
         self,
@@ -497,7 +497,7 @@ class GitHubClient:
             repo,
             headers={"Accept": "application/vnd.github.v3.diff"},
         )
-        return str(response.text)
+        return response.text
 
     async def get_pr_files(
         self,
