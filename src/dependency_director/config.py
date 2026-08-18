@@ -74,13 +74,14 @@ DEFAULT_WORKFLOW_LOG_TAIL_LINES = 50
 class LogLimits(NamedTuple):
     """Caps applied to the CI logs fetched for one pull request.
 
+    Neither may be 0: a run that fetches logs and then returns none of them is
+    a wasted round trip, and 'no failures found' would be a lie.
+
     Attributes:
         max_failed_jobs: Failed jobs whose logs are returned; the rest are
             counted and reported, never dropped silently.
         tail_lines: Lines kept from the end of each job's log.
 
-    Neither may be 0: a run that fetches logs and then returns none of them is
-    a wasted round trip, and 'no failures found' would be a lie.
     """
 
     max_failed_jobs: int = DEFAULT_MAX_FAILED_JOBS

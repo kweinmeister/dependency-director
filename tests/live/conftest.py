@@ -46,7 +46,7 @@ def scenario_repo(tmp_path: Path) -> BuiltRepo:
 
 @pytest.fixture
 def live_settings() -> Settings:
-    """Settings for a live run, inheriting real model credentials from env."""
+    """Build settings for a live run, inheriting real model credentials from env."""
     return Settings()
 
 

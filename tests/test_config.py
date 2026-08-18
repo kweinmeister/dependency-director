@@ -751,6 +751,22 @@ async def _empty_chunks() -> AsyncGenerator[types.Text]:
     yield types.Text(text="", step_index=0)
 
 
+def _chat_that_logs(logger: logging.Logger, message: str, *args: object) -> AsyncMock:
+    """Build a chat stub whose turn logs one warning and renders nothing.
+
+    The %-style args are forwarded unformatted, so the stub exercises the same
+    lazy-interpolation path the SDK's own records take.
+    """
+
+    async def chat(_prompt: str) -> MagicMock:
+        logger.warning(message, *args)
+        response = MagicMock()
+        response.chunks = _empty_chunks()
+        return response
+
+    return AsyncMock(side_effect=chat)
+
+
 @pytest.mark.asyncio
 async def test_run_agent_for_repo_reports_a_clean_turn_as_completed(
     mock_agent_class: MagicMock,
@@ -786,17 +802,12 @@ async def test_run_agent_for_repo_surfaces_errors_the_sdk_only_logged(
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
 
-    async def _chat_that_logs_a_system_error(_prompt: str) -> MagicMock:
-        logging.getLogger().warning(
-            "System step error (HTTP %s): %s",
-            0,
-            "Detected a loop in the model's output.",
-        )
-        response = MagicMock()
-        response.chunks = _empty_chunks()
-        return response
-
-    mock_agent_class.return_value.chat = AsyncMock(side_effect=_chat_that_logs_a_system_error)
+    mock_agent_class.return_value.chat = _chat_that_logs(
+        logging.getLogger(),
+        "System step error (HTTP %s): %s",
+        0,
+        "Detected a loop in the model's output.",
+    )
     await run_agent_for_repo(
         repo="test-owner/test-repo",
         settings=settings,
@@ -819,13 +830,10 @@ async def test_run_agent_for_repo_ignores_its_own_log_records(
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
 
-    async def _chat_that_triggers_our_own_warning(_prompt: str) -> MagicMock:
-        logging.getLogger("dependency_director.main").warning("A warning we emitted ourselves")
-        response = MagicMock()
-        response.chunks = _empty_chunks()
-        return response
-
-    mock_agent_class.return_value.chat = AsyncMock(side_effect=_chat_that_triggers_our_own_warning)
+    mock_agent_class.return_value.chat = _chat_that_logs(
+        logging.getLogger("dependency_director.main"),
+        "A warning we emitted ourselves",
+    )
     await run_agent_for_repo(
         repo="test-owner/test-repo",
         settings=settings,
