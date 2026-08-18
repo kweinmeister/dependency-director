@@ -40,6 +40,10 @@ from dependency_director.tools import (
 
 MAX_ARGS_DISPLAY_LEN = 80
 
+# The hosts a target may name. Everything we do runs against api.github.com,
+# so a target pointing anywhere else is a mistake, not a destination.
+GITHUB_HOSTS = frozenset({"github.com", "www.github.com"})
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SKILLS_PATH = PROJECT_ROOT / ".agents" / "skills"
 
@@ -639,22 +643,39 @@ def _check_sandbox_requirements(*, verify_all: bool, no_sandbox: bool) -> None:
         )
 
 
+def _require_github_host(host: str, target: str) -> None:
+    """Reject a target that names a host we do not talk to.
+
+    Only the path is ever read out of a target, and it is then looked up on
+    api.github.com. Without this a clone URL for another forge, or a lookalike
+    host, would quietly resolve to whatever github.com carries at that path.
+    """
+    if host.lower() not in GITHUB_HOSTS:
+        msg = f"Invalid target '{target}'. Only {', '.join(sorted(GITHUB_HOSTS))} targets are supported."
+        raise click.UsageError(msg)
+
+
 def _parse_target_string(s: str, target: str) -> tuple[str, str | None]:
     """Parse a cleaned target string into (owner, full_repo | None).
 
     Handles SSH (git@), URL (https://), bare github.com/, and plain owner/repo formats.
+    A trailing slash is tolerated on the host-qualified forms only.
     Raises click.UsageError on invalid input.
     """
     if "git@" in s and ":" in s:
         # e.g., git@github.com:owner/repo
-        _, path = s.split(":", 1)
-        target_path = path
+        location, _, path = s.partition(":")
+        _require_github_host(location.rpartition("@")[2], target)
+        target_path = path.rstrip("/")
     elif "://" in s:
-        # e.g., https://github.com/owner/repo
+        # e.g., https://github.com/owner/repo. Read the host off the parse, not
+        # the raw string: in https://github.com@evil.com/o/r it is the userinfo.
         parsed = urlparse(s)
-        target_path = parsed.path.lstrip("/")
-    elif s.startswith("github.com/"):
-        target_path = s[len("github.com/") :]
+        _require_github_host(parsed.hostname or "", target)
+        target_path = parsed.path.strip("/")
+    elif (host := s.partition("/")[0]).lower() in GITHUB_HOSTS:
+        # e.g., github.com/owner/repo
+        target_path = s[len(host) :].strip("/")
     else:
         target_path = s
 
@@ -688,14 +709,10 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
         )
         raise click.UsageError(msg)
 
-    # Clean target string (remove .git suffix)
+    # Clean target string (remove .git suffix). Trailing slashes are left to
+    # the parser: they are noise on a URL, but 'owner/' is a malformed repo.
     s = target.strip()
     s = s.removesuffix(".git")
-
-    # Normalize trailing slash for URL-like formats only
-    is_url = "://" in s or "git@" in s or s.startswith("github.com/")
-    if is_url:
-        s = s.rstrip("/")
 
     return _parse_target_string(s, target)
 

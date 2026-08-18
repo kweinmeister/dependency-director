@@ -131,6 +131,11 @@ def test_cli_target_owner_only(mock_run_agent: MagicMock) -> None:
         ("http://github.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
         ("git@github.com:test-owner/some-repo.git", "test-owner", "test-owner/some-repo"),
         ("github.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("https://www.github.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        # Hostnames are case-insensitive, in every form we accept one.
+        ("https://GitHub.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("git@GitHub.com:test-owner/some-repo", "test-owner", "test-owner/some-repo"),
+        ("GitHub.com/test-owner/some-repo", "test-owner", "test-owner/some-repo"),
         ("test-owner/some-repo", "test-owner", "test-owner/some-repo"),
         ("https://github.com/test-owner", "test-owner", None),
         ("https://github.com/test-owner/", "test-owner", None),
@@ -178,6 +183,10 @@ def test_cli_target_formats(
         "owner/",
         "https://github.com/",
         "https://github.com/owner/repo/extra",
+        # A bare host names no owner; it used to be read as an org called
+        # "github.com" and scanned.
+        "github.com",
+        "github.com/",
         "",
     ],
 )
@@ -199,6 +208,43 @@ def test_cli_invalid_target_formats_rejected(
         result = runner.invoke(cli, [invalid_target] if invalid_target else [])
 
         assert result.exit_code != 0
+        mock_run_agent.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "foreign_target",
+    [
+        "https://evil.com/test-owner/some-repo",
+        "http://github.com.evil.com/test-owner/some-repo",
+        # github.com is the userinfo here; the host is evil.com.
+        "https://github.com@evil.com/test-owner/some-repo",
+        "git@gitlab.com:test-owner/some-repo",
+    ],
+)
+@patch("dependency_director.main.run_agent", new_callable=AsyncMock)
+def test_cli_rejects_targets_hosted_elsewhere(
+    mock_run_agent: MagicMock,
+    foreign_target: str,
+) -> None:
+    """A URL naming another host must be refused, not resolved against GitHub anyway.
+
+    Only the path was ever read out of these, so a GitLab clone URL or a
+    lookalike host silently operated on whatever github.com/<same-path>
+    happened to be — a different repo than the one that was asked for.
+    """
+    runner = CliRunner()
+    with patch("dependency_director.main.Settings") as mock_settings_cls:
+        mock_settings = mock_settings_cls.return_value
+        mock_settings.concurrency = 1
+        mock_settings.max_fix_attempts = 3
+        mock_settings.review_wait = 0
+        mock_settings.no_sandbox = False
+        mock_settings.owner = None
+
+        result = runner.invoke(cli, [foreign_target])
+
+        assert result.exit_code != 0
+        assert "github.com" in result.output
         mock_run_agent.assert_not_called()
 
 
