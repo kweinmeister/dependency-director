@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from dependency_director.main import cli
+from dependency_director.main import GITHUB_HOSTS, cli
 
 
 @pytest.fixture(autouse=True)
@@ -244,7 +244,8 @@ def test_cli_rejects_targets_hosted_elsewhere(
         result = runner.invoke(cli, [foreign_target])
 
         assert result.exit_code != 0
-        assert "github.com" in result.output
+        # Say which hosts would have worked, rather than just "invalid".
+        assert all(host in result.output for host in GITHUB_HOSTS)
         mock_run_agent.assert_not_called()
 
 
