@@ -33,7 +33,13 @@
       "*.pipedream.com",
       "*.webhook.site",
       "*.requestbin.com"
-    ]
+    ],
+    "deniedDomainReasons": {
+      "*.ngrok.io": "Tunneling and reverse-proxy services are denied in the sandbox.",
+      "*.pipedream.com": "Data exfiltration endpoints are denied in the sandbox.",
+      "*.webhook.site": "Data exfiltration endpoints are denied in the sandbox.",
+      "*.requestbin.com": "Data exfiltration endpoints are denied in the sandbox."
+    }
   },
   "filesystem": {
     "denyRead": ["~"],
@@ -82,6 +88,9 @@
     "allowWrite": ["/tmp"],
     "denyWrite": [".env", ".git/hooks"],
     "allowGitConfig": false
+  },
+  "git": {
+    "safeDirectories": []
   },
   "enableWeakerNetworkIsolation": false
 }
