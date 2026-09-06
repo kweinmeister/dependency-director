@@ -115,7 +115,7 @@ async def test_sandbox_tmpfile_write_allowed(async_fs: type[AsyncFSHelper]) -> N
         workspace = str(Path(td) / "workspace")
         await async_fs.mkdir(workspace)
         run_command = create_run_command_tool(workspace)
-        cmd = 'python3 -c "import tempfile; f = tempfile.NamedTemporaryFile(delete=False); f.write(b\'tmp-ok\'); f.close(); print(f.name)"'
+        cmd = "python3 -c \"import tempfile; f = tempfile.NamedTemporaryFile(delete=False); f.write(b'tmp-ok'); f.close(); print(f.name)\""
         output = await run_command(cmd)
         assert "Permission denied" not in output
         assert "Operation not permitted" not in output

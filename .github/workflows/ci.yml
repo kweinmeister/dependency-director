@@ -30,7 +30,9 @@ jobs:
         with:
           python-version-file: "pyproject.toml"
       - name: Run ruff check
-        run: uv run ruff check src
+        run: uv run ruff check src tests
+      - name: Run ruff format check
+        run: uv run ruff format --check src tests
       - name: Run ty check
         run: uv run ty check src
 
