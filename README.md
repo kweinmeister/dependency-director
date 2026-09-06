@@ -306,7 +306,7 @@ file. A template is provided in [`.env.template`](.env.template).
 | `DEPDIRECTOR_MAX_FIX_ATTEMPTS`  | Maximum iterative fix-and-test attempts per failing PR.                                     | `3`                                                                       |
 | `DEPDIRECTOR_MAX_OUTPUT_CHARS`  | Characters kept per stream from each command's output (0 = unlimited).                      | `24000`                                                                   |
 | `DEPDIRECTOR_MAX_OUTPUT_LINES`  | Lines kept per stream from each command's output; the middle is dropped (0 = unlimited).    | `200`                                                                     |
-| `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.7-flash`).                                  | `gemini-3.7-flash`                                                        |
+| `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.8-flash`).                                  | `gemini-3.8-flash`                                                        |
 | `DEPDIRECTOR_NO_SANDBOX`        | Set to `true` to disable sandbox-runtime (srt) sandboxing.                                  | `false`                                                                   |
 | `DEPDIRECTOR_OWNER`             | Default GitHub user or organization to scan (can be overridden by CLI argument).            | _(Optional)_                                                              |
 | `DEPDIRECTOR_REVIEW_WAIT`       | Minutes to poll for review bot comments after pushing a fix (0 = disabled).                 | `0`                                                                       |
