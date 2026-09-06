@@ -1909,6 +1909,37 @@ def _setup_cache_env(cache_dir: str, env: dict[str, str]) -> None:
     env["YARN_CACHE_FOLDER"] = str(cache_base / "yarn")
 
 
+def _setup_tmp_env(workspace_dir: str, env: dict[str, str]) -> Path:
+    """Configure temporary directory environment variables inside the workspace.
+
+    Sets CLAUDE_CODE_TMPDIR (and CLAUDE_TMPDIR), as well as standard POSIX and
+    Windows environment variables (TEMP, TMP), to a dedicated .tmp directory
+    inside the workspace. srt automatically injects CLAUDE_CODE_TMPDIR as the
+    sandboxed child's TMPDIR, ensuring test runners (like pytest's pytest-of-<user>)
+    and compilers write strictly within the sandbox's allowed boundaries.
+
+    Keeps the parent srt process's TMPDIR bounded to a short standard system
+    temp directory (e.g. tempfile.gettempdir() or /tmp) to prevent srt's internal
+    Unix domain socket (srt-mux-*.sock) from exceeding POSIX sockaddr_un sun_path
+    limits (104 bytes on macOS/BSD, 108 bytes on Linux) when running inside
+    deeply nested workspace paths.
+    """
+    sandbox_tmp = Path(workspace_dir) / ".tmp"
+    sandbox_tmp.mkdir(parents=True, exist_ok=True)
+    tmp_path_str = str(sandbox_tmp)
+    env["CLAUDE_CODE_TMPDIR"] = tmp_path_str
+    env["CLAUDE_TMPDIR"] = tmp_path_str
+    env["TEMP"] = tmp_path_str
+    env["TMP"] = tmp_path_str
+
+    # Ensure the parent srt process uses a short standard system temp directory
+    # to avoid POSIX socket length limits (e.g. sockaddr_un sun_path 104-108 bytes)
+    # in deeply nested workspaces, while sandboxed children receive CLAUDE_CODE_TMPDIR.
+    system_tmp = tempfile.gettempdir()
+    env["TMPDIR"] = system_tmp if len(system_tmp) < 50 else "/tmp"
+    return sandbox_tmp
+
+
 def _is_git_command_argv(argv: list[str]) -> bool:
     """Check if the first executable in an argv list is git."""
     for token in argv:
@@ -2041,6 +2072,7 @@ class SandboxedCommandRunner:
         """Execute a single (non-compound) argv array through srt."""
         env = {k: v for k, v in os.environ.items() if k in SAFE_ENV_ALLOWLIST}
         _setup_cache_env(self.cfg.cache_dir, env)
+        _setup_tmp_env(self.cfg.workspace_dir, env)
 
         is_git_command = _is_git_command_argv(argv)
 
@@ -2123,6 +2155,7 @@ def create_run_command_tool(
 
     # The cache outlives the workspace, so it may already exist from an earlier repo.
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    (Path(workspace_dir) / ".tmp").mkdir(parents=True, exist_ok=True)
 
     base_path = srt_settings_path or DEFAULT_SRT_SETTINGS_PATH
     try:
@@ -2139,6 +2172,11 @@ def create_run_command_tool(
                 allow_write.append(path)
             if path not in allow_read:
                 allow_read.append(path)
+
+        git_config = srt_config.setdefault("git", {})
+        safe_dirs = git_config.setdefault("safeDirectories", [])
+        if workspace_dir not in safe_dirs:
+            safe_dirs.append(workspace_dir)
 
         with tempfile.NamedTemporaryFile(
             suffix=".json",

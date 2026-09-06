@@ -120,6 +120,8 @@ SAFE_ENV_ALLOWLIST: set[str] = {
     "CC",
     "CFLAGS",
     "CI",
+    "CLAUDE_CODE_TMPDIR",
+    "CLAUDE_TMPDIR",
     "CONDA_PREFIX",
     "CXX",
     "CXXFLAGS",

@@ -20,6 +20,7 @@ from dependency_director.tools import (
     CommandResult,
     SandboxedCommandRunner,
     _format_command_result,
+    _setup_tmp_env,
     _truncate_middle,
     create_run_command_tool,
     is_ripgrep_available,
@@ -104,6 +105,25 @@ async def test_sandbox_workspace_write_allowed(tmp_path: Path, async_fs: type[As
     assert "Operation not permitted" not in output
     assert await async_fs.exists(target_file)
     assert (await async_fs.read_text(target_file)).strip() == "valid patch content"
+
+
+@requires_srt
+@pytest.mark.asyncio
+async def test_sandbox_tmpfile_write_allowed(async_fs: type[AsyncFSHelper]) -> None:
+    """Verify that Python's tempfile module can create temporary files inside the isolated TMPDIR."""
+    with tempfile.TemporaryDirectory() as td:
+        workspace = str(Path(td) / "workspace")
+        await async_fs.mkdir(workspace)
+        run_command = create_run_command_tool(workspace)
+        cmd = 'python3 -c "import tempfile; f = tempfile.NamedTemporaryFile(delete=False); f.write(b\'tmp-ok\'); f.close(); print(f.name)"'
+        output = await run_command(cmd)
+        assert "Permission denied" not in output
+        assert "Operation not permitted" not in output
+        created_file = get_stdout(output)
+        expected_prefix = str(Path(workspace) / ".tmp")
+        assert created_file.startswith(expected_prefix)
+        assert await async_fs.exists(created_file)
+        assert (await async_fs.read_text(created_file)).strip() == "tmp-ok"
 
 
 @requires_srt
@@ -738,6 +758,65 @@ async def test_sandbox_cache_env_overrides(tmp_path: Path, async_fs: type[AsyncF
     for var, subpath in CACHE_ENV_SUBPATHS.items():
         expected = str(Path(cache_dir).joinpath(*subpath.split("/"))) if subpath else cache_dir
         assert env.get(var) == expected, var
+
+
+def test_setup_tmp_env_unit(tmp_path: Path) -> None:
+    """Verify _setup_tmp_env creates .tmp and sets CLAUDE_CODE_TMPDIR, TEMP, and TMP."""
+    workspace = str(tmp_path / "workspace")
+    env: dict[str, str] = {"TMPDIR": "/var/folders/host_leak"}
+    created_tmp = _setup_tmp_env(workspace, env)
+    expected_tmp = str(tmp_path / "workspace" / ".tmp")
+    assert str(created_tmp) == expected_tmp
+    assert Path(expected_tmp).is_dir()
+    assert env["CLAUDE_CODE_TMPDIR"] == expected_tmp
+    assert env["CLAUDE_TMPDIR"] == expected_tmp
+    assert env["TEMP"] == expected_tmp
+    assert env["TMP"] == expected_tmp
+    assert env["TMPDIR"] != "/var/folders/host_leak"
+    assert len(env["TMPDIR"]) < 50
+
+
+@pytest.mark.asyncio
+async def test_sandbox_tmp_env_overrides_host_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    async_fs: type[AsyncFSHelper],
+) -> None:
+    """Verify CLAUDE_CODE_TMPDIR points to workspace .tmp and TMPDIR is kept safe."""
+    monkeypatch.setenv("TMPDIR", "/var/folders/host_leak")
+    monkeypatch.setenv("TEMP", "/var/folders/host_leak")
+    monkeypatch.setenv("TMP", "/var/folders/host_leak")
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
+    env = (await _capture_sandbox_exec(run_command)).kwargs.get("env", {})
+    expected_tmp = str(Path(workspace) / ".tmp")
+    assert env.get("CLAUDE_CODE_TMPDIR") == expected_tmp
+    assert env.get("CLAUDE_TMPDIR") == expected_tmp
+    assert env.get("TEMP") == expected_tmp
+    assert env.get("TMP") == expected_tmp
+    assert env.get("TMPDIR") != "/var/folders/host_leak"
+    assert len(env.get("TMPDIR", "")) < 50
+    assert await async_fs.exists(expected_tmp)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_tmp_env_self_healing(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
+    """Verify .tmp is automatically recreated on command execution if deleted."""
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"filesystem": {}}')
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
+    tmp_dir = Path(workspace) / ".tmp"
+    assert tmp_dir.is_dir()
+    # Simulate a command deleting .tmp (e.g. rm -rf or clean)
+    tmp_dir.rmdir()
+    assert not tmp_dir.exists()
+    await _capture_sandbox_exec(run_command)
+    assert tmp_dir.is_dir()
 
 
 @pytest.mark.asyncio
