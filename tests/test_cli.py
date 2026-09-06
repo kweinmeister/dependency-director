@@ -71,7 +71,7 @@ def test_cli_model_option(mock_run_agent: MagicMock) -> None:
         mock_settings.max_fix_attempts = 3
         mock_settings.review_wait = 0
         mock_settings.no_sandbox = False
-        mock_settings.model = "gemini-3.7-flash"
+        mock_settings.model = "gemini-3.8-flash"
 
         result = runner.invoke(cli, ["test-owner/some-repo", "--model", "gemini-3.6-pro"])
 
