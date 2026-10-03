@@ -842,6 +842,12 @@ def test_base_health_is_checked_before_logs_are_pulled() -> None:
     assert content.index("get_branch_ci_status") < content.index("get_pr_workflow_run_logs")
 
 
+def test_base_health_check_handles_pending_and_none() -> None:
+    """Base check instructs agent to continue when base is GREEN, PENDING, or NONE."""
+    content = _section_content(_get_instructions(), "workflow")
+    assert "If the base is GREEN, PENDING, or NONE, the failure belongs to the PR: continue." in content
+
+
 def test_logs_are_read_once_per_distinct_failure() -> None:
     """PRs failing the identical check must not each cost a full log read.
 

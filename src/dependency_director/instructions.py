@@ -67,7 +67,7 @@ def get_system_instructions(
         "tool then falls back to the repository default, which is the wrong branch for any PR "
         "targeting elsewhere. Call it ONCE per distinct base_ref and reuse that one result for "
         "every RED PR sharing that base — do NOT re-check the same base per PR. "
-        "If the base is GREEN, the failure belongs to the PR: continue. "
+        "If the base is GREEN, PENDING, or NONE, the failure belongs to the PR: continue. "
         "If it reports ci_status='RED', compare check names: a base failure only excuses "
         "the PR for the same check. If every check failing on the PR is also failing on "
         f"the base, {base_red_action} "
