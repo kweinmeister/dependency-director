@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx as httpx_mod
@@ -15,6 +16,7 @@ from dependency_director.tools import (
     GitHubNotFoundError,
     ToolFn,
     _check_ci,
+    _make_get_branch_ci_status,
     create_agent_tools,
 )
 
@@ -174,7 +176,13 @@ async def test_github_client_get_job_logs_redirect_handling(github_token: str) -
 @pytest.fixture
 def tools(mock_client: MagicMock) -> AgentTools:
     """Fixture to set up write tools for status checking tests."""
-    return create_agent_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
+    return create_agent_tools(
+        client=mock_client,
+        bots=DEFAULT_BOTS,
+        dry_run=False,
+        review_wait=0,
+        branch_ci_delays=(),
+    )
 
 
 @pytest.fixture
@@ -814,6 +822,120 @@ async def test_tool_get_branch_ci_status_reports_which_checks_failed(
     assert result["ci_status"] == "RED"
     failed = [c["name"] for c in result["checks"] if c["conclusion"] == "failure"]
     assert failed == ["lint"]
+
+
+async def _invoke_branch_ci_twice_with_sleep_mock(
+    mock_client: MagicMock,
+    check_runs_returns: list[Any] | Any,
+    delays: list[float],
+) -> tuple[dict[str, Any], dict[str, Any], AsyncMock]:
+    """Invoke get_branch_ci_status twice under a sleep patch and return results and mock."""
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    if isinstance(check_runs_returns, list):
+        mock_client.get_commit_check_runs = AsyncMock(side_effect=check_runs_returns)
+    else:
+        mock_client.get_commit_check_runs = AsyncMock(return_value=check_runs_returns)
+    with patch("dependency_director.tools.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        tool = _make_get_branch_ci_status(mock_client, delays=delays)
+        first = json.loads(await tool("owner", "repo", "main"))
+        second = json.loads(await tool("owner", "repo", "main"))
+    return first, second, mock_sleep
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_polls_pending_until_settled(
+    mock_client: MagicMock,
+) -> None:
+    """Verify get_branch_ci_status polls when checks are pending and caches settled result."""
+    check_runs = [
+        {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]},
+        {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]},
+    ]
+    first, second, mock_sleep = await _invoke_branch_ci_twice_with_sleep_mock(
+        mock_client,
+        check_runs,
+        delays=[0.1, 0.2],
+    )
+
+    assert first["ci_status"] == "GREEN"
+    assert second["ci_status"] == "GREEN"
+    mock_sleep.assert_awaited_once_with(0.1)
+    # 2 calls during polling on the first invocation, 0 on the second
+    assert mock_client.get_commit_check_runs.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_does_not_cache_pending_on_timeout(
+    mock_client: MagicMock,
+) -> None:
+    """Verify get_branch_ci_status does not cache PENDING status when polling times out."""
+    check_runs = {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]}
+    first, second, mock_sleep = await _invoke_branch_ci_twice_with_sleep_mock(
+        mock_client,
+        check_runs,
+        delays=[0.1],
+    )
+
+    assert first["ci_status"] == "PENDING"
+    assert second["ci_status"] == "PENDING"
+    assert mock_sleep.await_count == 2
+    # 2 calls per invocation (1 initial + 1 retry) = 4 total calls
+    assert mock_client.get_commit_check_runs.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_coalesces_in_flight_requests(
+    mock_client: MagicMock,
+) -> None:
+    """Coalesce simultaneous requests for the same branch into a single in-flight task."""
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+    mock_client.get_commit_check_runs = AsyncMock(
+        side_effect=[
+            {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]},
+            {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]},
+        ],
+    )
+    with patch("dependency_director.tools.asyncio.sleep", new_callable=AsyncMock):
+        tool = _make_get_branch_ci_status(mock_client, delays=[0.1])
+        res1, res2 = await asyncio.gather(
+            tool("owner", "repo", "main"),
+            tool("owner", "repo", "main"),
+        )
+
+    assert json.loads(res1)["ci_status"] == "GREEN"
+    assert json.loads(res2)["ci_status"] == "GREEN"
+    # Exactly one polling loop ran despite two concurrent calls
+    assert mock_client.get_commit_check_runs.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_get_branch_ci_status_runs_different_branches_concurrently(
+    mock_client: MagicMock,
+) -> None:
+    """Execute status queries on different branches concurrently without blocking."""
+    mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
+
+    async def mock_check_runs(_owner: str, _repo: str, ref: str) -> dict[str, Any]:
+        return {
+            "check_runs": [
+                {
+                    "name": f"ci-{ref}",
+                    "status": "completed",
+                    "conclusion": "success" if ref == "main" else "failure",
+                }
+            ]
+        }
+
+    mock_client.get_commit_check_runs = AsyncMock(side_effect=mock_check_runs)
+    tool = _make_get_branch_ci_status(mock_client)
+
+    res_main, res_dev = await asyncio.gather(
+        tool("owner", "repo", "main"),
+        tool("owner", "repo", "dev"),
+    )
+
+    assert json.loads(res_main)["ci_status"] == "GREEN"
+    assert json.loads(res_dev)["ci_status"] == "RED"
 
 
 # --- The base branch the agent is told about must be the PR's own ---

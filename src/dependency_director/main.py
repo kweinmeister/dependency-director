@@ -10,7 +10,7 @@ import sys
 import tempfile
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlparse
 
 import click
@@ -177,7 +177,13 @@ def _preserve_status_line_breaks(text: str) -> str:
 # of it in parentheses, which holds no nested parens of its own. Anchored at the
 # start only: a sentence that merely quotes a denial stays prose, while a denial
 # the model's next sentence ran into is still recognised.
+POLICY_WORKSPACE_ONLY: Final[str] = "workspace_only"
 _POLICY_DENIAL_RE = re.compile(r"Denied by policy '(?P<name>[^']+)'\.[ \t]*(\([^)]*\))?")
+_WORKSPACE_DENIAL_RE = re.compile(
+    r"Access to path (?:\"[^\"]+\"|\S+) is denied\.\s*"
+    r"It is outside the allowed workspace directories:\s*\[[^\]]*\]\s*"
+    r"(?:\([^)]*\))?"
+)
 
 
 def _split_policy_denial(text: str) -> tuple[str | None, str]:
@@ -190,9 +196,12 @@ def _split_policy_denial(text: str) -> tuple[str | None, str]:
     """
     leading = text.lstrip()
     match = _POLICY_DENIAL_RE.match(leading)
-    if not match:
-        return None, text
-    return match.group("name"), leading[match.end() :]
+    if match:
+        return match.group("name"), leading[match.end() :]
+    ws_match = _WORKSPACE_DENIAL_RE.match(leading)
+    if ws_match:
+        return POLICY_WORKSPACE_ONLY, leading[ws_match.end() :]
+    return None, text
 
 
 class ToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]
@@ -210,6 +219,25 @@ class ToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]
     async def __call__(self, error: Exception) -> None:
         """Accept the bare-callable form the SDK also invokes hooks through."""
         await self.run(None, error)
+
+
+def _normalize_tool_arg(val: Any) -> Any:
+    """Normalize tool argument values for display, converting whole-number floats to ints."""
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    if isinstance(val, list):
+        return [_normalize_tool_arg(item) for item in val]
+    if isinstance(val, dict):
+        return {k: _normalize_tool_arg(v) for k, v in val.items()}
+    return val
+
+
+def _format_tool_args(args: dict[str, Any], max_len: int = MAX_ARGS_DISPLAY_LEN) -> str:
+    """Format tool argument dict for console display, normalizing whole floats to ints."""
+    args_str = ", ".join(f"{k}={_normalize_tool_arg(v)!r}" for k, v in args.items())
+    if len(args_str) > max_len:
+        return args_str[: max_len - 3] + "..."
+    return args_str
 
 
 async def _render_agent_response(response: types.ChatResponse) -> None:
@@ -241,9 +269,7 @@ async def _render_agent_response(response: types.ChatResponse) -> None:
                 text_buffer.append(text)
             case types.ToolCall(name=name, args=args):
                 _flush_text()
-                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                if len(args_str) > MAX_ARGS_DISPLAY_LEN:
-                    args_str = args_str[: MAX_ARGS_DISPLAY_LEN - 3] + "..."
+                args_str = _format_tool_args(args)
                 console.print(
                     f"  🔧 [tool.name]{name}[/tool.name]([tool.args]{args_str}[/tool.args])",
                 )

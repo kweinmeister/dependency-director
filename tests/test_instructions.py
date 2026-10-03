@@ -25,18 +25,35 @@ def _get_instructions(
 
 @pytest.fixture
 def instructions() -> types.TemplatedSystemInstructions:
-    """Fixture to return a default templated system instructions object for testing."""
+    """Return a default templated system instructions object for testing."""
     return _get_instructions()
 
 
+@pytest.fixture
+def no_sandbox_instructions() -> types.TemplatedSystemInstructions:
+    """Return system instructions configured for no-sandbox mode."""
+    return _get_instructions(no_sandbox=True)
+
+
+@pytest.fixture
+def fix_base_instructions() -> types.TemplatedSystemInstructions:
+    """Return system instructions configured with base branch fixing enabled."""
+    return _get_instructions(fix_base=True)
+
+
+@pytest.fixture
+def standalone_fix_instructions() -> types.TemplatedSystemInstructions:
+    """Return system instructions configured with standalone fix PR strategy."""
+    return _get_instructions(standalone_fix=True)
+
+
 def _section_content(inst: types.TemplatedSystemInstructions, title: str) -> str:
-    for s in inst.sections:
-        if s.title == title:
-            return s.content
-    return ""
+    """Return content of the first section matching title, or empty string."""
+    return next((s.content for s in inst.sections if s.title == title), "")
 
 
 def _section_titles(inst: types.TemplatedSystemInstructions) -> set[str]:
+    """Return the set of section titles present in instructions."""
     return {s.title for s in inst.sections}
 
 
@@ -187,13 +204,15 @@ def test_output_format_reports_attempts_actually_made(
     assert "actually made" in content.lower()
 
 
-def test_workflow_handles_a_failure_that_does_not_reproduce() -> None:
+def test_workflow_handles_a_failure_that_does_not_reproduce(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify the agent is told what to do when local tests pass on a RED PR.
 
     Without a branch for this case the agent invents one, which is how a PR
     that passed locally on the first try was reported as three failed fixes.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert "reproduce" in content.lower()
 
 
@@ -210,30 +229,31 @@ def test_max_attempts_appears_in_workflow(value: int) -> None:
 # --- identity ---
 
 
-def test_identity_is_generic() -> None:
+def test_identity_is_generic(instructions: types.TemplatedSystemInstructions) -> None:
     """Verify that the agent identity is generic and does not contain repo-specific info."""
-    inst = get_system_instructions(max_attempts=3)
-    assert inst.identity is not None
-    assert "dependency-director" in inst.identity
-    assert "autonomous" in inst.identity
+    assert instructions.identity is not None
+    assert "dependency-director" in instructions.identity
+    assert "autonomous" in instructions.identity
 
 
 # --- workspace_dir in prompt (not system instructions) ---
 
 
-def test_workspace_dir_uses_placeholder() -> None:
+def test_workspace_dir_uses_placeholder(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify that sandbox workflow references <workspace_dir> placeholder instead of a specific path."""
-    inst = get_system_instructions(max_attempts=3)
-    workflow = _section_content(inst, "workflow")
-    guardrails = _section_content(inst, "guardrails")
+    workflow = _section_content(instructions, "workflow")
+    guardrails = _section_content(instructions, "guardrails")
     assert "<workspace_dir>" in workflow
     assert "workspace directory" in guardrails
 
 
-def test_workspace_dir_not_hardcoded() -> None:
+def test_workspace_dir_not_hardcoded(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify no hardcoded temp paths appear in system instructions."""
-    inst = get_system_instructions(max_attempts=3)
-    all_content = " ".join(_section_content(inst, s.title) for s in inst.sections)
+    all_content = " ".join(_section_content(instructions, s.title) for s in instructions.sections)
     assert "/tmp/" not in all_content
     assert "dependency-director-" not in all_content
 
@@ -334,45 +354,52 @@ def test_review_wait_content() -> None:
 # --- Fix strategy ---
 
 
-def test_default_pushes_to_original_branch() -> None:
+def test_default_pushes_to_original_branch(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify instructions command pushing fixes back to the original branch by default."""
-    inst = _get_instructions(standalone_fix=False)
-    content = _section_content(inst, "workflow")
+    content = _section_content(instructions, "workflow")
     assert "directly" in content.lower()
     assert "dependency-director/fix-" not in content
 
 
-def test_default_includes_merge_from_main() -> None:
+def test_default_includes_merge_from_main(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify instructions command merging main branch before attempting fixes by default."""
-    inst = _get_instructions(standalone_fix=False)
-    content = _section_content(inst, "workflow")
+    content = _section_content(instructions, "workflow")
     assert "git merge origin/main" in content
 
 
-def test_standalone_fix_creates_new_branch() -> None:
+def test_standalone_fix_creates_new_branch(
+    standalone_fix_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify instructions specify creating a new branch when standalone-fix is active."""
-    inst = _get_instructions(standalone_fix=True)
-    content = _section_content(inst, "workflow")
+    content = _section_content(standalone_fix_instructions, "workflow")
     assert "dependency-director/fix-" in content
 
 
-def test_standalone_fix_branch_placeholder_is_substitutable() -> None:
+def test_standalone_fix_branch_placeholder_is_substitutable(
+    standalone_fix_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify the fix branch uses the same placeholder as the source branch.
 
     'fix-<pr-pr_number>' is not a placeholder the agent can fill in, so it
     ends up in the branch name verbatim.
     """
-    content = _section_content(_get_instructions(standalone_fix=True), "workflow")
+    content = _section_content(standalone_fix_instructions, "workflow")
     assert "dependency-director/fix-<pr-number>" in content
     assert "pr-pr_number" not in content
 
 
-def test_standalone_fix_names_the_pr_creation_tool() -> None:
+def test_standalone_fix_names_the_pr_creation_tool(
+    standalone_fix_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify the standalone strategy points at the tool that opens the PR.
 
     Pushing a branch nobody opens a PR for leaves the fix invisible.
     """
-    content = _section_content(_get_instructions(standalone_fix=True), "workflow")
+    content = _section_content(standalone_fix_instructions, "workflow")
     assert "create_pr" in content
 
 
@@ -447,70 +474,58 @@ def test_custom_bots_in_instructions() -> None:
     assert "dependabot[bot]" not in content
 
 
-def test_no_sandbox_instructions() -> None:
+def test_no_sandbox_instructions(
+    no_sandbox_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Verify instructions explicitly flag that sandboxing is disabled when configured."""
-    inst = get_system_instructions(
-        max_attempts=3,
-        no_sandbox=True,
-    )
-    guardrails = _section_content(inst, "guardrails")
+    guardrails = _section_content(no_sandbox_instructions, "guardrails")
     assert "NO-SANDBOX mode" in guardrails
     assert "MUST NOT clone repositories" in guardrails
 
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(no_sandbox_instructions, "workflow")
     assert "Do NOT clone" in workflow
     assert "cannot be fixed in non-sandboxed mode" in workflow
 
 
-def test_no_sandbox_instructions_no_shell_access() -> None:
+def test_no_sandbox_instructions_no_shell_access(
+    no_sandbox_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """No-sandbox guardrails must state that no shell access is available."""
-    inst = get_system_instructions(
-        max_attempts=3,
-        no_sandbox=True,
-    )
-    guardrails = _section_content(inst, "guardrails")
+    guardrails = _section_content(no_sandbox_instructions, "guardrails")
     assert "No shell access" in guardrails
 
 
-def test_no_sandbox_instructions_no_run_command_reference() -> None:
+def test_no_sandbox_instructions_no_run_command_reference(
+    no_sandbox_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """No-sandbox instructions must NOT reference run_command_sandboxed since the tool is not registered."""
-    inst = get_system_instructions(
-        max_attempts=3,
-        no_sandbox=True,
-    )
-    all_content = " ".join(_section_content(inst, s.title) for s in inst.sections)
+    all_content = " ".join(_section_content(no_sandbox_instructions, s.title) for s in no_sandbox_instructions.sections)
     assert "run_command_sandboxed" not in all_content
 
 
-def test_sandbox_instructions_reference_run_command() -> None:
+def test_sandbox_instructions_reference_run_command(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Sandbox mode instructions MUST reference run_command_sandboxed since the tool IS registered."""
-    inst = get_system_instructions(
-        max_attempts=3,
-        no_sandbox=False,
-    )
-    guardrails = _section_content(inst, "guardrails")
+    guardrails = _section_content(instructions, "guardrails")
     assert "run_command_sandboxed" in guardrails
 
 
-def test_no_sandbox_workflow_skips_red_prs() -> None:
+def test_no_sandbox_workflow_skips_red_prs(
+    no_sandbox_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """No-sandbox workflow must skip RED PRs (no local fix attempts)."""
-    inst = get_system_instructions(
-        max_attempts=3,
-        no_sandbox=True,
-    )
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(no_sandbox_instructions, "workflow")
     # Should not reference cloning or installing deps for RED PRs
     assert "clone" not in workflow.lower() or "Do NOT clone" in workflow
     assert "install deps" not in workflow.lower()
 
 
-def test_no_sandbox_workflow_still_has_merge_and_rebase() -> None:
+def test_no_sandbox_workflow_still_has_merge_and_rebase(
+    no_sandbox_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """No-sandbox workflow must still reference merge and rebase tools."""
-    inst = get_system_instructions(
-        max_attempts=3,
-        no_sandbox=True,
-    )
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(no_sandbox_instructions, "workflow")
     assert "merge_bot_pr" in workflow
     assert "rebase_bot_pr" in workflow
     assert "get_pr_status" in workflow
@@ -530,6 +545,15 @@ def test_trust_tool_outputs_no_host_inspection(
     guardrails = _section_content(instructions, "guardrails")
     assert "Trust tool outputs" in guardrails
     assert "Do NOT search, browse, or inspect the host environment" in guardrails
+
+
+def test_guardrails_require_absolute_paths_for_file_tools(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Guardrails must require absolute paths under workspace_dir for file tools."""
+    guardrails = _section_content(instructions, "guardrails")
+    assert "view_file" in guardrails
+    assert "absolute paths" in guardrails
 
 
 def test_minimize_conversational_output(
@@ -562,15 +586,16 @@ def test_red_pr_branch_lookup_uses_list_branches() -> None:
     assert "git branch -r" not in workflow
 
 
-def test_red_pr_branch_lookup_uses_branch_prefixes() -> None:
+def test_red_pr_branch_lookup_uses_branch_prefixes(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Branch-lookup instruction must use branch-name prefixes, not [bot] author strings.
 
     Branch names look like 'dependabot/pip/urllib3-2.0', never 'dependabot[bot]/...'.
     The instruction must tell the agent to match on the prefix (e.g. 'dependabot/')
     derived from the bot author, not the full author string with [bot] suffix.
     """
-    inst = _get_instructions()
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(instructions, "workflow")
     # Must reference branch prefixes like 'dependabot/' and 'renovate/'
     assert "dependabot/" in workflow
     assert "renovate/" in workflow
@@ -578,50 +603,44 @@ def test_red_pr_branch_lookup_uses_branch_prefixes() -> None:
     assert "[bot]" not in workflow.split("list_branches")[1].split(".")[0]
 
 
-def test_sandbox_workflow_no_shell_operators() -> None:
+def test_sandbox_workflow_no_shell_operators(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Sandbox-mode workflow must not contain pipe, &&, or || operators."""
-    inst = _get_instructions()
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(instructions, "workflow")
     # Check for standalone shell operators (not inside quoted strings)
     assert " | " not in workflow, "Workflow contains pipe operator"
     assert " && " not in workflow, "Workflow contains && operator"
     assert " || " not in workflow, "Workflow contains || operator"
 
 
-def test_workflow_diff_before_clone() -> None:
-    """RED PR workflow should reference get_pr_diff before cloning."""
-    inst = _get_instructions()
-    workflow = _section_content(inst, "workflow")
-    assert "get_pr_diff" in workflow, "get_pr_diff not found in workflow"
+@pytest.mark.parametrize("tool_name", ["get_pr_diff", "get_pr_files"])
+def test_workflow_inspects_pr_before_clone(
+    instructions: types.TemplatedSystemInstructions,
+    tool_name: str,
+) -> None:
+    """RED PR workflow should reference inspection tools before cloning."""
+    workflow = _section_content(instructions, "workflow")
+    assert tool_name in workflow, f"{tool_name} not found in workflow"
     assert "before cloning" in workflow, "'before cloning' context not found"
-    # Ensure get_pr_diff appears before the "before cloning" phrase
-    diff_pos = workflow.find("get_pr_diff")
+    tool_pos = workflow.find(tool_name)
     before_clone_pos = workflow.find("before cloning")
-    assert diff_pos < before_clone_pos, "get_pr_diff must appear before 'before cloning'"
+    assert tool_pos < before_clone_pos, f"{tool_name} must appear before 'before cloning'"
 
 
-def test_workflow_files_before_clone() -> None:
-    """RED PR workflow should reference get_pr_files before cloning."""
-    inst = _get_instructions()
-    workflow = _section_content(inst, "workflow")
-    assert "get_pr_files" in workflow, "get_pr_files not found in workflow"
-    assert "before cloning" in workflow, "'before cloning' context not found"
-    files_pos = workflow.find("get_pr_files")
-    before_clone_pos = workflow.find("before cloning")
-    assert files_pos < before_clone_pos, "get_pr_files must appear before 'before cloning'"
-
-
-def test_post_action_checks_reference_wait_for_ci() -> None:
+def test_post_action_checks_reference_wait_for_ci(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """post_action_checks should reference wait_for_ci tool instead of manual polling."""
-    inst = _get_instructions()
-    content = _section_content(inst, "post_action_checks")
+    content = _section_content(instructions, "post_action_checks")
     assert "wait_for_ci" in content
 
 
-def test_guardrails_env_syntax_guidance() -> None:
+def test_guardrails_env_syntax_guidance(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Guardrails should instruct agent to use 'env KEY=val cmd' not 'KEY=val cmd'."""
-    inst = _get_instructions()
-    guardrails = _section_content(inst, "guardrails")
+    guardrails = _section_content(instructions, "guardrails")
     assert "env KEY=val" in guardrails
     assert "srt" in guardrails.lower() or "argv" in guardrails.lower()
 
@@ -635,10 +654,11 @@ def test_merging_green_prs_uses_wait_for_ci() -> None:
     assert "get_pr_status" not in content
 
 
-def test_workflow_inlines_self_review() -> None:
+def test_workflow_inlines_self_review(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Workflow self-review should be inlined, not reference external skill files."""
-    inst = _get_instructions()
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(instructions, "workflow")
     assert "self-review" in workflow.lower()
     assert "code-review-and-quality" not in workflow
     assert "SKILL.md" not in workflow
@@ -647,63 +667,59 @@ def test_workflow_inlines_self_review() -> None:
 # --- Issue #4: Rebase re-check after processing ---
 
 
-def test_workflow_rebase_recheck_after_processing() -> None:
-    """Sandbox workflow must include a final pass to re-check rebased PRs.
+@pytest.mark.parametrize("no_sandbox", [False, True], ids=["sandbox", "no_sandbox"])
+def test_workflow_rebase_recheck_after_processing(no_sandbox: bool) -> None:
+    """Workflow must include a final pass to re-check rebased PRs.
 
     After all PRs are processed, the agent should call get_pr_status
     once on each rebased PR and merge if GREEN.
     """
-    inst = _get_instructions()
+    inst = _get_instructions(no_sandbox=no_sandbox)
     workflow = _section_content(inst, "workflow")
     assert "rebased" in workflow.lower()
     assert "get_pr_status" in workflow
-    # Must appear after the main processing steps
-    main_processing = workflow.find("Max")
-    recheck = workflow.lower().find("rebased")
-    assert recheck > main_processing, "Rebase re-check must appear after main processing steps"
-
-
-def test_no_sandbox_workflow_rebase_recheck() -> None:
-    """No-sandbox workflow must also include the rebase re-check pass."""
-    inst = _get_instructions(no_sandbox=True)
-    workflow = _section_content(inst, "workflow")
-    assert "rebased" in workflow.lower()
-    assert "get_pr_status" in workflow
+    if not no_sandbox:
+        main_processing = workflow.find("Max")
+        recheck = workflow.lower().find("rebased")
+        assert recheck > main_processing, "Rebase re-check must appear after main processing steps"
 
 
 # --- Skill reading guidance ---
 
 
-def test_guardrails_defer_skill_reading() -> None:
+def test_guardrails_defer_skill_reading(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Guardrails must tell the agent to NOT read skills unless fixing RED PRs.
 
     The code-review-and-quality skill is 15KB. Reading it on every repo
     wastes tokens when all PRs are GREEN or CONFLICT.
     """
-    inst = _get_instructions()
-    guardrails = _section_content(inst, "guardrails")
+    guardrails = _section_content(instructions, "guardrails")
     assert "skill" in guardrails.lower()
     assert "RED" in guardrails
 
 
-def test_no_sandbox_guardrails_no_skill_reading() -> None:
+def test_no_sandbox_guardrails_no_skill_reading(
+    no_sandbox_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """No-sandbox guardrails must tell agent to never read skills (no code fixing)."""
-    inst = _get_instructions(no_sandbox=True)
-    guardrails = _section_content(inst, "guardrails")
+    guardrails = _section_content(no_sandbox_instructions, "guardrails")
     assert "skill" in guardrails.lower()
 
 
 # --- wait_for_ci only after merge/push ---
 
 
-def test_post_action_checks_not_first_pr() -> None:
+def test_post_action_checks_not_first_pr(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """post_action_checks must clarify wait_for_ci is only for PRs AFTER a merge/push.
 
     The first PR's status is already known from get_pr_status — calling
     wait_for_ci on it wastes ~10K tokens per repo.
     """
-    inst = _get_instructions()
-    section = _section_content(inst, "post_action_checks")
+    section = _section_content(instructions, "post_action_checks")
     # Must explicitly say "not" or "do not" in context of first PR
     assert "first" in section.lower()
 
@@ -711,21 +727,24 @@ def test_post_action_checks_not_first_pr() -> None:
 # --- No artifact creation ---
 
 
-def test_output_format_no_artifacts() -> None:
+def test_output_format_no_artifacts(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """output_format must tell the agent not to create artifact files.
 
     The agent was writing processing_summary.md files to the brain directory,
     wasting tokens on file creation when the summary is already in stdout.
     """
-    inst = _get_instructions()
-    section = _section_content(inst, "output_format")
+    section = _section_content(instructions, "output_format")
     assert "artifact" in section.lower() or "file" in section.lower()
 
 
 # --- Summary shape ---
 
 
-def test_output_format_summary_is_a_bullet_list_not_a_table() -> None:
+def test_output_format_summary_is_a_bullet_list_not_a_table(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The final summary must be a bullet list, and tables ruled out explicitly.
 
     'Summary list' alone left the model free to render a markdown table. On
@@ -733,7 +752,7 @@ def test_output_format_summary_is_a_bullet_list_not_a_table() -> None:
     string, which tripped the looping-content detector: the turn died mid-table
     and the SDK re-emitted the whole run.
     """
-    content = _section_content(_get_instructions(), "output_format").lower()
+    content = _section_content(instructions, "output_format").lower()
     assert "bullet list" in content
     assert "never a table" in content
 
@@ -763,7 +782,9 @@ def test_manual_review_no_rebase_remaining() -> None:
 # --- uv sync strategy for sandbox ---
 
 
-def test_sandbox_workflow_uv_sync_first() -> None:
+def test_sandbox_workflow_uv_sync_first(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Sandbox workflow must tell agent to run 'uv sync' as a separate step.
 
     `uv run <tool>` silently tries to sync all deps first. For heavy projects
@@ -771,15 +792,16 @@ def test_sandbox_workflow_uv_sync_first() -> None:
     visible error. Running `uv sync` explicitly first makes failures visible.
     After sync, subsequent `uv run` calls detect the venv is current instantly.
     """
-    inst = _get_instructions()
-    workflow = _section_content(inst, "workflow")
+    workflow = _section_content(instructions, "workflow")
     assert "uv sync" in workflow
 
 
 # --- Base branch health ---
 
 
-def test_workflow_checks_base_health_before_cloning() -> None:
+def test_workflow_checks_base_health_before_cloning(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The base check must be instructed, and must come before the clone.
 
     On fast-diff-mcp the model happened to run 'git checkout main && ruff check'
@@ -787,96 +809,122 @@ def test_workflow_checks_base_health_before_cloning() -> None:
     asked for it, so on another repo it may clone and grind through every PR
     before noticing the base was already red.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert "get_branch_ci_status" in content
     assert content.index("get_branch_ci_status") < content.index("Clone (if not already)")
 
 
-def test_workflow_reports_a_broken_base_once_not_per_pr() -> None:
+def test_workflow_reports_a_broken_base_once_not_per_pr(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Five PRs blocked on one cause should be diagnosed once, then skipped."""
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert "ONCE per distinct base_ref" in content
     assert "do NOT re-check the same base" in content
     assert "every remaining RED PR" in content
 
 
-def test_base_check_uses_the_prs_own_base_ref() -> None:
+def test_base_check_uses_the_prs_own_base_ref(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The branch checked must be the one the PR targets, not the repo default.
 
     'get_branch_ci_status' falls back to the default branch when no branch is
     passed, so an instruction that omits the argument silently diagnoses the
     wrong branch for any PR aimed at 'develop' or a release line.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert "base_ref" in content
     assert "list_bot_prs" in content
     assert content.index("get_branch_ci_status(owner, repo, branch)") < content.index("Clone (if not already)")
 
 
-def test_base_check_is_reused_per_base_not_across_unrelated_bases() -> None:
+def test_base_check_is_reused_per_base_not_across_unrelated_bases(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Two PRs on different bases need two checks; two on one base need one."""
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert "distinct base_ref" in content
     assert "sharing that base" in content
 
 
-def test_base_fix_pr_targets_the_base_that_was_diagnosed() -> None:
+def test_base_fix_pr_targets_the_base_that_was_diagnosed(
+    fix_base_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The fix must land on the branch that is actually broken.
 
     Opening the fix against the repository default when the diagnosed base was
     'develop' repairs a branch nobody reported as failing and leaves the
     dependency PRs just as blocked.
     """
-    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    content = _section_content(fix_base_instructions, "fix_base_branch")
     assert "base_ref" in content
 
 
-def test_base_health_is_checked_before_logs_are_pulled() -> None:
+def test_base_health_is_checked_before_logs_are_pulled(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The cheap branch-level check has to precede the expensive per-PR one.
 
     A base failing the same checks excuses every PR on it, so logs pulled
     first are logs discarded. Reading them for five PRs is what turned one
     repository into 2.6M input tokens.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert content.index("get_branch_ci_status") < content.index("get_pr_workflow_run_logs")
 
 
-def test_logs_are_read_once_per_distinct_failure() -> None:
+def test_base_health_check_handles_pending_and_none(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Base check instructs agent to continue when base is GREEN, PENDING, or NONE."""
+    content = _section_content(instructions, "workflow")
+    assert "If the base is GREEN, PENDING, or NONE, the failure belongs to the PR: continue." in content
+
+
+def test_logs_are_read_once_per_distinct_failure(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """PRs failing the identical check must not each cost a full log read.
 
     kweinmeister/fast-diff-mcp ran five dependency PRs that all failed the same
     'Build and Test' job for the same reason, and the run pulled logs five
     times — the single largest line item in a 4.5M-token run.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     assert "already read logs for" in lowered
     assert "reproduce" in lowered
 
 
-def test_log_reuse_falls_back_when_the_failure_differs() -> None:
+def test_log_reuse_falls_back_when_the_failure_differs(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Two PRs can fail one check for unrelated reasons.
 
     Reusing a diagnosis across them is only safe because the local run is the
     real source of truth; without a stated fallback the agent would carry the
     first PR's conclusion onto a failure it does not explain.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     assert "does not reproduce" in lowered
     assert "different error" in lowered
 
 
-def test_log_reuse_is_keyed_on_the_check_that_failed() -> None:
+def test_log_reuse_is_keyed_on_the_check_that_failed(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The reuse rule has to be scoped to matching checks, not to 'a second RED PR'."""
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     reuse_at = content.lower().index("already read logs for")
     window = content[max(0, reuse_at - 300) : reuse_at + 300].lower()
     assert "check" in window
 
 
-def test_a_check_that_failed_from_a_runner_error_is_not_cloned() -> None:
+def test_a_check_that_failed_from_a_runner_error_is_not_cloned(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """A check the runner itself killed says nothing about the dependency update.
 
     kweinmeister/youtube-dashboard had five PRs whose only failing check was a
@@ -884,7 +932,7 @@ def test_a_check_that_failed_from_a_runner_error_is_not_cloned() -> None:
     repository can reproduce that, so the clone-sync-test cycle the agent ran
     to prove it could only ever end where it started.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     assert "runner error" in lowered
     error_at = lowered.index("runner error")
@@ -892,14 +940,22 @@ def test_a_check_that_failed_from_a_runner_error_is_not_cloned() -> None:
     assert "do not clone" in window
 
 
-def test_runner_error_triage_names_the_conditions_it_covers() -> None:
+@pytest.mark.parametrize(
+    "condition",
+    ["turn", "rate", "memory", "timed out", "authenticate"],
+)
+def test_runner_error_triage_names_the_conditions_it_covers(
+    instructions: types.TemplatedSystemInstructions,
+    condition: str,
+) -> None:
     """'Runner error' is only actionable if the agent knows what counts as one."""
-    content = _section_content(_get_instructions(), "workflow").lower()
-    for condition in ("turn", "rate", "memory", "timed out", "authenticate"):
-        assert condition in content, f"runner-error triage does not mention {condition}"
+    content = _section_content(instructions, "workflow").lower()
+    assert condition in content, f"runner-error triage does not mention {condition}"
 
 
-def test_a_diagnosis_outside_the_dependency_update_is_not_re_cloned() -> None:
+def test_a_diagnosis_outside_the_dependency_update_is_not_re_cloned(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Reusing a log read is not enough when the clone is the expensive part.
 
     The existing rule stops the second PR pulling logs but still sends it
@@ -907,31 +963,35 @@ def test_a_diagnosis_outside_the_dependency_update_is_not_re_cloned() -> None:
     agent already holds. For a cause no code change of its own would fix,
     that whole cycle is dead weight.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     assert "skip the clone" in lowered
     assert "outside the dependency update" in lowered
 
 
-def test_clone_reuse_still_reproduces_a_real_code_failure() -> None:
+def test_clone_reuse_still_reproduces_a_real_code_failure(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Skipping the clone is only safe for causes outside the PR's own code.
 
     Two PRs can fail the same check for genuinely different code reasons, so
     the shortcut must not swallow a failure a fix would actually address.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     assert "clone and reproduce" in lowered
     assert "real code failure" in lowered
 
 
-def test_non_reproduction_is_only_claimed_after_a_local_run() -> None:
+def test_non_reproduction_is_only_claimed_after_a_local_run(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """'Did not reproduce locally' is a claim about a test run that happened.
 
     In the youtube-dashboard run the agent logged it for three PRs it never
     cloned, reporting a local result it had not observed.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     claim_at = lowered.index("did not reproduce locally")
     window = lowered[claim_at : claim_at + 400]
@@ -950,66 +1010,80 @@ def test_dry_run_treats_a_blocked_push_as_expected() -> None:
     assert "expected" in lowered
 
 
-def test_base_blame_requires_the_same_checks_to_be_failing() -> None:
+def test_base_blame_requires_the_same_checks_to_be_failing(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """A red base does not excuse every red PR.
 
     kweinmeister/voting-agent has a failing 'Deploy Frontend' job on main while
     lint and tests pass. A PR that breaks lint there is the PR's own fault, so
     blaming any RED PR on a merely-RED base would silently stop fixing them.
     """
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     lowered = content.lower()
     assert "check names" in lowered
     assert "also failing on the base" in lowered
 
 
-def test_pr_only_failures_are_still_fixed_when_the_base_is_red() -> None:
+def test_pr_only_failures_are_still_fixed_when_the_base_is_red(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """The escape hatch: a check the PR fails but the base passes is the PR's."""
-    content = _section_content(_get_instructions(), "workflow")
+    content = _section_content(instructions, "workflow")
     assert "passing on the base" in content
     assert "the PR introduced that failure" in content
 
 
-def test_base_fix_section_absent_by_default() -> None:
+def test_base_fix_section_absent_by_default(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
     """Opening unrelated PRs is a surprise, so it must be opt-in."""
-    assert "fix_base_branch" not in _section_titles(_get_instructions())
+    assert "fix_base_branch" not in _section_titles(instructions)
 
 
-def test_base_fix_section_opens_a_separate_pr_against_the_base() -> None:
+def test_base_fix_section_opens_a_separate_pr_against_the_base(
+    fix_base_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """A base fix must never land on a dependency branch.
 
     Pushing repo-wide changes to 'dependabot/...' is bad review hygiene and
     makes Dependabot stop managing the PR.
     """
-    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    content = _section_content(fix_base_instructions, "fix_base_branch")
     assert "create_pr" in content
     assert "MUST NOT" in content
     assert "dependency" in content.lower()
 
 
-def test_base_fix_scope_is_bounded_to_what_ci_fails_on() -> None:
+def test_base_fix_scope_is_bounded_to_what_ci_fails_on(
+    fix_base_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """'Fix the base' must not become 'clean up the whole repo'."""
-    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    content = _section_content(fix_base_instructions, "fix_base_branch")
     lowered = content.lower()
     assert "only" in lowered
     assert "unrelated" in lowered
 
 
-def test_base_fix_checks_for_a_pr_it_already_opened() -> None:
+def test_base_fix_checks_for_a_pr_it_already_opened(
+    fix_base_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """A base fix awaiting review must stop the next run before it clones.
 
     The fix branch name is derived from the base ref, so every run over an
     unmerged base fix rebuilds the same branch, force-pushes over the PR a
     human is reviewing, and then dead-ends when GitHub refuses the duplicate.
     """
-    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    content = _section_content(fix_base_instructions, "fix_base_branch")
     assert "find_open_pr_for_branch" in content
     assert "before" in content.lower()
 
 
-def test_base_fix_leaves_generated_files_alone() -> None:
+def test_base_fix_leaves_generated_files_alone(
+    fix_base_instructions: types.TemplatedSystemInstructions,
+) -> None:
     """'uv sync' rewrites the lockfile, and that is not part of a lint fix."""
-    content = _section_content(_get_instructions(fix_base=True), "fix_base_branch")
+    content = _section_content(fix_base_instructions, "fix_base_branch")
     assert "uv.lock" in content
 
 
