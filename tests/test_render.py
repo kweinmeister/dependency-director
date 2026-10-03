@@ -7,6 +7,7 @@ and the reader has to parse the glyphs apart by eye.
 """
 
 from collections.abc import AsyncGenerator
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,23 +27,26 @@ STATUS_LINES = (
 )
 
 
-def _response(*texts: str) -> MagicMock:
-    """Build a stand-in chat response that streams ``texts`` as model output."""
+def _response(*chunks: Any) -> MagicMock:
+    """Build a stand-in chat response that streams ``chunks`` as model output."""
 
-    async def chunks() -> AsyncGenerator[types.Text]:
-        for index, text in enumerate(texts):
-            yield types.Text(text=text, step_index=index)
+    async def stream() -> AsyncGenerator[Any]:
+        for index, chunk in enumerate(chunks):
+            if isinstance(chunk, str):
+                yield types.Text(text=chunk, step_index=index)
+            else:
+                yield chunk
 
     response = MagicMock()
-    response.chunks = chunks()
+    response.chunks = stream()
     return response
 
 
-async def _render(*texts: str) -> str:
-    """Render ``texts`` the way a real turn would, and return what the terminal got."""
-    console = Console(width=80, no_color=True, highlight=False)
+async def _render(*chunks: Any, console_width: int = 80) -> str:
+    """Render ``chunks`` the way a real turn would, and return what the terminal got."""
+    console = Console(width=console_width, no_color=True, highlight=False)
     with patch("dependency_director.main.console", console), console.capture() as capture:
-        await _render_agent_response(_response(*texts))
+        await _render_agent_response(_response(*chunks))
     return capture.get()
 
 
@@ -75,22 +79,38 @@ async def test_tables_still_render_as_tables() -> None:
     assert "| PR | Result |" not in output
 
 
-DENIAL = (
+POLICY_DENIAL = (
     "Denied by policy 'dry_run_block_push_sandboxed'. "
     "(\"denied by pre-tool hook: Denied by policy 'dry_run_block_push_sandboxed'.\")"
 )
 
+WORKSPACE_DENIAL = (
+    'Access to path "/Users/kweinmeister/Projects/dependency-director" is denied. '
+    "It is outside the allowed workspace directories: [/tmp/ws1 /tmp/ws2] "
+    '("denied by pre-tool hook: Access to path '
+    '"/Users/kweinmeister/Projects/dependency-director" is denied. '
+    'It is outside the allowed workspace directories: [/tmp/ws1 /tmp/ws2]")'
+)
+
 
 @pytest.mark.asyncio
-async def test_a_policy_denial_renders_as_one_labelled_line() -> None:
+@pytest.mark.parametrize(
+    ("denial_text", "expected_policy"),
+    [
+        (POLICY_DENIAL, "dry_run_block_push_sandboxed"),
+        (WORKSPACE_DENIAL, "workspace_only"),
+    ],
+    ids=["policy_rule", "workspace_confinement"],
+)
+async def test_denial_renders_as_one_labelled_line(denial_text: str, expected_policy: str) -> None:
     """The SDK emits the deny reason as prose; it belongs with the tool lines.
 
-    A dry run blocks a push per RED PR, so this arrives once per PR. Rendered
-    verbatim it reads like a crash, and it states the same sentence twice.
+    A dry run or workspace containment blocks an action, which emits pre-tool hook
+    prose that would look like a crash if rendered verbatim.
     """
-    output = (await _render(DENIAL)).strip()
+    output = (await _render(denial_text)).strip()
     assert output.count("\n") == 0, f"denial spilled across lines: {output!r}"
-    assert "dry_run_block_push_sandboxed" in output
+    assert expected_policy in output
     assert "denied by pre-tool hook" not in output
 
 
@@ -105,48 +125,28 @@ async def test_prose_about_a_denial_is_left_as_prose() -> None:
 @pytest.mark.asyncio
 async def test_a_denial_does_not_swallow_text_around_it() -> None:
     """Collapsing a buffer that holds more than the denial would lose output."""
-    output = await _render(f"{DENIAL}\n\nThe fix is verified and ready.")
+    output = await _render(f"{POLICY_DENIAL}\n\nThe fix is verified and ready.")
     assert "The fix is verified and ready." in output
 
 
 @pytest.mark.asyncio
-async def test_a_denial_is_labelled_even_when_more_text_follows_it() -> None:
+@pytest.mark.parametrize(
+    ("denial_text", "expected_policy", "trailing"),
+    [
+        (POLICY_DENIAL, "dry_run_block_push_sandboxed", "✓ #57 fix pushed"),
+        (WORKSPACE_DENIAL, "workspace_only", "✓ #43 conflict resolved"),
+    ],
+    ids=["policy_rule", "workspace_confinement"],
+)
+async def test_denial_preserves_trailing_text(denial_text: str, expected_policy: str, trailing: str) -> None:
     """Nothing separates the SDK's denial from the model's next sentence.
 
-    Both land in one buffer whenever no tool call intervenes, which is what
-    left one of five denials raw in an otherwise clean run.
+    Both land in one buffer whenever no tool call intervenes.
     """
-    output = await _render(f"{DENIAL}✓ #57 fix pushed")
+    output = await _render(f"{denial_text}{trailing}")
     assert "denied by pre-tool hook" not in output
-    assert "blocked by policy" in output
-    assert "✓ #57 fix pushed" in output
-
-
-WORKSPACE_DENIAL = (
-    'Access to path "/Users/kweinmeister/Projects/dependency-director" is denied. '
-    "It is outside the allowed workspace directories: [/tmp/ws1 /tmp/ws2] "
-    '("denied by pre-tool hook: Access to path '
-    '"/Users/kweinmeister/Projects/dependency-director" is denied. '
-    'It is outside the allowed workspace directories: [/tmp/ws1 /tmp/ws2]")'
-)
-
-
-@pytest.mark.asyncio
-async def test_a_workspace_denial_renders_as_one_labelled_line() -> None:
-    """Workspace containment violations emit hook prose that must collapse to one line."""
-    output = (await _render(WORKSPACE_DENIAL)).strip()
-    assert output.count("\n") == 0, f"denial spilled across lines: {output!r}"
-    assert "blocked by policy 'workspace_only'" in output
-    assert "denied by pre-tool hook" not in output
-
-
-@pytest.mark.asyncio
-async def test_a_workspace_denial_preserves_trailing_text() -> None:
-    """A workspace denial in the same chunk as the model's next sentence must keep it."""
-    output = await _render(f"{WORKSPACE_DENIAL}✓ #43 conflict resolved")
-    assert "blocked by policy 'workspace_only'" in output
-    assert "✓ #43 conflict resolved" in output
-    assert "denied by pre-tool hook" not in output
+    assert f"blocked by policy '{expected_policy}'" in output
+    assert trailing in output
 
 
 def test_code_fences_are_left_alone() -> None:
@@ -161,18 +161,26 @@ def test_a_status_line_that_already_hard_breaks_is_untouched() -> None:
     assert _preserve_status_line_breaks(already) == "✓ #51 merged  \n✓ #52 merged"
 
 
-def test_format_tool_args_normalizes_whole_floats() -> None:
+@pytest.mark.parametrize(
+    ("raw_args", "expected_str"),
+    [
+        (
+            {"pr_number": 154.0, "owner": "kweinmeister", "ratio": 1.5, "flag": True},
+            "pr_number=154, owner='kweinmeister', ratio=1.5, flag=True",
+        ),
+        (
+            {"ids": [154.0, 156.0], "nested": {"target": 42.0, "ratio": 2.5}},
+            "ids=[154, 156], nested={'target': 42, 'ratio': 2.5}",
+        ),
+    ],
+    ids=["flat_primitives", "nested_containers"],
+)
+def test_format_tool_args_normalizes_floats(
+    raw_args: dict[str, Any],
+    expected_str: str,
+) -> None:
     """Whole-number floats from protobuf structs must display as ints."""
-    args = {"pr_number": 154.0, "owner": "kweinmeister", "ratio": 1.5, "flag": True}
-    formatted = _format_tool_args(args)
-    assert formatted == "pr_number=154, owner='kweinmeister', ratio=1.5, flag=True"
-
-
-def test_format_tool_args_normalizes_nested_containers() -> None:
-    """Whole floats in nested lists or dicts must also normalize to ints."""
-    args = {"ids": [154.0, 156.0], "nested": {"target": 42.0, "ratio": 2.5}}
-    formatted = _format_tool_args(args)
-    assert formatted == "ids=[154, 156], nested={'target': 42, 'ratio': 2.5}"
+    assert _format_tool_args(raw_args) == expected_str
 
 
 def test_format_tool_args_truncates_long_strings() -> None:
@@ -186,20 +194,10 @@ def test_format_tool_args_truncates_long_strings() -> None:
 @pytest.mark.asyncio
 async def test_render_tool_call_formats_pr_number_as_int() -> None:
     """Tool calls with whole-number float arguments must render without decimal points."""
-    console = Console(width=120, no_color=True, highlight=False)
-
-    async def chunks() -> AsyncGenerator[types.ToolCall]:
-        yield types.ToolCall(
-            name="get_pr_status",
-            args={"owner": "kweinmeister", "pr_number": 154.0, "repo": "agent-design-patterns"},
-        )
-
-    response = MagicMock()
-    response.chunks = chunks()
-
-    with patch("dependency_director.main.console", console), console.capture() as capture:
-        await _render_agent_response(response)
-
-    output = capture.get()
+    call = types.ToolCall(
+        name="get_pr_status",
+        args={"owner": "kweinmeister", "pr_number": 154.0, "repo": "agent-design-patterns"},
+    )
+    output = await _render(call, console_width=120)
     assert "pr_number=154" in output
     assert "154.0" not in output
