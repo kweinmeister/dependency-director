@@ -212,6 +212,25 @@ class ToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]
         await self.run(None, error)
 
 
+def _normalize_tool_arg(val: Any) -> Any:
+    """Normalize tool argument values for display, converting whole-number floats to ints."""
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    if isinstance(val, list):
+        return [_normalize_tool_arg(item) for item in val]
+    if isinstance(val, dict):
+        return {k: _normalize_tool_arg(v) for k, v in val.items()}
+    return val
+
+
+def _format_tool_args(args: dict[str, Any], max_len: int = MAX_ARGS_DISPLAY_LEN) -> str:
+    """Format tool argument dict for console display, normalizing whole floats to ints."""
+    args_str = ", ".join(f"{k}={_normalize_tool_arg(v)!r}" for k, v in args.items())
+    if len(args_str) > max_len:
+        return args_str[: max_len - 3] + "..."
+    return args_str
+
+
 async def _render_agent_response(response: types.ChatResponse) -> None:
     text_buffer: list[str] = []
 
@@ -241,9 +260,7 @@ async def _render_agent_response(response: types.ChatResponse) -> None:
                 text_buffer.append(text)
             case types.ToolCall(name=name, args=args):
                 _flush_text()
-                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                if len(args_str) > MAX_ARGS_DISPLAY_LEN:
-                    args_str = args_str[: MAX_ARGS_DISPLAY_LEN - 3] + "..."
+                args_str = _format_tool_args(args)
                 console.print(
                     f"  🔧 [tool.name]{name}[/tool.name]([tool.args]{args_str}[/tool.args])",
                 )

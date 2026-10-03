@@ -13,7 +13,11 @@ import pytest
 from google.antigravity import types
 from rich.console import Console
 
-from dependency_director.main import _preserve_status_line_breaks, _render_agent_response
+from dependency_director.main import (
+    _format_tool_args,
+    _preserve_status_line_breaks,
+    _render_agent_response,
+)
 
 STATUS_LINES = (
     "⚠ #51 not fixed: blocked on base fix PR #58\n"
@@ -128,3 +132,47 @@ def test_a_status_line_that_already_hard_breaks_is_untouched() -> None:
     """Appending to a line that already ends in a break would just add noise."""
     already = "✓ #51 merged  \n✓ #52 merged"
     assert _preserve_status_line_breaks(already) == "✓ #51 merged  \n✓ #52 merged"
+
+
+def test_format_tool_args_normalizes_whole_floats() -> None:
+    """Whole-number floats from protobuf structs must display as ints."""
+    args = {"pr_number": 154.0, "owner": "kweinmeister", "ratio": 1.5, "flag": True}
+    formatted = _format_tool_args(args)
+    assert formatted == "pr_number=154, owner='kweinmeister', ratio=1.5, flag=True"
+
+
+def test_format_tool_args_normalizes_nested_containers() -> None:
+    """Whole floats in nested lists or dicts must also normalize to ints."""
+    args = {"ids": [154.0, 156.0], "nested": {"target": 42.0, "ratio": 2.5}}
+    formatted = _format_tool_args(args)
+    assert formatted == "ids=[154, 156], nested={'target': 42, 'ratio': 2.5}"
+
+
+def test_format_tool_args_truncates_long_strings() -> None:
+    """Long argument strings must truncate with an ellipsis."""
+    args = {"data": "x" * 200}
+    formatted = _format_tool_args(args, max_len=30)
+    assert len(formatted) == 30
+    assert formatted.endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_render_tool_call_formats_pr_number_as_int() -> None:
+    """Tool calls with whole-number float arguments must render without decimal points."""
+    console = Console(width=120, no_color=True, highlight=False)
+
+    async def chunks() -> AsyncGenerator[types.ToolCall]:
+        yield types.ToolCall(
+            name="get_pr_status",
+            args={"owner": "kweinmeister", "pr_number": 154.0, "repo": "agent-design-patterns"},
+        )
+
+    response = MagicMock()
+    response.chunks = chunks()
+
+    with patch("dependency_director.main.console", console), console.capture() as capture:
+        await _render_agent_response(response)
+
+    output = capture.get()
+    assert "pr_number=154" in output
+    assert "154.0" not in output
