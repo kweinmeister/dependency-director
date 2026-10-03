@@ -25,33 +25,35 @@ def _get_instructions(
 
 @pytest.fixture
 def instructions() -> types.TemplatedSystemInstructions:
-    """Fixture to return a default templated system instructions object for testing."""
+    """Return a default templated system instructions object for testing."""
     return _get_instructions()
 
 
 @pytest.fixture
 def no_sandbox_instructions() -> types.TemplatedSystemInstructions:
-    """Fixture to return system instructions configured for no-sandbox mode."""
+    """Return system instructions configured for no-sandbox mode."""
     return _get_instructions(no_sandbox=True)
 
 
 @pytest.fixture
 def fix_base_instructions() -> types.TemplatedSystemInstructions:
-    """Fixture to return system instructions configured with base branch fixing enabled."""
+    """Return system instructions configured with base branch fixing enabled."""
     return _get_instructions(fix_base=True)
 
 
 @pytest.fixture
 def standalone_fix_instructions() -> types.TemplatedSystemInstructions:
-    """Fixture to return system instructions configured with standalone fix PR strategy."""
+    """Return system instructions configured with standalone fix PR strategy."""
     return _get_instructions(standalone_fix=True)
 
 
 def _section_content(inst: types.TemplatedSystemInstructions, title: str) -> str:
+    """Return content of the first section matching title, or empty string."""
     return next((s.content for s in inst.sections if s.title == title), "")
 
 
 def _section_titles(inst: types.TemplatedSystemInstructions) -> set[str]:
+    """Return the set of section titles present in instructions."""
     return {s.title for s in inst.sections}
 
 

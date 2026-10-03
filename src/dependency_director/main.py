@@ -10,7 +10,7 @@ import sys
 import tempfile
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlparse
 
 import click
@@ -177,6 +177,7 @@ def _preserve_status_line_breaks(text: str) -> str:
 # of it in parentheses, which holds no nested parens of its own. Anchored at the
 # start only: a sentence that merely quotes a denial stays prose, while a denial
 # the model's next sentence ran into is still recognised.
+POLICY_WORKSPACE_ONLY: Final[str] = "workspace_only"
 _POLICY_DENIAL_RE = re.compile(r"Denied by policy '(?P<name>[^']+)'\.[ \t]*(\([^)]*\))?")
 _WORKSPACE_DENIAL_RE = re.compile(
     r"Access to path (?:\"[^\"]+\"|\S+) is denied\.\s*"
@@ -199,7 +200,7 @@ def _split_policy_denial(text: str) -> tuple[str | None, str]:
         return match.group("name"), leading[match.end() :]
     ws_match = _WORKSPACE_DENIAL_RE.match(leading)
     if ws_match:
-        return "workspace_only", leading[ws_match.end() :]
+        return POLICY_WORKSPACE_ONLY, leading[ws_match.end() :]
     return None, text
 
 

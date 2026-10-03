@@ -1140,11 +1140,33 @@ def _make_get_branch_ci_status(
     # A base branch is checked once and the verdict reused for every red PR
     # sharing it. The cache lives in this closure, which is built once per
     # repository run, so its lifetime is exactly one run and nothing has to
-    # invalidate it. The lock keeps two PRs asking about the same base at the
-    # same moment from both paying for the round trip.
+    # invalidate it. In-flight task tracking coalesces concurrent checks for the
+    # same branch without blocking checks for other branches or repositories.
     cache: dict[tuple[str, str, str], str] = {}
-    lock = asyncio.Lock()
+    in_flight: dict[tuple[str, str, str], asyncio.Task[str]] = {}
     retry_delays = DEFAULT_BRANCH_CI_DELAYS if delays is None else delays
+
+    async def _fetch_and_poll(owner: str, repo: str, target: str, key: tuple[str, str, str]) -> str:
+        try:
+            # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
+            # An exception leaves the cache untouched: a transient API failure
+            # must not become this run's permanent answer for the branch.
+            ci_status, checks = await _checks_for_ref(client, owner, repo, target)
+            if ci_status == "PENDING":
+                for delay in retry_delays:
+                    await asyncio.sleep(delay)
+                    ci_status, checks = await _checks_for_ref(client, owner, repo, target)
+                    if ci_status != "PENDING":
+                        break
+
+            payload = json_payload(BranchCiStatus(branch=target, ci_status=ci_status, checks=checks))
+            # Cache settled verdicts only. An in-progress (PENDING) verdict must
+            # not become this run's permanent answer if polling timed out.
+            if ci_status != "PENDING":
+                cache[key] = payload
+            return payload
+        finally:
+            in_flight.pop(key, None)
 
     async def get_branch_ci_status(owner: str, repo: str, branch: str = "") -> str:
         """Report CI health for a branch, without cloning it.
@@ -1166,27 +1188,14 @@ def _make_get_branch_ci_status(
         """
         target = branch or await client.get_default_branch(owner, repo)
         key = (owner, repo, target)
-        async with lock:
-            if key in cache:
-                return cache[key]
+        if key in cache:
+            return cache[key]
+        if key in in_flight:
+            return await in_flight[key]
 
-            # GitHub resolves a branch name as a commit ref, so this needs no SHA lookup.
-            # An exception leaves the cache untouched: a transient API failure
-            # must not become this run's permanent answer for the branch.
-            ci_status, checks = await _checks_for_ref(client, owner, repo, target)
-            if ci_status == "PENDING":
-                for delay in retry_delays:
-                    await asyncio.sleep(delay)
-                    ci_status, checks = await _checks_for_ref(client, owner, repo, target)
-                    if ci_status != "PENDING":
-                        break
-
-            payload = json_payload(BranchCiStatus(branch=target, ci_status=ci_status, checks=checks))
-            # Cache settled verdicts only. An in-progress (PENDING) verdict must
-            # not become this run's permanent answer if polling timed out.
-            if ci_status != "PENDING":
-                cache[key] = payload
-            return payload
+        task = asyncio.create_task(_fetch_and_poll(owner, repo, target, key))
+        in_flight[key] = task
+        return await task
 
     return get_branch_ci_status
 

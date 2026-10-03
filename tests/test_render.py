@@ -52,28 +52,28 @@ async def _render(*chunks: Any, console_width: int = 80) -> str:
 
 @pytest.mark.asyncio
 async def test_status_lines_each_get_their_own_line() -> None:
-    """Three outcomes must read as three lines, not one paragraph."""
+    """Ensure three outcomes render as three separate lines, not one paragraph."""
     output = await _render(STATUS_LINES)
     assert sum("not fixed" in line for line in output.splitlines()) == 3
 
 
 @pytest.mark.asyncio
 async def test_status_lines_survive_arriving_in_separate_chunks() -> None:
-    """The model streams text in arbitrary pieces; the split must not decide layout."""
+    """Preserve status lines when text arrives in separate stream chunks."""
     output = await _render(*(f"{part}\n" for part in STATUS_LINES.split("\n")))
     assert sum("not fixed" in line for line in output.splitlines()) == 3
 
 
 @pytest.mark.asyncio
 async def test_ordinary_prose_is_still_reflowed() -> None:
-    """The fix must target status lines, not disable markdown wrapping wholesale."""
+    """Verify ordinary prose reflows without status-line break preservation."""
     output = await _render("The base branch is red.\nEvery PR on it inherits the failure.")
     assert "red. Every PR" in output
 
 
 @pytest.mark.asyncio
 async def test_tables_still_render_as_tables() -> None:
-    """The summary the agent ends on is a markdown table and must stay one."""
+    """Verify markdown tables render as tables without status-line modifications."""
     output = await _render("| PR | Result |\n| --- | --- |\n| #51 | ⚠ blocked |\n")
     assert "─" in output
     assert "| PR | Result |" not in output
@@ -103,11 +103,7 @@ WORKSPACE_DENIAL = (
     ids=["policy_rule", "workspace_confinement"],
 )
 async def test_denial_renders_as_one_labelled_line(denial_text: str, expected_policy: str) -> None:
-    """The SDK emits the deny reason as prose; it belongs with the tool lines.
-
-    A dry run or workspace containment blocks an action, which emits pre-tool hook
-    prose that would look like a crash if rendered verbatim.
-    """
+    """Render policy denial as a single labelled line without raw hook prose."""
     output = (await _render(denial_text)).strip()
     assert output.count("\n") == 0, f"denial spilled across lines: {output!r}"
     assert expected_policy in output
@@ -116,7 +112,7 @@ async def test_denial_renders_as_one_labelled_line(denial_text: str, expected_po
 
 @pytest.mark.asyncio
 async def test_prose_about_a_denial_is_left_as_prose() -> None:
-    """The model discusses the denial in its own words; only the SDK's line is ours."""
+    """Preserve model prose discussing a denial without stripping it."""
     said = "I saw Denied by policy 'x' and treated it as the expected simulated push."
     output = await _render(said)
     assert "treated it as the expected simulated push" in output
@@ -124,7 +120,7 @@ async def test_prose_about_a_denial_is_left_as_prose() -> None:
 
 @pytest.mark.asyncio
 async def test_a_denial_does_not_swallow_text_around_it() -> None:
-    """Collapsing a buffer that holds more than the denial would lose output."""
+    """Ensure a policy denial preserves preceding and succeeding text."""
     output = await _render(f"{POLICY_DENIAL}\n\nThe fix is verified and ready.")
     assert "The fix is verified and ready." in output
 
@@ -139,10 +135,7 @@ async def test_a_denial_does_not_swallow_text_around_it() -> None:
     ids=["policy_rule", "workspace_confinement"],
 )
 async def test_denial_preserves_trailing_text(denial_text: str, expected_policy: str, trailing: str) -> None:
-    """Nothing separates the SDK's denial from the model's next sentence.
-
-    Both land in one buffer whenever no tool call intervenes.
-    """
+    """Preserve trailing output in the same chunk following a policy denial."""
     output = await _render(f"{denial_text}{trailing}")
     assert "denied by pre-tool hook" not in output
     assert f"blocked by policy '{expected_policy}'" in output
@@ -150,13 +143,13 @@ async def test_denial_preserves_trailing_text(denial_text: str, expected_policy:
 
 
 def test_code_fences_are_left_alone() -> None:
-    """Trailing whitespace is content inside a fence, so it must not be added there."""
+    """Preserve code fence contents without modifying trailing whitespace."""
     fenced = "```\n✓ example output\n```\n"
     assert _preserve_status_line_breaks(fenced) == fenced
 
 
 def test_a_status_line_that_already_hard_breaks_is_untouched() -> None:
-    """Appending to a line that already ends in a break would just add noise."""
+    """Leave status lines ending with existing hard breaks untouched."""
     already = "✓ #51 merged  \n✓ #52 merged"
     assert _preserve_status_line_breaks(already) == "✓ #51 merged  \n✓ #52 merged"
 
@@ -179,12 +172,12 @@ def test_format_tool_args_normalizes_floats(
     raw_args: dict[str, Any],
     expected_str: str,
 ) -> None:
-    """Whole-number floats from protobuf structs must display as ints."""
+    """Format whole-number floats from protobuf structs as ints."""
     assert _format_tool_args(raw_args) == expected_str
 
 
 def test_format_tool_args_truncates_long_strings() -> None:
-    """Long argument strings must truncate with an ellipsis."""
+    """Truncate long argument strings with an ellipsis."""
     args = {"data": "x" * 200}
     formatted = _format_tool_args(args, max_len=30)
     assert len(formatted) == 30
@@ -193,7 +186,7 @@ def test_format_tool_args_truncates_long_strings() -> None:
 
 @pytest.mark.asyncio
 async def test_render_tool_call_formats_pr_number_as_int() -> None:
-    """Tool calls with whole-number float arguments must render without decimal points."""
+    """Render tool calls with whole-number float arguments without decimal points."""
     call = types.ToolCall(
         name="get_pr_status",
         args={"owner": "kweinmeister", "pr_number": 154.0, "repo": "agent-design-patterns"},
