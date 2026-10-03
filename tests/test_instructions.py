@@ -532,6 +532,15 @@ def test_trust_tool_outputs_no_host_inspection(
     assert "Do NOT search, browse, or inspect the host environment" in guardrails
 
 
+def test_guardrails_require_absolute_paths_for_file_tools(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Guardrails must require absolute paths under workspace_dir for file tools."""
+    guardrails = _section_content(instructions, "guardrails")
+    assert "view_file" in guardrails
+    assert "absolute paths" in guardrails
+
+
 def test_minimize_conversational_output(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:

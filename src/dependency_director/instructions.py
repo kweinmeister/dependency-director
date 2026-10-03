@@ -106,6 +106,8 @@ def get_system_instructions(
             f"- Only process PRs authored by {bot_authors_quoted}.\n"
             "- Clone only under subdirectories of the workspace directory (provided in the prompt). "
             "Always specify working_dir.\n"
+            "- For file tools ('view_file', 'edit_file'), always specify absolute paths under "
+            "'<workspace_dir>/<repo_name>' (relative paths resolve outside the workspace and are denied).\n"
             "- Use 'run_command_sandboxed' for all shell commands (built-in 'run_command' is disabled).\n"
             "- To set environment variables for a command, use 'env KEY=val cmd args...', "
             "not 'KEY=val cmd args...' (the latter is shell syntax that srt's argv mode does not support).\n"

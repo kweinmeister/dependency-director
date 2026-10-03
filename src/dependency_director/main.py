@@ -178,6 +178,11 @@ def _preserve_status_line_breaks(text: str) -> str:
 # start only: a sentence that merely quotes a denial stays prose, while a denial
 # the model's next sentence ran into is still recognised.
 _POLICY_DENIAL_RE = re.compile(r"Denied by policy '(?P<name>[^']+)'\.[ \t]*(\([^)]*\))?")
+_WORKSPACE_DENIAL_RE = re.compile(
+    r"Access to path (?:\"[^\"]+\"|\S+) is denied\.\s*"
+    r"It is outside the allowed workspace directories:\s*\[[^\]]*\]\s*"
+    r"(?:\([^)]*\))?"
+)
 
 
 def _split_policy_denial(text: str) -> tuple[str | None, str]:
@@ -190,9 +195,12 @@ def _split_policy_denial(text: str) -> tuple[str | None, str]:
     """
     leading = text.lstrip()
     match = _POLICY_DENIAL_RE.match(leading)
-    if not match:
-        return None, text
-    return match.group("name"), leading[match.end() :]
+    if match:
+        return match.group("name"), leading[match.end() :]
+    ws_match = _WORKSPACE_DENIAL_RE.match(leading)
+    if ws_match:
+        return "workspace_only", leading[ws_match.end() :]
+    return None, text
 
 
 class ToolErrorHook(hooks.OnToolErrorHook):  # type: ignore[misc]

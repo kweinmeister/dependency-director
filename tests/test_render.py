@@ -122,6 +122,33 @@ async def test_a_denial_is_labelled_even_when_more_text_follows_it() -> None:
     assert "✓ #57 fix pushed" in output
 
 
+WORKSPACE_DENIAL = (
+    'Access to path "/Users/kweinmeister/Projects/dependency-director" is denied. '
+    "It is outside the allowed workspace directories: [/tmp/ws1 /tmp/ws2] "
+    '("denied by pre-tool hook: Access to path '
+    '"/Users/kweinmeister/Projects/dependency-director" is denied. '
+    'It is outside the allowed workspace directories: [/tmp/ws1 /tmp/ws2]")'
+)
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_denial_renders_as_one_labelled_line() -> None:
+    """Workspace containment violations emit hook prose that must collapse to one line."""
+    output = (await _render(WORKSPACE_DENIAL)).strip()
+    assert output.count("\n") == 0, f"denial spilled across lines: {output!r}"
+    assert "blocked by policy 'workspace_only'" in output
+    assert "denied by pre-tool hook" not in output
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_denial_preserves_trailing_text() -> None:
+    """A workspace denial in the same chunk as the model's next sentence must keep it."""
+    output = await _render(f"{WORKSPACE_DENIAL}✓ #43 conflict resolved")
+    assert "blocked by policy 'workspace_only'" in output
+    assert "✓ #43 conflict resolved" in output
+    assert "denied by pre-tool hook" not in output
+
+
 def test_code_fences_are_left_alone() -> None:
     """Trailing whitespace is content inside a fence, so it must not be added there."""
     fenced = "```\n✓ example output\n```\n"
