@@ -118,6 +118,25 @@ def test_settings_concurrency_accepts_one(monkeypatch: pytest.MonkeyPatch) -> No
     assert Settings().concurrency == 1
 
 
+@pytest.mark.parametrize(
+    ("env_var", "invalid_value"),
+    [
+        ("DEPDIRECTOR_MAX_FIX_ATTEMPTS", "0"),
+        ("DEPDIRECTOR_MAX_FIX_ATTEMPTS", "-1"),
+        ("DEPDIRECTOR_REVIEW_WAIT", "-1"),
+    ],
+)
+def test_settings_rejects_out_of_bounds_attempts_and_review_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    env_var: str,
+    invalid_value: str,
+) -> None:
+    """Verify max_fix_attempts >= 1 and review_wait >= 0 constraints are enforced."""
+    monkeypatch.setenv(env_var, invalid_value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 def test_settings_empty_bots_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty bots list silently disables all PR processing; reject it early."""
     monkeypatch.setenv("DEPDIRECTOR_BOTS", "[]")
@@ -657,7 +676,7 @@ def test_settings_vertex_loading(
 
 @pytest.mark.asyncio
 async def test_agent_config_disables_builtin_run_command(mock_agent_class: MagicMock, github_token: str) -> None:
-    """Verify that the agent config disables the built-in run_command tool and registers the custom one."""
+    """Verify that the agent config disables non-file built-in tools and registers the custom command runner."""
     settings = Settings()
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
@@ -674,7 +693,14 @@ async def test_agent_config_disables_builtin_run_command(mock_agent_class: Magic
     )
     config_passed = mock_agent_class.call_args[1]["config"]
 
-    assert BuiltinTools.RUN_COMMAND in config_passed.capabilities.disabled_tools
+    expected_disabled = {
+        BuiltinTools.RUN_COMMAND,
+        BuiltinTools.READ_URL_CONTENT,
+        BuiltinTools.SEARCH_WEB,
+        BuiltinTools.ASK_QUESTION,
+        BuiltinTools.GENERATE_IMAGE,
+    }
+    assert expected_disabled <= set(config_passed.capabilities.disabled_tools)
     registered_tool_names = [getattr(t, "__name__", "") for t in config_passed.tools]
     assert "run_command_sandboxed" in registered_tool_names
 

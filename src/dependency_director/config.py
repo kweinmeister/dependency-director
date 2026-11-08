@@ -183,11 +183,12 @@ class Settings(BaseSettings):
     github_token: str = Field(default="", validation_alias="github_token")
     max_fix_attempts: int = Field(
         default=3,
+        ge=1,
         validation_alias="depdirector_max_fix_attempts",
     )
     owner: str = Field(default="", validation_alias="depdirector_owner")
     concurrency: int = Field(default=1, ge=1, validation_alias="depdirector_concurrency")
-    review_wait: int = Field(default=0, validation_alias="depdirector_review_wait")
+    review_wait: int = Field(default=0, ge=0, validation_alias="depdirector_review_wait")
     bots: list[BotConfig] = Field(
         default=DEFAULT_BOTS,
         min_length=1,

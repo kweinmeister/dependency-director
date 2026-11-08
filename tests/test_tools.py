@@ -1162,3 +1162,48 @@ async def test_github_client_create_pull_request(github_token: str) -> None:
             json={"title": "t", "head": "h", "base": "b", "body": "d"},
         )
         await c.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_list_commits_tolerates_null_author(github_token: str) -> None:
+    """Verify list_commits handles null commit.author gracefully via Pydantic."""
+    commit_payload = {
+        "sha": "abcdef1234567",
+        "commit": {"message": "fix: null author\n\nextra", "author": None},
+    }
+    client, _ = make_client_with_responses(
+        [httpx_mod.Response(200, json=[commit_payload])],
+        token=github_token,
+    )
+    try:
+        summaries = await client.list_commits("owner", "repo")
+        assert len(summaries) == 1
+        assert summaries[0].sha == "abcdef1"
+        assert summaries[0].message == "fix: null author"
+        assert summaries[0].author == ""
+        assert summaries[0].date == ""
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_github_client_get_commit_tolerates_null_author_and_patch(github_token: str) -> None:
+    """Verify get_commit handles null commit.author and null file patches via Pydantic."""
+    commit_payload = {
+        "sha": "abcdef1234567",
+        "commit": {"message": "fix: null author\n\nextra", "author": None},
+        "files": [{"filename": "src/a.py", "status": "modified", "patch": None}],
+    }
+    client, _ = make_client_with_responses(
+        [httpx_mod.Response(200, json=commit_payload)],
+        token=github_token,
+    )
+    try:
+        details = await client.get_commit("owner", "repo", "abcdef1234567")
+        assert details.sha == "abcdef1234567"
+        assert details.author == ""
+        assert details.date == ""
+        assert len(details.files) == 1
+        assert details.files[0].patch == ""
+    finally:
+        await client.close()

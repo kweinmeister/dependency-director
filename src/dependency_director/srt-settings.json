@@ -85,7 +85,7 @@
       "~/go/pkg/mod",
       "~/go/bin"
     ],
-    "allowWrite": ["/tmp"],
+    "allowWrite": [],
     "denyWrite": [".env", ".git/hooks"],
     "allowGitConfig": false
   },
