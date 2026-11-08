@@ -36,15 +36,15 @@ def get_system_instructions(
         fix_strategy = (
             "commit to local branch, push using 'git push origin "
             "pr-<pr-number>:dependency-director/fix-<pr-number>', then call "
-            "'create_pr(owner, repo, title, head_branch, body)' with "
-            "head_branch='dependency-director/fix-<pr-number>' and a body "
-            "referencing the original PR."
+            "'create_pr(owner, repo, title, head_branch, body, base_branch=<base_ref>)' with "
+            "head_branch='dependency-director/fix-<pr-number>', base_branch set to the PR's "
+            "'base_ref', and a body referencing the original PR."
         )
     else:
         fix_strategy = (
-            "commit to local branch, merge main ('git merge origin/main'), "
+            "commit to local branch, merge the PR's base_ref ('git merge origin/<base_ref>'), "
             "resolve conflicts, re-test, and push directly to remote branch "
-            "using 'git push origin pr-<pr-number>:<remote-pr-branch>'. "
+            "using 'git push origin pr-<pr-number>:<head_ref>'. "
             "Do NOT create new branch/PR."
         )
 
@@ -128,11 +128,12 @@ def get_system_instructions(
             "3. Process PRs oldest-to-newest (do NOT reorder):\n"
             "   - GREEN: Call merge_bot_pr (no cloning needed). Stop on failure.\n"
             "   - CONFLICT: If edited only by bot, call rebase_bot_pr then skip to the next PR "
-            "(Dependabot processes rebases asynchronously). Else clone to <workspace_dir>/<repo_name>, merge main, "
-            "resolve conflicts, test, push.\n"
+            "(Dependabot processes rebases asynchronously). Else clone to <workspace_dir>/<repo_name>, "
+            "merge the PR's base_ref ('git merge origin/<base_ref>'), resolve conflicts, test, push.\n"
             f"   - RED: {base_health_check}"
             "Only once the base is cleared does the PR's own failure need investigating: "
-            "get logs via 'get_pr_workflow_run_logs', then 'get_pr_diff' and 'get_pr_files' "
+            "get logs via 'get_pr_workflow_run_logs', then 'get_pr_diff', 'get_pr_files', "
+            "and (when diagnosing breaking changes) 'get_pr_body' "
             "to understand scope before cloning. Logs are the most expensive read in a run, "
             "so never pull them for a PR a red base has already excused. "
             "Read what the logs actually blame before you clone. A check that died from a "
@@ -153,8 +154,10 @@ def get_system_instructions(
             "Clone (if not already) to '<workspace_dir>/<repo_name>', "
             "then 'git fetch origin pull/<pr_number>/head:pr-<pr_number>' "
             "and 'git checkout pr-<pr_number>' (two separate calls). "
-            "Find remote branch name via 'list_branches(owner, repo)', "
-            f"match prefixes ({bot_prefixes_quoted}), strip 'origin/' for push target. "
+            "Use the PR's 'head_ref' from 'list_bot_prs' or 'get_pr_status' as the remote branch name "
+            "for pushing (only call 'list_branches(owner, repo)' matching prefixes "
+            f"({bot_prefixes_quoted}) as a fallback if 'head_ref' is unavailable), "
+            "and strip any 'origin/' prefix for the push target. "
             "Run 'uv sync' as a separate step (avoids hidden timeouts inside 'uv run'). "
             "If sync times out or fails with network error/401, "
             "skip and log: '✗ #<n> skipped: dependency registry unavailable in sandbox'. "
@@ -181,7 +184,9 @@ def get_system_instructions(
         types.SystemInstructionSection(
             title="code_quality",
             content=(
-                "- Fix root causes (types, signatures, API changes) using changelogs.\n"
+                "- Fix root causes (types, signatures, API changes): call 'get_pr_body(owner, repo, pr_number)' "
+                "to inspect release notes/changelogs, and introspect the installed package's actual symbol "
+                "signatures and types in the local environment (e.g. '.venv' or 'node_modules') after syncing.\n"
                 "- NEVER suppress errors (type: ignore, noqa, Any) unless upstream bugs "
                 "leave no alternative (require comment)."
             ),
@@ -226,7 +231,7 @@ def get_system_instructions(
                     "Merge fix PRs using 'merge_bot_pr' once CI turns green.\n"
                     "After fixing and merging a RED PR, rebase all remaining RED PRs "
                     "using 'rebase_bot_pr' before continuing with individual fixes. "
-                    "This propagates the fix via main — re-check each with 'get_pr_status' "
+                    "This propagates the fix via the base branch (<base_ref>) — re-check each with 'get_pr_status' "
                     "and merge any that turned GREEN. Only clone and fix those still RED."
                 ),
             ),

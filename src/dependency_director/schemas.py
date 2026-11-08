@@ -50,7 +50,13 @@ def _to_aware_utc(value: object) -> datetime:
     return _OLDEST
 
 
+def _empty_if_none(value: object) -> object:
+    """Normalize explicit JSON null strings from GitHub to empty strings."""
+    return "" if value is None else value
+
+
 UtcTimestamp = Annotated[datetime, BeforeValidator(_to_aware_utc)]
+NonNullStr = Annotated[str, BeforeValidator(_empty_if_none)]
 
 
 class _Inbound(BaseModel):
@@ -106,6 +112,12 @@ class PullRequest(_Inbound):
         matches a configured bot, which is the correct outcome.
         """
         return (self.user.login or "") if self.user else ""
+
+
+class PullRequestBody(_Inbound):
+    """The description/changelog body of a single pull request, read on demand."""
+
+    body: NonNullStr = ""
 
 
 # --- Inbound: checks, statuses, and workflow runs ---
@@ -192,17 +204,12 @@ class GitCommitPayload(_Inbound):
         return self.author.date if self.author else ""
 
 
-def _empty_str_if_none(value: object) -> object:
-    """Coerce a null string field (such as a binary file's ``patch``) to ``""``."""
-    return "" if value is None else value
-
-
 class CommitFilePayload(_Inbound):
     """One file entry inside a GitHub commit response."""
 
     filename: str = ""
     status: str = ""
-    patch: Annotated[str, BeforeValidator(_empty_str_if_none)] = ""
+    patch: NonNullStr = ""
 
 
 class CommitResponse(_Inbound):
@@ -270,7 +277,8 @@ class BotPrSummary(BaseModel):
 
     ``base_ref`` is here so the agent can check the branch this PR actually
     targets. Without it the only branch it can name is the repository default,
-    which is the wrong one for any PR aimed elsewhere.
+    which is the wrong one for any PR aimed elsewhere. ``head_ref`` is here so
+    the agent knows the exact remote branch name without guessing from prefixes.
     """
 
     number: int
@@ -278,6 +286,7 @@ class BotPrSummary(BaseModel):
     author: str
     created_at: str
     base_ref: str
+    head_ref: str
 
 
 class OpenPrSummary(BaseModel):
@@ -314,6 +323,7 @@ class PrStatus(BaseModel):
     pr_number: int
     title: str
     head_sha: str
+    head_ref: str
     base_ref: str
     mergeable: bool | None
     mergeable_state: str | None

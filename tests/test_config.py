@@ -914,7 +914,7 @@ async def test_agent_config_no_mcp_servers(mock_agent_class: MagicMock, github_t
 
 @pytest.mark.asyncio
 async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock, github_token: str) -> None:
-    """All 16 host tools (+ optional run_command) should be registered."""
+    """All 17 host tools (+ optional run_command) should be registered."""
     settings = Settings()
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
@@ -936,6 +936,7 @@ async def test_agent_config_registers_all_host_tools(mock_agent_class: MagicMock
         "get_branch_ci_status",
         "get_commit_details",
         "get_file_contents",
+        "get_pr_body",
         "get_pr_diff",
         "get_pr_files",
         "get_pr_status",

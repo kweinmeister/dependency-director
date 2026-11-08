@@ -376,6 +376,7 @@ async def run_agent_for_repo(
         dry_run=dry_run,
         review_wait=review_wait,
         log_limits=settings.log_limits,
+        output_limits=settings.output_limits,
     )
 
     workspace_tmp: str | None = None

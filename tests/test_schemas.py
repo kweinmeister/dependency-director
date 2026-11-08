@@ -26,6 +26,7 @@ from dependency_director.schemas import (
     PatchedFile,
     PrStatus,
     PullRequest,
+    PullRequestBody,
     PullRequestRef,
     RepositoryPayload,
     SrtSettings,
@@ -59,9 +60,10 @@ def test_pull_request_reads_the_nested_head_and_base_refs() -> None:
 def test_pull_request_tolerates_a_payload_github_has_extended() -> None:
     """Verify unknown fields are ignored, so a GitHub addition cannot break a run."""
     pr = PullRequest.model_validate(
-        {"number": 1, "title": "t", "some_field_added_next_year": {"nested": [1, 2]}},
+        {"number": 1, "title": "t", "body": "huge changelog", "some_field_added_next_year": {"nested": [1, 2]}},
     )
     assert pr.number == 1
+    assert "body" not in pr.model_dump()
 
 
 def test_pull_request_defaults_the_fields_github_omits() -> None:
@@ -74,7 +76,21 @@ def test_pull_request_defaults_the_fields_github_omits() -> None:
     assert pr.mergeable is None
     assert pr.author == ""
     assert pr.base.ref == ""
+    assert pr.head.ref == ""
     assert pr.head.sha == ""
+
+
+@pytest.mark.parametrize(
+    ("raw_body", "expected"),
+    [
+        ("## Release notes\n- Breaking API change", "## Release notes\n- Breaking API change"),
+        (None, ""),
+    ],
+)
+def test_pull_request_body_preserves_body_and_normalizes_null(raw_body: str | None, expected: str) -> None:
+    """Verify PullRequestBody preserves the PR body and normalizes null to empty string."""
+    parsed = PullRequestBody.model_validate({"number": 1, "title": "t", "body": raw_body})
+    assert parsed.body == expected
 
 
 @pytest.mark.parametrize("user", [None, {}, {"login": None}])
@@ -189,10 +205,11 @@ def test_summarize_checks_labels_legacy_statuses_by_context() -> None:
 
 
 def test_bot_pr_list_exposes_the_base_ref_of_every_pr() -> None:
-    """Verify the PR listing names each PR's base, so the agent can check it.
+    """Verify the PR listing names each PR's base and head refs.
 
-    Without this the agent has nothing to pass to get_branch_ci_status and
-    silently falls back to the repository default branch.
+    Without base_ref the agent has nothing to pass to get_branch_ci_status and
+    silently falls back to the repository default branch; without head_ref the
+    agent has to guess which remote branch belongs to a multi-dependency PR.
     """
     payload = BotPrList(
         bot_prs=[
@@ -202,20 +219,23 @@ def test_bot_pr_list_exposes_the_base_ref_of_every_pr() -> None:
                 author="dependabot[bot]",
                 created_at="2026-01-02T03:04:05Z",
                 base_ref="develop",
+                head_ref="dependabot/pip/lib-2.0",
             ),
         ],
         count=1,
     ).model_dump()
     assert payload["bot_prs"][0]["base_ref"] == "develop"
-    assert set(payload["bot_prs"][0]) == {"number", "title", "author", "created_at", "base_ref"}
+    assert payload["bot_prs"][0]["head_ref"] == "dependabot/pip/lib-2.0"
+    assert set(payload["bot_prs"][0]) == {"number", "title", "author", "created_at", "base_ref", "head_ref"}
 
 
 def test_pr_status_names_the_base_branch() -> None:
-    """Verify the PR status payload carries base_ref alongside head_sha."""
+    """Verify the PR status payload carries base_ref and head_ref alongside head_sha."""
     payload = PrStatus(
         pr_number=7,
         title="t",
         head_sha="deadbeef",
+        head_ref="dependabot/pip/lib-2.0",
         base_ref="develop",
         mergeable=True,
         mergeable_state="clean",
@@ -224,6 +244,7 @@ def test_pr_status_names_the_base_branch() -> None:
         checks=[CheckSummary(name="lint", status="completed", conclusion="failure")],
     ).model_dump()
     assert payload["base_ref"] == "develop"
+    assert payload["head_ref"] == "dependabot/pip/lib-2.0"
     assert payload["head_sha"] == "deadbeef"
 
 
@@ -330,3 +351,41 @@ def test_srt_settings_rejects_malformed_fields(invalid_payload: dict[str, object
     """Verify SrtSettings raises ValidationError when filesystem or git fields are malformed."""
     with pytest.raises(ValidationError):
         SrtSettings.model_validate(invalid_payload)
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "payload"),
+    [
+        (
+            BotPrSummary,
+            {
+                "number": 7,
+                "title": "chore(deps): bump lib",
+                "author": "dependabot[bot]",
+                "created_at": "2026-01-02T03:04:05Z",
+                "base_ref": "develop",
+            },
+        ),
+        (
+            PrStatus,
+            {
+                "pr_number": 7,
+                "title": "t",
+                "head_sha": "deadbeef",
+                "base_ref": "develop",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "ci_status": "RED",
+                "merge_status": "CLEAN",
+                "checks": [],
+            },
+        ),
+    ],
+)
+def test_outbound_pr_models_require_head_ref(
+    model_cls: type[BotPrSummary | PrStatus],
+    payload: dict[str, object],
+) -> None:
+    """Verify BotPrSummary and PrStatus reject payloads that omit head_ref."""
+    with pytest.raises(ValidationError):
+        model_cls.model_validate(payload)

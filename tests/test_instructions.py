@@ -366,9 +366,11 @@ def test_default_pushes_to_original_branch(
 def test_default_includes_merge_from_main(
     instructions: types.TemplatedSystemInstructions,
 ) -> None:
-    """Verify instructions command merging main branch before attempting fixes by default."""
+    """Verify instructions command merging the PR's base branch before attempting fixes by default."""
     content = _section_content(instructions, "workflow")
-    assert "git merge origin/main" in content
+    assert "git merge origin/<base_ref>" in content
+    assert "origin/main" not in content
+    assert "merge main" not in content
 
 
 def test_standalone_fix_creates_new_branch(
@@ -1091,3 +1093,28 @@ def test_base_fix_is_excluded_from_auto_merge() -> None:
     """Merging the agent's own change to main is a bigger deal than a dep bump."""
     content = _section_content(_get_instructions(fix_base=True, auto_merge=True), "fix_base_branch")
     assert "MUST NOT merge" in content
+
+
+# --- PR 2: Branch accuracy & APR context ---
+
+
+def test_red_pr_branch_lookup_prefers_head_ref(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Verify RED PR instructions direct the agent to use head_ref directly, with list_branches as fallback."""
+    workflow = _section_content(instructions, "workflow")
+    assert "head_ref" in workflow
+    assert "list_branches" in workflow
+    assert workflow.index("head_ref") < workflow.index("list_branches")
+
+
+def test_red_pr_instructions_reference_get_pr_body_and_local_introspection(
+    instructions: types.TemplatedSystemInstructions,
+) -> None:
+    """Verify instructions direct the agent to call get_pr_body and introspect installed packages."""
+    code_quality = _section_content(instructions, "code_quality")
+    workflow = _section_content(instructions, "workflow")
+    assert "get_pr_body" in workflow
+    assert "get_pr_body" in code_quality
+    assert ".venv" in code_quality or "node_modules" in code_quality
+    assert "signature" in code_quality.lower()
