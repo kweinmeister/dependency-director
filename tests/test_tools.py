@@ -1,5 +1,6 @@
 """Tests for repository client and git command tools in dependency-director."""
 
+import json
 from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,9 +13,11 @@ from dependency_director.config import (
     RATE_LIMIT_MAX_ATTEMPTS,
     RATE_LIMIT_MAX_DELAY_SECONDS,
     BotConfig,
+    OutputLimits,
 )
 from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
+    AgentTools,
     GitHubAuthenticationError,
     GitHubClient,
     GitHubNotFoundError,
@@ -36,6 +39,12 @@ from .conftest import make_client_with_responses, make_client_with_status
 def tools(mock_client: MagicMock) -> WriteTools:
     """Fixture to set up write tools for status checking tests."""
     return _make_write_tools(client=mock_client, bots=DEFAULT_BOTS, dry_run=False, review_wait=0)
+
+
+@pytest.fixture
+def agent_tools(mock_client: MagicMock) -> AgentTools:
+    """Fixture to set up the full AgentTools bundle with default settings."""
+    return create_agent_tools(mock_client, DEFAULT_BOTS, dry_run=False, review_wait=0)
 
 
 @pytest.fixture
@@ -1207,3 +1216,91 @@ async def test_github_client_get_commit_tolerates_null_author_and_patch(github_t
         assert details.files[0].patch == ""
     finally:
         await client.close()
+
+
+# --- get_pr_body and list_open_prs body stripping ---
+
+
+@pytest.mark.asyncio
+async def test_list_bot_prs_excludes_body_to_save_tokens(
+    mock_client: MagicMock,
+    agent_tools: AgentTools,
+) -> None:
+    """Verify list_bot_prs omits PR bodies from serialized output while preserving head/base refs."""
+    mock_client.list_open_prs = AsyncMock(
+        return_value=[
+            PullRequest.model_validate(
+                {
+                    "number": 12,
+                    "title": "Bump lib from 1.0 to 2.0",
+                    "body": "## Huge release notes\n" + ("changelog line\n" * 500),
+                    "user": {"login": "dependabot[bot]"},
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "head": {"ref": "dependabot/pip/lib-2.0", "sha": "abc1234"},
+                    "base": {"ref": "develop", "sha": "def5678"},
+                },
+            ),
+        ],
+    )
+    raw_json = await agent_tools.list_bot_prs("owner", "repo")
+    parsed = json.loads(raw_json)
+    assert len(parsed["bot_prs"]) == 1
+    assert parsed["bot_prs"][0]["number"] == 12
+    assert parsed["bot_prs"][0]["head_ref"] == "dependabot/pip/lib-2.0"
+    assert parsed["bot_prs"][0]["base_ref"] == "develop"
+    assert "body" not in parsed["bot_prs"][0]
+    assert "Huge release notes" not in raw_json
+
+
+@pytest.mark.asyncio
+async def test_get_pr_body_fetches_and_returns_body(
+    mock_client: MagicMock,
+    agent_tools: AgentTools,
+) -> None:
+    """Verify get_pr_body fetches PR release notes/changelog on demand."""
+    mock_client.get_pr_body = AsyncMock(
+        return_value="### Release notes\n- Breaking: renamed `foo` to `bar`.",
+    )
+
+    body = await agent_tools.get_pr_body("owner", "repo", 42)
+
+    assert "Breaking: renamed `foo` to `bar`." in body
+    mock_client.get_pr_body.assert_awaited_once_with("owner", "repo", 42)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_body", [None, ""])
+async def test_github_client_get_pr_body_handles_null_or_empty_body(
+    github_token: str,
+    raw_body: str | None,
+) -> None:
+    """Verify GitHubClient.get_pr_body normalizes None or empty PR body to an empty string."""
+    client, _ = make_client_with_responses(
+        [httpx_mod.Response(200, json={"number": 42, "title": "bump pkg", "body": raw_body})],
+        token=github_token,
+    )
+    try:
+        assert await client.get_pr_body("owner", "repo", 42) == ""
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_get_pr_body_truncates_oversized_body(mock_client: MagicMock) -> None:
+    """Verify get_pr_body bounds giant Dependabot bodies using output_limits."""
+    agent_tools = create_agent_tools(
+        mock_client,
+        DEFAULT_BOTS,
+        dry_run=False,
+        review_wait=0,
+        output_limits=OutputLimits(max_lines=10, max_chars=200),
+    )
+    giant_body = "\n".join(f"Release note line {i}" for i in range(100))
+    mock_client.get_pr_body = AsyncMock(return_value=giant_body)
+
+    body = await agent_tools.get_pr_body("owner", "repo", 42)
+
+    assert "Release note line 0" in body
+    assert "Release note line 99" in body
+    assert "omitted] ..." in body
+    assert len(body) < len(giant_body)

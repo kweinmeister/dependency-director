@@ -966,6 +966,7 @@ async def test_list_bot_prs_reports_the_branch_each_pr_targets(
                     "title": "bump lib",
                     "user": {"login": DEFAULT_BOTS[0].author},
                     "created_at": "2026-08-01T00:00:00Z",
+                    "head": {"ref": "dependabot/pip/lib-2.0"},
                     "base": {"ref": "develop"},
                 },
             ),
@@ -973,6 +974,7 @@ async def test_list_bot_prs_reports_the_branch_each_pr_targets(
     )
     result = json.loads(await list_bot_prs("owner", "repo"))
     assert result["bot_prs"][0]["base_ref"] == "develop"
+    assert result["bot_prs"][0]["head_ref"] == "dependabot/pip/lib-2.0"
 
 
 @pytest.mark.asyncio
@@ -980,12 +982,12 @@ async def test_pr_status_reports_the_branch_the_pr_targets(
     mock_client: MagicMock,
     get_pr_status: ToolFn,
 ) -> None:
-    """A PR's status must carry its base, so a RED verdict can be attributed."""
+    """A PR's status must carry its base and head refs, so a RED verdict can be attributed and pushed."""
     mock_client.get_pr_details = AsyncMock(
         return_value={
             "number": 42,
             "title": "bump",
-            "head": {"sha": "sha123"},
+            "head": {"sha": "sha123", "ref": "dependabot/npm_and_yarn/byam-b929d93a17"},
             "base": {"ref": "release/2.0"},
             "mergeable": True,
             "mergeable_state": "clean",
@@ -995,3 +997,4 @@ async def test_pr_status_reports_the_branch_the_pr_targets(
     mock_client.get_commit_status = AsyncMock(return_value={"statuses": []})
     result = json.loads(await get_pr_status("owner", "repo", 42))
     assert result["base_ref"] == "release/2.0"
+    assert result["head_ref"] == "dependabot/npm_and_yarn/byam-b929d93a17"

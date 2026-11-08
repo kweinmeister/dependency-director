@@ -56,6 +56,7 @@ from dependency_director.schemas import (
     PatchedFile,
     PrStatus,
     PullRequest,
+    PullRequestBody,
     RepositoryPayload,
     SrtSettings,
     WorkflowJob,
@@ -379,6 +380,11 @@ class GitHubClient:
         """Get the GitHub username/login of a pull request author."""
         data = await self.get_pr_details(owner, repo, pr_number)
         return PullRequest.model_validate(data).author
+
+    async def get_pr_body(self, owner: str, repo: str, pr_number: int) -> str:
+        """Get the description/changelog body of a pull request."""
+        data = await self.get_pr_details(owner, repo, pr_number)
+        return PullRequestBody.model_validate(data).body
 
     async def merge_pr(self, owner: str, repo: str, pr_number: int) -> dict[str, Any]:
         """Merge a pull request using the squash-and-merge method."""
@@ -840,6 +846,7 @@ class AgentTools(NamedTuple):
     get_branch_ci_status: ToolFn
     get_commit_details: ToolFn
     get_file_contents: ToolFn
+    get_pr_body: ToolFn
     get_pr_diff: ToolFn
     get_pr_files: ToolFn
     get_pr_status: ToolFn
@@ -1239,6 +1246,7 @@ async def _check_ci(
         pr_number=pr_number,
         title=pr.title,
         head_sha=pr.head.sha,
+        head_ref=pr.head.ref,
         base_ref=pr.base.ref,
         mergeable=pr.mergeable,
         mergeable_state=pr.mergeable_state,
@@ -1379,9 +1387,9 @@ def _make_list_bot_prs(client: GitHubClient, bots: list[BotConfig]) -> ToolFn:
         """List open dependency-bot pull requests for a repository.
 
         Returns a compact JSON list with only the essential fields: number,
-        title, author, created_at, and base_ref — the branch the PR targets,
-        which is what 'get_branch_ci_status' should be asked about. Sorted
-        oldest first. Only PRs authored by configured bots are included.
+        title, author, created_at, base_ref (the branch the PR targets), and
+        head_ref (the remote branch name for checkout/push). Sorted oldest
+        first. Only PRs authored by configured bots are included.
         """
         allowed_authors = {b.author for b in bots}
         all_prs = await client.list_open_prs(owner, repo)
@@ -1392,6 +1400,7 @@ def _make_list_bot_prs(client: GitHubClient, bots: list[BotConfig]) -> ToolFn:
                 author=pr.author,
                 created_at=pr.created_at,
                 base_ref=pr.base.ref,
+                head_ref=pr.head.ref,
             )
             for pr in all_prs
             if pr.author in allowed_authors
@@ -1399,6 +1408,23 @@ def _make_list_bot_prs(client: GitHubClient, bots: list[BotConfig]) -> ToolFn:
         return json_payload(BotPrList(bot_prs=bot_prs, count=len(bot_prs)))
 
     return list_bot_prs
+
+
+def _make_get_pr_body(
+    client: GitHubClient,
+    output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
+) -> ToolFn:
+    async def get_pr_body(owner: str, repo: str, pr_number: int) -> str:
+        """Fetch the body/description (changelog and release notes) of a pull request.
+
+        Use this on demand when diagnosing a RED dependency PR to inspect
+        breaking changes, migration notes, or changelog entries without
+        paying the token cost on every open PR.
+        """
+        body = await client.get_pr_body(owner, repo, pr_number)
+        return _truncate_middle(body, output_limits)
+
+    return get_pr_body
 
 
 def _make_legacy_tools(client: GitHubClient) -> LegacyTools:
@@ -1498,6 +1524,7 @@ def create_agent_tools(
     dry_run: bool,
     review_wait: int,
     log_limits: LogLimits = DEFAULT_LOG_LIMITS,
+    output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS,
     branch_ci_delays: Sequence[float] | None = None,
 ) -> AgentTools:
     """Create all agent tool functions, including legacy tools, status tools, and workflow log tools."""
@@ -1515,6 +1542,7 @@ def create_agent_tools(
         get_branch_ci_status=_make_get_branch_ci_status(client, delays=branch_ci_delays),
         get_commit_details=legacy.get_commit_details,
         get_file_contents=legacy.get_file_contents,
+        get_pr_body=_make_get_pr_body(client, output_limits),
         get_pr_diff=legacy.get_pr_diff,
         get_pr_files=legacy.get_pr_files,
         get_pr_status=_make_get_pr_status(client),
