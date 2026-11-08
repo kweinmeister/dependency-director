@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from google.antigravity import types
 from google.antigravity.hooks import policy
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -110,6 +111,14 @@ PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 # the per-repo workspace, which is deleted before and after each repository —
 # a cache inside it would make every repo re-download every dependency.
 DEFAULT_CACHE_DIR: str = str(Path(tempfile.gettempdir()) / "dependency-director-cache")
+
+# Per-repository SDK guardrails. A stuck agent loop or a large repository with
+# dozens of open PRs can otherwise churn through turns or exhaust the context
+# window. Setting any of these to 0 disables that specific cap.
+DEFAULT_MAX_MODEL_CALLS = 100
+DEFAULT_MAX_TOOL_CALLS = 150
+DEFAULT_COMPACTION_TOKENS = 100_000
+MAX_SDK_CALL_LIMIT = 2_147_483_647
 
 DEFAULT_SRT_SETTINGS_PATH: str = str(
     importlib.resources.files("dependency_director") / "srt-settings.json",
@@ -244,6 +253,23 @@ class Settings(BaseSettings):
         default=DEFAULT_CACHE_DIR,
         validation_alias="depdirector_cache_dir",
     )
+    max_model_calls: int = Field(
+        default=DEFAULT_MAX_MODEL_CALLS,
+        ge=0,
+        le=MAX_SDK_CALL_LIMIT,
+        validation_alias="depdirector_max_model_calls",
+    )
+    max_tool_calls: int = Field(
+        default=DEFAULT_MAX_TOOL_CALLS,
+        ge=0,
+        le=MAX_SDK_CALL_LIMIT,
+        validation_alias="depdirector_max_tool_calls",
+    )
+    compaction_tokens: int = Field(
+        default=DEFAULT_COMPACTION_TOKENS,
+        ge=0,
+        validation_alias="depdirector_compaction_tokens",
+    )
 
     @property
     def output_limits(self) -> OutputLimits:
@@ -254,6 +280,23 @@ class Settings(BaseSettings):
     def log_limits(self) -> LogLimits:
         """Return the configured CI-log caps."""
         return LogLimits(max_failed_jobs=self.max_failed_jobs, tail_lines=self.workflow_log_tail_lines)
+
+    @property
+    def budget_config(self) -> types.BudgetConfig | None:
+        """Return the SDK BudgetConfig, or None when both call caps are disabled (0)."""
+        if not (self.max_model_calls or self.max_tool_calls):
+            return None
+        return types.BudgetConfig(
+            max_model_calls=self.max_model_calls or None,
+            max_tool_calls=self.max_tool_calls or None,
+        )
+
+    @property
+    def compaction_config(self) -> types.CompactionConfig | None:
+        """Return the SDK CompactionConfig, or None when compaction is disabled (0)."""
+        if self.compaction_tokens <= 0:
+            return None
+        return types.CompactionConfig(token_threshold=self.compaction_tokens)
 
     model_config = SettingsConfigDict(
         env_file=".env",

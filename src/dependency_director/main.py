@@ -28,16 +28,18 @@ from dependency_director.config import (
     get_dry_run_policies,
     get_safety_policies,
 )
-from dependency_director.instructions import get_system_instructions
-from dependency_director.schemas import PullRequest
-from dependency_director.tools import (
+from dependency_director.github_client import (
     GitHubClient,
     GitHubClientError,
-    create_agent_tools,
+)
+from dependency_director.instructions import get_system_instructions
+from dependency_director.sandbox import (
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
 )
+from dependency_director.schemas import PullRequest
+from dependency_director.tools import create_agent_tools
 
 MAX_ARGS_DISPLAY_LEN = 80
 
@@ -64,6 +66,7 @@ console = Console(
             "status": "cyan",
         },
     ),
+    highlight=False,
 )
 
 
@@ -443,6 +446,8 @@ async def run_agent_for_repo(
                     types.BuiltinTools.GENERATE_IMAGE,
                 ],
             ),
+            budget_config=settings.budget_config,
+            compaction_config=settings.compaction_config,
         )
 
         mode_str = "Vertex AI" if settings.vertex else "Developer API"
@@ -483,6 +488,14 @@ async def run_agent_for_repo(
             finally:
                 root_logger.removeHandler(issues)
 
+            stop_reason = getattr(response, "stop_reason", None)
+            stopped_early = False
+            if isinstance(stop_reason, types.StopReason) and stop_reason is not types.StopReason.UNSPECIFIED:
+                stopped_early = True
+                console.print(
+                    f"\n[bold yellow]⚠ Agent execution for {repo} stopped early "
+                    f"({stop_reason.value}); the run may be incomplete.[/bold yellow]",
+                )
             if issues.messages:
                 console.print(
                     f"\n[bold yellow]⚠ Agent execution for {repo} ended with "
@@ -491,7 +504,7 @@ async def run_agent_for_repo(
                 )
                 for message in issues.messages:
                     console.print(f"  [yellow]{message}[/yellow]")
-            else:
+            elif not stopped_early:
                 console.print(
                     f"\n[bold green]✨ Agent execution completed for {repo}.[/bold green]",
                 )

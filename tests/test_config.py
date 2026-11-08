@@ -26,6 +26,7 @@ from dependency_director.config import (
     get_dry_run_policies,
     get_safety_policies,
 )
+from dependency_director.github_client import GitHubClient
 from dependency_director.main import (
     PROJECT_ROOT,
     SKILLS_PATH,
@@ -33,7 +34,6 @@ from dependency_director.main import (
     run_agent_for_repo,
 )
 from dependency_director.schemas import PullRequest
-from dependency_director.tools import GitHubClient
 
 from .conftest import AsyncFSHelper
 
@@ -963,7 +963,7 @@ async def test_run_agent_for_repo_early_halt(
     settings = Settings()
     settings.github_token = github_token
     settings.gemini_api_key = "placeholder-key"
-    with patch("dependency_director.tools.GitHubClient.list_open_prs", new_callable=AsyncMock) as mock_list:
+    with patch("dependency_director.github_client.GitHubClient.list_open_prs", new_callable=AsyncMock) as mock_list:
         mock_list.return_value = []
         await run_agent_for_repo(repo="test-owner/test-repo", settings=settings, max_attempts=3)
         mock_agent_class.assert_not_called()
@@ -1056,3 +1056,264 @@ async def test_run_agent_for_repo_chat_error_does_not_crash(
         standalone_fix=False,
         review_wait=0,
     )
+
+
+# --- SDK Guardrails: BudgetConfig, CompactionConfig, StopReason ---
+
+
+def test_sdk_guardrail_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify default values and constants for max_model_calls, max_tool_calls, and compaction_tokens."""
+    from dependency_director.config import (
+        DEFAULT_COMPACTION_TOKENS,
+        DEFAULT_MAX_MODEL_CALLS,
+        DEFAULT_MAX_TOOL_CALLS,
+    )
+
+    assert DEFAULT_MAX_MODEL_CALLS == 100
+    assert DEFAULT_MAX_TOOL_CALLS == 150
+    assert DEFAULT_COMPACTION_TOKENS == 100_000
+
+    for var in (
+        "DEPDIRECTOR_MAX_MODEL_CALLS",
+        "DEPDIRECTOR_MAX_TOOL_CALLS",
+        "DEPDIRECTOR_COMPACTION_TOKENS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    s = Settings()
+    assert s.max_model_calls == 100
+    assert s.max_tool_calls == 150
+    assert s.compaction_tokens == 100_000
+
+
+@pytest.mark.parametrize(
+    ("max_model_calls", "max_tool_calls", "compaction_tokens"),
+    [
+        (40, 60, 50_000),
+        (0, 0, 0),
+    ],
+)
+def test_sdk_guardrail_env_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    max_model_calls: int,
+    max_tool_calls: int,
+    compaction_tokens: int,
+) -> None:
+    """Verify env var overrides for positive and zero (disabled) SDK guardrail settings."""
+    monkeypatch.setenv("DEPDIRECTOR_MAX_MODEL_CALLS", str(max_model_calls))
+    monkeypatch.setenv("DEPDIRECTOR_MAX_TOOL_CALLS", str(max_tool_calls))
+    monkeypatch.setenv("DEPDIRECTOR_COMPACTION_TOKENS", str(compaction_tokens))
+
+    s = Settings()
+    assert s.max_model_calls == max_model_calls
+    assert s.max_tool_calls == max_tool_calls
+    assert s.compaction_tokens == compaction_tokens
+
+
+@pytest.mark.parametrize(
+    ("env_var", "invalid_value"),
+    [
+        ("DEPDIRECTOR_MAX_MODEL_CALLS", "-1"),
+        ("DEPDIRECTOR_MAX_TOOL_CALLS", "-1"),
+        ("DEPDIRECTOR_COMPACTION_TOKENS", "-1"),
+        ("DEPDIRECTOR_MAX_MODEL_CALLS", "2147483648"),
+        ("DEPDIRECTOR_MAX_TOOL_CALLS", "2147483648"),
+    ],
+)
+def test_sdk_guardrail_rejects_out_of_range_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_var: str,
+    invalid_value: str,
+) -> None:
+    """Verify Settings raises ValidationError when guardrail env vars are negative or exceed MAX_SDK_CALL_LIMIT."""
+    monkeypatch.setenv(env_var, invalid_value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+@pytest.mark.asyncio
+async def test_agent_config_wires_default_budget_and_compaction(
+    mock_agent_class: MagicMock,
+    github_token: str,
+) -> None:
+    """Verify LocalAgentConfig receives BudgetConfig and CompactionConfig by default."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+
+    config_passed = mock_agent_class.call_args[1]["config"]
+    assert config_passed.budget_config == types.BudgetConfig(max_model_calls=100, max_tool_calls=150)
+    assert config_passed.compaction_config == types.CompactionConfig(token_threshold=100_000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_model_calls", "max_tool_calls", "compaction_tokens", "expected_budget", "expected_compaction"),
+    [
+        (0, 0, 0, None, None),
+        (
+            0,
+            75,
+            50_000,
+            types.BudgetConfig(max_model_calls=None, max_tool_calls=75),
+            types.CompactionConfig(token_threshold=50_000),
+        ),
+        (
+            25,
+            0,
+            0,
+            types.BudgetConfig(max_model_calls=25, max_tool_calls=None),
+            None,
+        ),
+    ],
+)
+async def test_agent_config_disables_budget_and_compaction_when_zero(
+    mock_agent_class: MagicMock,
+    github_token: str,
+    max_model_calls: int,
+    max_tool_calls: int,
+    compaction_tokens: int,
+    expected_budget: types.BudgetConfig | None,
+    expected_compaction: types.CompactionConfig | None,
+) -> None:
+    """Verify setting guardrail caps to 0 passes None to LocalAgentConfig."""
+    settings = Settings()
+    settings.max_model_calls = max_model_calls
+    settings.max_tool_calls = max_tool_calls
+    settings.compaction_tokens = compaction_tokens
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+
+    config_passed = mock_agent_class.call_args[1]["config"]
+    assert config_passed.budget_config == expected_budget
+    assert config_passed.compaction_config == expected_compaction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_reason",
+    [
+        types.StopReason.MAX_TOOL_CALLS_EXCEEDED,
+        types.StopReason.QUOTA_EXHAUSTED,
+    ],
+)
+async def test_run_agent_for_repo_warns_on_early_stop_reason(
+    mock_agent_class: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    github_token: str,
+    stop_reason: types.StopReason,
+) -> None:
+    """Verify run_agent_for_repo prints a warning and omits completion message when stopped early."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    mock_response = MagicMock()
+    mock_response.chunks = _empty_chunks()
+    mock_response.stop_reason = stop_reason
+    mock_agent_class.return_value.chat = AsyncMock(return_value=mock_response)
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+
+    captured = capsys.readouterr()
+    normalized = " ".join(captured.out.split())
+    assert (
+        f"⚠ Agent execution for test-owner/test-repo stopped early ({stop_reason.value}); the run may be incomplete."
+    ) in normalized
+    assert "✨ Agent execution completed" not in normalized
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_surfaces_both_stop_reason_and_logged_sdk_issues(
+    mock_agent_class: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    github_token: str,
+) -> None:
+    """Verify both stop_reason and logged SDK warnings are printed when both occur on the same turn."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    async def chat_with_warning_and_stop(_prompt: str) -> MagicMock:
+        logging.getLogger().warning("SDK budget exhausted mid-step")
+        response = MagicMock()
+        response.chunks = _empty_chunks()
+        response.stop_reason = types.StopReason.MAX_MODEL_CALLS_EXCEEDED
+        return response
+
+    mock_agent_class.return_value.chat = AsyncMock(side_effect=chat_with_warning_and_stop)
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+    )
+
+    normalized = " ".join(capsys.readouterr().out.split())
+    assert "stopped early (MAX_MODEL_CALLS_EXCEEDED)" in normalized
+    assert "SDK budget exhausted mid-step" in normalized
+    assert "✨ Agent execution completed" not in normalized
+
+
+@pytest.mark.asyncio
+async def test_run_agent_for_repo_prints_completion_when_stop_reason_unspecified(
+    mock_agent_class: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    github_token: str,
+) -> None:
+    """Verify run_agent_for_repo prints the normal completion message when stop_reason is UNSPECIFIED."""
+    settings = Settings()
+    settings.github_token = github_token
+    settings.gemini_api_key = "placeholder-key"
+
+    mock_response = MagicMock()
+    mock_response.chunks = _empty_chunks()
+    mock_response.stop_reason = types.StopReason.UNSPECIFIED
+    mock_agent_class.return_value.chat = AsyncMock(return_value=mock_response)
+
+    await run_agent_for_repo(
+        repo="test-owner/test-repo",
+        settings=settings,
+        max_attempts=3,
+        dry_run=True,
+        auto_merge=False,
+        verify_all=False,
+        standalone_fix=False,
+        review_wait=0,
+    )
+
+    captured = capsys.readouterr()
+    assert "✨ Agent execution completed for test-owner/test-repo." in captured.out
+    assert "stopped early" not in captured.out

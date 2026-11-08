@@ -28,6 +28,7 @@ from dependency_director.schemas import (
     PullRequest,
     PullRequestBody,
     PullRequestRef,
+    PullRequestReview,
     RepositoryPayload,
     SrtSettings,
     WorkflowJobsResponse,
@@ -389,3 +390,54 @@ def test_outbound_pr_models_require_head_ref(
     """Verify BotPrSummary and PrStatus reject payloads that omit head_ref."""
     with pytest.raises(ValidationError):
         model_cls.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("raw_review", "expected_author", "expected_state", "expected_body"),
+    [
+        (
+            {"id": 10, "user": {"login": "reviewer"}, "state": "APPROVED", "body": None},
+            "reviewer",
+            "APPROVED",
+            "",
+        ),
+        (
+            {"id": None, "user": None, "state": None, "body": "Needs work"},
+            "unknown",
+            "",
+            "Needs work",
+        ),
+        (
+            {"user": {"login": None}, "state": "COMMENTED"},
+            "unknown",
+            "COMMENTED",
+            "",
+        ),
+    ],
+)
+def test_pull_request_review_normalizes_null_fields(
+    raw_review: dict[str, object],
+    expected_author: str,
+    expected_state: str,
+    expected_body: str,
+) -> None:
+    """Verify PullRequestReview normalizes null user, state, and body values cleanly."""
+    review = PullRequestReview.model_validate(raw_review)
+    assert review.author == expected_author
+    assert review.state == expected_state
+    assert review.body == expected_body
+
+
+@pytest.mark.parametrize(
+    ("raw_commit", "expected_login"),
+    [
+        ({"sha": "abc", "author": {"login": "dependabot[bot]"}}, "dependabot[bot]"),
+        ({"sha": "abc", "author": None}, ""),
+        ({"sha": "abc", "author": {"login": None}}, ""),
+        ({"sha": "abc"}, ""),
+    ],
+)
+def test_commit_response_github_login(raw_commit: dict[str, object], expected_login: str) -> None:
+    """Verify CommitResponse.github_login extracts top-level GitHub login or defaults to empty string."""
+    parsed = CommitResponse.model_validate(raw_commit)
+    assert parsed.github_login == expected_login

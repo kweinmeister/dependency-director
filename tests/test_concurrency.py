@@ -10,8 +10,8 @@ import httpx as httpx_mod
 import pytest
 
 from dependency_director.config import Settings
+from dependency_director.github_client import GitHubAuthenticationError, GitHubClient
 from dependency_director.main import get_repositories, run_agent, run_agent_for_repo
-from dependency_director.tools import GitHubAuthenticationError, GitHubClient
 
 
 @pytest.mark.asyncio
@@ -318,7 +318,7 @@ async def test_sdk_issues_are_reported_under_the_repo_that_caused_them(
         ),
     )
 
-    output = capsys.readouterr().out
+    output = " ".join(capsys.readouterr().out.split())
     for name in ("repo-a", "repo-b"):
         assert f"Agent execution for test-owner/{name} ended with 1 error(s)" in output
         # Reported once, by the run that caused it — not echoed under the other.

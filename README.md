@@ -215,7 +215,9 @@ all pushes and merges, and the agent runs a self-review before
 committing any fix.
 
 See
-[`src/dependency_director/config.py`](src/dependency_director/config.py)
+[`src/dependency_director/config.py`](src/dependency_director/config.py),
+[`src/dependency_director/sandbox.py`](src/dependency_director/sandbox.py),
+[`src/dependency_director/github_client.py`](src/dependency_director/github_client.py),
 and
 [`src/dependency_director/tools.py`](src/dependency_director/tools.py)
 for the full policy and validation implementation.
@@ -301,11 +303,14 @@ file. A template is provided in [`.env.template`](.env.template).
 | `DEPDIRECTOR_BOTS`              | JSON array of bot configs (`[{"author":"...","rebase_command":"..."}]`).                    | Default bots (automated dependency update tools like Renovate/Dependabot) |
 | `DEPDIRECTOR_CACHE_DIR`         | Package cache shared by every repository and run (see [Package cache](#package-cache)).     | `<tmp>/dependency-director-cache`                                         |
 | `DEPDIRECTOR_COMMAND_TIMEOUT`   | Seconds allowed per sandboxed command before it is killed (minimum 10).                     | `300`                                                                     |
+| `DEPDIRECTOR_COMPACTION_TOKENS` | Token count threshold for automatic SDK context compaction (0 = disabled).                  | `100000`                                                                  |
 | `DEPDIRECTOR_CONCURRENCY`       | Maximum concurrent repository operations (1 = sequential).                                  | `1`                                                                       |
 | `DEPDIRECTOR_MAX_FAILED_JOBS`   | Failed CI jobs whose logs are fetched per red PR; the rest are counted and reported.        | `3`                                                                       |
 | `DEPDIRECTOR_MAX_FIX_ATTEMPTS`  | Maximum iterative fix-and-test attempts per failing PR.                                     | `3`                                                                       |
+| `DEPDIRECTOR_MAX_MODEL_CALLS`   | Maximum LLM turns allowed per repository run (0 = unlimited).                               | `100`                                                                     |
 | `DEPDIRECTOR_MAX_OUTPUT_CHARS`  | Characters kept per stream from each command's output (0 = unlimited).                      | `24000`                                                                   |
 | `DEPDIRECTOR_MAX_OUTPUT_LINES`  | Lines kept per stream from each command's output; the middle is dropped (0 = unlimited).    | `200`                                                                     |
+| `DEPDIRECTOR_MAX_TOOL_CALLS`    | Maximum tool invocations allowed per repository run (0 = unlimited).                        | `150`                                                                     |
 | `DEPDIRECTOR_MODEL`             | Gemini model identifier to use (e.g. `gemini-3.8-flash`).                                  | `gemini-3.8-flash`                                                        |
 | `DEPDIRECTOR_NO_SANDBOX`        | Set to `true` to disable sandbox-runtime (srt) sandboxing.                                  | `false`                                                                   |
 | `DEPDIRECTOR_OWNER`             | Default GitHub user or organization to scan (can be overridden by CLI argument).            | _(Optional)_                                                              |

@@ -120,6 +120,24 @@ class PullRequestBody(_Inbound):
     body: NonNullStr = ""
 
 
+class PullRequestReview(_Inbound):
+    """One pull request review entry from ``/pulls/{number}/reviews``."""
+
+    id: int | None = None
+    user: GitHubUser | None = None
+    state: NonNullStr = ""
+    body: NonNullStr = ""
+
+    @property
+    def author(self) -> str:
+        """Return the reviewer's login, or ``'unknown'`` when null or absent."""
+        return (self.user.login or "unknown") if self.user else "unknown"
+
+    def dedup_key(self, index: int) -> int | tuple[str, str, str, int]:
+        """Return a stable key so pre-existing reviews can be distinguished from new ones."""
+        return self.id if self.id is not None else (self.author, self.state, self.body, index)
+
+
 # --- Inbound: checks, statuses, and workflow runs ---
 
 
@@ -180,6 +198,9 @@ class WorkflowJobsResponse(_Inbound):
     jobs: list[WorkflowJob] = Field(default_factory=list)
 
 
+# --- Inbound: commits and repositories ---
+
+
 class GitCommitAuthor(_Inbound):
     """The Git-level author metadata inside a commit payload."""
 
@@ -213,17 +234,24 @@ class CommitFilePayload(_Inbound):
 
 
 class CommitResponse(_Inbound):
-    """One commit payload from ``/commits`` or ``/commits/{sha}``."""
+    """One commit payload from ``/commits``, ``/commits/{sha}``, or ``/pulls/{n}/commits``."""
 
     sha: str = ""
+    author: GitHubUser | None = None
     commit: GitCommitPayload = Field(default_factory=GitCommitPayload)
     files: list[CommitFilePayload] = Field(default_factory=list)
 
+    @property
+    def github_login(self) -> str:
+        """Return the GitHub account login associated with the commit, or empty string."""
+        return (self.author.login or "") if self.author else ""
+
 
 class RepositoryPayload(_Inbound):
-    """One repository entry from ``/user/repos``, ``/users/{o}/repos``, or ``/orgs/{o}/repos``."""
+    """One repository entry from ``/repos/{o}/{r}``, ``/user/repos``, ``/users/{o}/repos``, or ``/orgs/{o}/repos``."""
 
     name: str = ""
+    default_branch: NonNullStr = "main"
     fork: bool = False
     archived: bool = False
     disabled: bool = False
@@ -289,6 +317,13 @@ class BotPrSummary(BaseModel):
     head_ref: str
 
 
+class BotPrList(BaseModel):
+    """The reply to ``list_bot_prs``."""
+
+    bot_prs: list[BotPrSummary]
+    count: int
+
+
 class OpenPrSummary(BaseModel):
     """The reply to ``find_open_pr_for_branch`` when a branch already has a PR.
 
@@ -300,13 +335,6 @@ class OpenPrSummary(BaseModel):
     title: str
     html_url: str
     base_ref: str
-
-
-class BotPrList(BaseModel):
-    """The reply to ``list_bot_prs``."""
-
-    bot_prs: list[BotPrSummary]
-    count: int
 
 
 class BranchCiStatus(BaseModel):
