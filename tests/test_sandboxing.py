@@ -274,16 +274,10 @@ async def test_sandbox_home_allowlist_enforced(tmp_path: Path, async_fs: type[As
     await async_fs.write_text(cargo_config, "placeholder_cargo_config")
     await async_fs.write_text(secret_doc, "secret_data")
     try:
-        output_cargo, output_secret = await asyncio.gather(
-            run_command(f"cat {cargo_config}"),
-            run_command(f"cat {secret_doc}"),
-        )
-        assert "Permission denied" not in output_cargo
-        assert "Operation not permitted" not in output_cargo
-        assert get_stdout(output_cargo) == "placeholder_cargo_config"
+        output = await run_command(f"cat {cargo_config} {secret_doc}")
+        assert get_stdout(output) == "placeholder_cargo_config"
         assert any(
-            msg in output_secret
-            for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
+            msg in output for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
         )
     finally:
         with contextlib.suppress(Exception):
@@ -341,16 +335,11 @@ async def test_sandbox_custom_denylist_enforced(tmp_path: Path, async_fs: type[A
     await async_fs.write_text(custom_settings_path, json.dumps(config))
     run_command = create_run_command_tool(workspace, srt_settings_path=custom_settings_path)
     try:
-        output1, output2 = await asyncio.gather(
-            run_command(f"cat {blocked_file}"),
-            run_command(f"cat {allowed_file}"),
-        )
+        output = await run_command(f"cat {allowed_file} {blocked_file}")
+        assert get_stdout(output) == "allowed_data"
         assert any(
-            msg in output1 for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
+            msg in output for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
         )
-        assert "Permission denied" not in output2
-        assert "Operation not permitted" not in output2
-        assert get_stdout(output2) == "allowed_data"
     finally:
         with contextlib.suppress(Exception):
             await async_fs.unlink(blocked_file)
@@ -413,12 +402,8 @@ async def test_sandbox_git_conflict_resolution_commands(tmp_path: Path, async_fs
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     run_command = create_run_command_tool(workspace)
-    output_fetch, output_merge, output_push = await asyncio.gather(
-        run_command("git fetch origin main"),
-        run_command("git merge origin/main"),
-        run_command("git push origin HEAD"),
-    )
-    for output in (output_fetch, output_merge, output_push):
+    for cmd in ("git fetch origin main", "git merge origin/main", "git push origin HEAD"):
+        output = await run_command(cmd)
         assert "Permission denied" not in output
         assert "Operation not permitted" not in output
         assert "not a git repository" in output.lower() or "fatal:" in output.lower()
@@ -1174,17 +1159,19 @@ async def test_sandbox_prevents_cross_workspace_and_root_tmp_writes(async_fs: ty
         try:
             with contextlib.suppress(Exception):
                 await async_fs.unlink(root_tmp_target)
-            out_sibling, out_tmp = await asyncio.gather(
-                run_a(f"python3 -c \"open('{sibling_target}', 'w').write('pwned')\""),
-                run_a(f"python3 -c \"open('{root_tmp_target}', 'w').write('pwned')\""),
+            script = (
+                "import pathlib\n"
+                f"for p in ({str(sibling_target)!r}, {root_tmp_target!r}):\n"
+                "    try:\n"
+                "        pathlib.Path(p).write_text('pwned')\n"
+                "    except OSError as e:\n"
+                "        print(f'{p}: {e}')"
             )
-            assert any(
-                msg in out_sibling for msg in ("Operation not permitted", "Permission denied", "Read-only file system")
-            )
+            out = await run_a(f"python3 -c {shlex.quote(script)}")
+            assert any(msg in out for msg in ("Operation not permitted", "Permission denied", "Read-only file system"))
+            assert str(sibling_target) in out
+            assert root_tmp_target in out
             assert (await async_fs.read_text(str(sibling_target))).strip() == "untouched"
-            assert any(
-                msg in out_tmp for msg in ("Operation not permitted", "Permission denied", "Read-only file system")
-            )
             assert not await async_fs.exists(root_tmp_target)
         finally:
             cleanup = getattr(run_a, "cleanup", None)

@@ -54,7 +54,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap ripgrep socat
       - name: Install sandbox-runtime (srt)
-        run: sudo npm install -g @anthropic-ai/sandbox-runtime
+        run: sudo npm install -g --no-fund @anthropic-ai/sandbox-runtime
       - name: Disable AppArmor userns restriction
         run: |
           sudo sysctl -w \
