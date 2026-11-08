@@ -9,11 +9,10 @@ import httpx as httpx_mod
 import pytest
 
 from dependency_director.config import DEFAULT_BOTS, DEFAULT_MAX_FAILED_JOBS, LogLimits
+from dependency_director.github_client import GitHubClient, GitHubNotFoundError
 from dependency_director.schemas import PullRequest
 from dependency_director.tools import (
     AgentTools,
-    GitHubClient,
-    GitHubNotFoundError,
     ToolFn,
     _check_ci,
     _make_get_branch_ci_status,

@@ -15,13 +15,16 @@ from dependency_director.config import (
     BotConfig,
     OutputLimits,
 )
-from dependency_director.schemas import PullRequest
-from dependency_director.tools import (
-    AgentTools,
+from dependency_director.github_client import (
     GitHubAuthenticationError,
     GitHubClient,
     GitHubNotFoundError,
     GitHubRateLimitError,
+    validate_repo_params,
+)
+from dependency_director.schemas import PullRequest, PullRequestReview
+from dependency_director.tools import (
+    AgentTools,
     ToolFn,
     WriteTools,
     _check_bot_author,
@@ -347,6 +350,26 @@ async def test_wait_for_reviews_missing_user_key(mock_client: MagicMock, wait_to
         result = await wait("owner", "repo", 42)
     assert "unknown" in result
     assert "Needs fix" in result
+
+
+@pytest.mark.asyncio
+async def test_wait_for_reviews_tolerates_null_body_and_user(
+    mock_client: MagicMock,
+    wait_tool: Callable[..., ToolFn],
+) -> None:
+    """Verify wait_for_reviews handles explicit JSON null body and user payloads without crashing."""
+    wait = wait_tool(review_wait=1)
+    mock_client.get_pr_reviews = AsyncMock(
+        side_effect=[
+            [],
+            [{"id": 99, "user": None, "body": None, "state": "APPROVED"}],
+        ],
+    )
+    with patch("dependency_director.tools.asyncio.sleep", new_callable=AsyncMock):
+        result = await wait("owner", "repo", 42)
+    assert "Review comments found" in result
+    assert "unknown" in result
+    assert "APPROVED" in result
 
 
 @pytest.mark.asyncio
@@ -1304,3 +1327,51 @@ async def test_get_pr_body_truncates_oversized_body(mock_client: MagicMock) -> N
     assert "Release note line 99" in body
     assert "omitted] ..." in body
     assert len(body) < len(giant_body)
+
+
+# --- Module decomposition & public interface ---
+
+
+@pytest.mark.parametrize(
+    "mod_name",
+    [
+        "argv",
+        "config",
+        "github_client",
+        "instructions",
+        "main",
+        "sandbox",
+        "schemas",
+        "tools",
+    ],
+)
+def test_decomposed_modules_exist_and_stay_under_1000_lines(mod_name: str) -> None:
+    """Verify every package module in dependency_director stays under the 1,000-line ceiling."""
+    import importlib
+    from pathlib import Path
+
+    mod = importlib.import_module(f"dependency_director.{mod_name}")
+    assert mod.__file__ is not None
+    line_count = len(Path(mod.__file__).read_text(encoding="utf-8").splitlines())
+    assert line_count < 1000, f"{mod_name}.py has {line_count} lines (must be < 1,000)"
+
+
+def test_validate_repo_params_rejects_invalid_identifiers() -> None:
+    """Verify validate_repo_params accepts valid GitHub owner/repo names and rejects traversal or spaces."""
+    validate_repo_params("octocat", "hello-world.py_1")
+    with pytest.raises(ValueError, match="Invalid owner name"):
+        validate_repo_params("../etc", "repo")
+    with pytest.raises(ValueError, match="Invalid repository name"):
+        validate_repo_params("octocat", "bad/repo")
+
+
+def test_pull_request_review_dedup_key_prefers_id_and_falls_back() -> None:
+    """Verify PullRequestReview.dedup_key uses review id when present and falls back to author/state/body/index."""
+    with_id = PullRequestReview.model_validate(
+        {"id": 42, "user": {"login": "bot"}, "state": "COMMENTED", "body": "lgtm"},
+    )
+    without_id = PullRequestReview.model_validate(
+        {"user": {"login": "bot"}, "state": "COMMENTED", "body": "lgtm"},
+    )
+    assert with_id.dedup_key(0) == 42
+    assert without_id.dedup_key(3) == ("bot", "COMMENTED", "lgtm", 3)

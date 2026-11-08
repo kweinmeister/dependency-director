@@ -10,8 +10,9 @@ import httpx as httpx_mod
 import pytest
 
 from dependency_director.config import DEFAULT_BOTS, BotConfig
+from dependency_director.github_client import GitHubClient
 from dependency_director.schemas import PullRequest
-from dependency_director.tools import GitHubClient, ToolFn, _make_write_tools
+from dependency_director.tools import ToolFn, _make_write_tools
 
 
 @pytest.fixture
@@ -117,10 +118,19 @@ def mock_agent_class() -> Generator[MagicMock]:
 
 
 @pytest.fixture(autouse=True)
+def reset_rich_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep Rich console output uncolored and width-stable across terminal environments."""
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("TTY_COMPATIBLE", raising=False)
+    monkeypatch.setattr("dependency_director.main.console._color_system", None)
+    monkeypatch.setattr("dependency_director.main.console._width", 120)
+
+
+@pytest.fixture(autouse=True)
 def mock_list_open_prs() -> Generator[MagicMock]:
     """Mock list_open_prs globally to return a placeholder bot PR in tests."""
     with patch(
-        "dependency_director.tools.GitHubClient.list_open_prs",
+        "dependency_director.github_client.GitHubClient.list_open_prs",
         new_callable=AsyncMock,
     ) as mock:
 

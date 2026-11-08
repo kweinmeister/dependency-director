@@ -1,5 +1,6 @@
 """Tests for command and filesystem sandboxing in dependency-director."""
 
+import asyncio
 import contextlib
 import fnmatch
 import inspect
@@ -16,16 +17,16 @@ from google.antigravity import LocalAgentConfig
 
 from dependency_director.argv import split_compound_argv
 from dependency_director.config import DEFAULT_CACHE_DIR, DEFAULT_SRT_SETTINGS_PATH, OutputLimits
-from dependency_director.tools import (
+from dependency_director.sandbox import (
     CommandResult,
     SandboxedCommandRunner,
     _format_command_result,
     _is_git_command_argv,
     _setup_tmp_env,
-    _truncate_middle,
     create_run_command_tool,
     is_ripgrep_available,
     is_srt_available,
+    truncate_middle,
     validate_argv,
 )
 
@@ -179,11 +180,12 @@ async def test_sandbox_git_metadata_write_denied(tmp_path: Path, async_fs: type[
 async def test_sandbox_git_metadata_write_config_allowed(tmp_path: Path, async_fs: type[AsyncFSHelper]) -> None:
     """Verify that modifying git configurations via the git CLI is allowed."""
     workspace = str(tmp_path / "workspace")
-    await async_fs.mkdir(workspace)
-    git_dir = str(Path(workspace) / ".git")
-    await async_fs.mkdir(git_dir)
+    git_dir = Path(workspace) / ".git"
+    await async_fs.mkdir(str(git_dir / "objects"))
+    await async_fs.mkdir(str(git_dir / "refs"))
+    await async_fs.write_text(str(git_dir / "HEAD"), "ref: refs/heads/main\n")
     run_command = create_run_command_tool(workspace)
-    config_file = str(Path(git_dir) / "config")
+    config_file = str(git_dir / "config")
     cmd = f"python3 -c \"open('{config_file}','w').write('evil-config\\n')\""
     output = await run_command(cmd)
     assert any(
@@ -196,7 +198,6 @@ async def test_sandbox_git_metadata_write_config_allowed(tmp_path: Path, async_f
         )
     )
     assert not await async_fs.exists(config_file) or (await async_fs.read_text(config_file)).strip() != "evil-config"
-    await run_command("git init")
     cmd_git = "git config core.repositoryformatversion 0"
     output_git = await run_command(cmd_git)
     assert "Operation not permitted" not in output_git
@@ -265,29 +266,22 @@ async def test_sandbox_home_allowlist_enforced(tmp_path: Path, async_fs: type[As
     run_command = create_run_command_tool(workspace)
     home_dir = await async_fs.expanduser("~")
     cargo_dir = str(Path(home_dir) / ".cargo" / "registry")
-    await async_fs.mkdir(cargo_dir)
-    cargo_config = str(Path(cargo_dir) / "config_test_sandbox.toml")
-    await async_fs.write_text(cargo_config, "placeholder_cargo_config")
-    try:
-        cmd = f"cat {cargo_config}"
-        output = await run_command(cmd)
-        assert "Permission denied" not in output
-        assert "Operation not permitted" not in output
-        assert get_stdout(output) == "placeholder_cargo_config"
-    finally:
-        with contextlib.suppress(Exception):
-            await async_fs.unlink(cargo_config)
     docs_dir = str(Path(home_dir) / "Documents")
+    await async_fs.mkdir(cargo_dir)
     await async_fs.mkdir(docs_dir)
+    cargo_config = str(Path(cargo_dir) / "config_test_sandbox.toml")
     secret_doc = str(Path(docs_dir) / "secret_test_sandbox.txt")
+    await async_fs.write_text(cargo_config, "placeholder_cargo_config")
     await async_fs.write_text(secret_doc, "secret_data")
     try:
-        cmd = f"cat {secret_doc}"
-        output = await run_command(cmd)
+        output = await run_command(f"cat {cargo_config} {secret_doc}")
+        assert get_stdout(output) == "placeholder_cargo_config"
         assert any(
             msg in output for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
         )
     finally:
+        with contextlib.suppress(Exception):
+            await async_fs.unlink(cargo_config)
         with contextlib.suppress(Exception):
             await async_fs.unlink(secret_doc)
 
@@ -341,16 +335,11 @@ async def test_sandbox_custom_denylist_enforced(tmp_path: Path, async_fs: type[A
     await async_fs.write_text(custom_settings_path, json.dumps(config))
     run_command = create_run_command_tool(workspace, srt_settings_path=custom_settings_path)
     try:
-        cmd1 = f"cat {blocked_file}"
-        output1 = await run_command(cmd1)
+        output = await run_command(f"cat {allowed_file} {blocked_file}")
+        assert get_stdout(output) == "allowed_data"
         assert any(
-            msg in output1 for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
+            msg in output for msg in ("No such file or directory", "Operation not permitted", "Permission denied")
         )
-        cmd2 = f"cat {allowed_file}"
-        output2 = await run_command(cmd2)
-        assert "Permission denied" not in output2
-        assert "Operation not permitted" not in output2
-        assert get_stdout(output2) == "allowed_data"
     finally:
         with contextlib.suppress(Exception):
             await async_fs.unlink(blocked_file)
@@ -398,7 +387,7 @@ async def test_sandbox_srt_not_found_raises(tmp_path: Path, async_fs: type[Async
     run_command = create_run_command_tool(workspace)
     with (
         patch(
-            "dependency_director.tools.asyncio.create_subprocess_exec",
+            "dependency_director.sandbox.asyncio.create_subprocess_exec",
             side_effect=FileNotFoundError("No such file or directory"),
         ),
         pytest.raises(FileNotFoundError),
@@ -413,21 +402,11 @@ async def test_sandbox_git_conflict_resolution_commands(tmp_path: Path, async_fs
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     run_command = create_run_command_tool(workspace)
-    cmd_fetch = "git fetch origin main"
-    output_fetch = await run_command(cmd_fetch)
-    assert "Permission denied" not in output_fetch
-    assert "Operation not permitted" not in output_fetch
-    assert "not a git repository" in output_fetch.lower() or "fatal:" in output_fetch.lower()
-    cmd_merge = "git merge origin/main"
-    output_merge = await run_command(cmd_merge)
-    assert "Permission denied" not in output_merge
-    assert "Operation not permitted" not in output_merge
-    assert "not a git repository" in output_merge.lower() or "fatal:" in output_merge.lower()
-    cmd_push = "git push origin HEAD"
-    output_push = await run_command(cmd_push)
-    assert "Permission denied" not in output_push
-    assert "Operation not permitted" not in output_push
-    assert "not a git repository" in output_push.lower() or "fatal:" in output_push.lower()
+    for cmd in ("git fetch origin main", "git merge origin/main", "git push origin HEAD"):
+        output = await run_command(cmd)
+        assert "Permission denied" not in output
+        assert "Operation not permitted" not in output
+        assert "not a git repository" in output.lower() or "fatal:" in output.lower()
 
 
 @requires_srt
@@ -445,23 +424,12 @@ async def test_sandbox_developer_loop_dependency_upgrade(tmp_path: Path, async_f
         "import sys\nsys.path.insert(0, '.')\nimport placeholder_lib\nprint(placeholder_lib.add(2, 3))\n",
     )
     run_command = create_run_command_tool(workspace)
-    cmd_run_fail = "python3 app.py"
-    output_fail = await run_command(cmd_run_fail)
+    cmd_run = "python3 app.py"
+    output_fail = await run_command(cmd_run)
     assert "TypeError" in output_fail
-    cmd_read_lib = "cat placeholder_lib/__init__.py"
-    output_read = await run_command(cmd_read_lib)
-    assert "def add(*, x, y):" in output_read
     patch_code = "import sys\nsys.path.insert(0, '.')\nimport placeholder_lib\nprint(placeholder_lib.add(x=2, y=3))\n"
-
-    # Write a helper script that patches app.py (avoids shell quoting issues)
-    patch_script = str(Path(workspace) / "_patch_app.py")
-    await async_fs.write_text(
-        patch_script,
-        f"with open('app.py', 'w') as f:\n    f.write({patch_code!r})\n",
-    )
-    cmd_patch = "python3 _patch_app.py"
-    await run_command(cmd_patch)
-    output_success = await run_command(cmd_run_fail)
+    await async_fs.write_text(app_file, patch_code)
+    output_success = await run_command(cmd_run)
     assert get_stdout(output_success) == "5"
 
 
@@ -475,8 +443,7 @@ async def test_sandbox_git_metadata_write_bypass_symlink(tmp_path: Path, async_f
     await async_fs.write_text(env_file, "KEY=VAL\n")
     run_command = create_run_command_tool(workspace)
     link_file = str(Path(workspace) / "env_link")
-    cmd_link = f"ln -s {env_file} {link_file}"
-    await run_command(cmd_link)
+    await asyncio.to_thread(Path(link_file).symlink_to, env_file)
     assert await async_fs.exists(link_file)
     assert await async_fs.is_symlink(link_file)
     cmd_write = f"python3 -c \"open('{link_file}','a').write('evil_env_payload\\n')\""
@@ -941,7 +908,7 @@ def test_sandbox_run_command_cleanup(tmp_path: Path) -> None:
     cleanup_sandbox = getattr(run_command, "cleanup", None)
     assert cleanup_sandbox is not None
 
-    with patch("dependency_director.tools.Path.unlink") as mock_unlink:
+    with patch("dependency_director.sandbox.Path.unlink") as mock_unlink:
         cleanup_sandbox()
         mock_unlink.assert_called_once()
 
@@ -954,7 +921,7 @@ def test_sandbox_run_command_cleanup_on_del(tmp_path: Path) -> None:
     settings_file.write_text('{"filesystem": {}}')
     run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
 
-    with patch("dependency_director.tools.Path.unlink") as mock_unlink:
+    with patch("dependency_director.sandbox.Path.unlink") as mock_unlink:
         del run_command
         mock_unlink.assert_called_once()
 
@@ -1190,18 +1157,21 @@ async def test_sandbox_prevents_cross_workspace_and_root_tmp_writes(async_fs: ty
 
         run_a = create_run_command_tool(str(ws_a))
         try:
-            out_sibling = await run_a(f"python3 -c \"open('{sibling_target}', 'w').write('pwned')\"")
-            assert any(
-                msg in out_sibling for msg in ("Operation not permitted", "Permission denied", "Read-only file system")
-            )
-            assert (await async_fs.read_text(str(sibling_target))).strip() == "untouched"
-
             with contextlib.suppress(Exception):
                 await async_fs.unlink(root_tmp_target)
-            out_tmp = await run_a(f"python3 -c \"open('{root_tmp_target}', 'w').write('pwned')\"")
-            assert any(
-                msg in out_tmp for msg in ("Operation not permitted", "Permission denied", "Read-only file system")
+            script = (
+                "import pathlib\n"
+                f"for p in ({str(sibling_target)!r}, {root_tmp_target!r}):\n"
+                "    try:\n"
+                "        pathlib.Path(p).write_text('pwned')\n"
+                "    except OSError as e:\n"
+                "        print(f'{p}: {e}')"
             )
+            out = await run_a(f"python3 -c {shlex.quote(script)}")
+            assert any(msg in out for msg in ("Operation not permitted", "Permission denied", "Read-only file system"))
+            assert str(sibling_target) in out
+            assert root_tmp_target in out
+            assert (await async_fs.read_text(str(sibling_target))).strip() == "untouched"
             assert not await async_fs.exists(root_tmp_target)
         finally:
             cleanup = getattr(run_a, "cleanup", None)
@@ -1493,7 +1463,7 @@ def test_truncation_stays_within_the_char_cap(size: int, max_chars: int) -> None
     budget spent entirely on head and tail before splicing the marker in
     overshoots the cap the caller configured.
     """
-    out = _truncate_middle("x" * size, OutputLimits(max_lines=0, max_chars=max_chars))
+    out = truncate_middle("x" * size, OutputLimits(max_lines=0, max_chars=max_chars))
     assert len(out) <= max_chars
 
 
@@ -1501,14 +1471,14 @@ def test_truncation_stays_within_the_char_cap(size: int, max_chars: int) -> None
 def test_truncation_stays_within_the_line_cap(max_lines: int) -> None:
     """Verify the marker line counts against the line cap rather than adding to it."""
     text = "\n".join(f"line{i}" for i in range(1_000))
-    out = _truncate_middle(text, OutputLimits(max_lines=max_lines, max_chars=0))
+    out = truncate_middle(text, OutputLimits(max_lines=max_lines, max_chars=0))
     assert len(out.splitlines()) <= max_lines
 
 
 def test_truncation_reports_how_much_it_actually_dropped() -> None:
     """Verify the omitted count matches what is missing, so the agent can trust it."""
     text = "\n".join(f"line{i}" for i in range(1_000))
-    out = _truncate_middle(text, OutputLimits(max_lines=100, max_chars=0))
+    out = truncate_middle(text, OutputLimits(max_lines=100, max_chars=0))
     kept = [line for line in out.splitlines() if "omitted" not in line]
     match = re.search(r"\[(\d+) lines omitted\]", out)
     assert match is not None

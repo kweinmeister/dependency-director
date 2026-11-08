@@ -57,6 +57,11 @@ venv = ".venv"
 # are opt-in via `pytest -m live`, so the default run stays fast and offline.
 addopts = "--cov=dependency_director --cov-report=term-missing --durations=10 -m 'not live'"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore:_pytest\\.python\\.CallSpec2 has been renamed to CallSpec:pytest.PytestRemovedIn10Warning:anyio\\.pytest_plugin",
+    "ignore:'_UnionGenericAlias' is deprecated and slated for removal in Python 3\\.17:DeprecationWarning:google\\.genai\\.types",
+]
 markers = [
     "live: exercises the real model against a faked GitHub and a local git remote",
 ]
