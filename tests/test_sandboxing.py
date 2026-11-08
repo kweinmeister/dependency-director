@@ -20,6 +20,7 @@ from dependency_director.tools import (
     CommandResult,
     SandboxedCommandRunner,
     _format_command_result,
+    _is_git_command_argv,
     _setup_tmp_env,
     _truncate_middle,
     create_run_command_tool,
@@ -614,10 +615,30 @@ def test_ripgrep_and_srt_availability() -> None:
         ("git --receive-pack=evil push", "Git option '--receive-pack' is blocked"),
         ("git -c protocol.ext.allow=always clone url", "Git configuration key 'protocol.ext.allow' is blocked"),
         ("git -c remote.origin.uploadpack=evil fetch", "Git configuration key 'remote.' is blocked"),
+        ("git -ccore.sshcommand=evil status", "Git configuration key 'core.sshcommand' is blocked"),
+        ("git -ccore.hookspath=/tmp fetch", "Git configuration key 'core.hookspath' is blocked"),
+        ("git -ccredential.helper=evil push", "Git configuration key 'credential.helper' is blocked"),
+        ("git --config=core.fsmonitor=evil status", "Git configuration key 'core.fsmonitor' is blocked"),
+        ("git -c core.fsmonitor=evil status", "Git configuration key 'core.fsmonitor' is blocked"),
+        (
+            "git --config=core.sshcommand=evil clone https://github.com/o/r",
+            "Git configuration key 'core.sshcommand' is blocked",
+        ),
+        ("git -cprotocol.ext.allow=always fetch", "Git configuration key 'protocol.ext.allow' is blocked"),
+        (
+            "env GIT_TERMINAL_PROMPT=0 git -ccore.sshcommand=evil status",
+            "Git configuration key 'core.sshcommand' is blocked",
+        ),
         # A key blocked via '-c' but reachable via 'config' is not blocked at
         # all; both routes reach the same setting.
         ("git config remote.origin.url https://evil.example", "Git configuration key 'remote.' is blocked"),
         ("git config protocol.ext.allow always", "Git configuration key 'protocol.ext.allow' is blocked"),
+        ("git config set core.sshcommand evil", "Git configuration key 'core.sshcommand' is blocked"),
+        ("git config -t bool core.fsmonitor true", "Git configuration key 'core.fsmonitor' is blocked"),
+        (
+            "GIT_CONFIG_PARAMETERS='core.fsmonitor=evil' git status",
+            "contains blocked git configuration key 'core.fsmonitor'",
+        ),
         # --- Forced pushes discard commits nobody agreed to lose ---
         ("git push origin main", None),
         ("git push origin pr-51:dependabot/pip/faker", None),
@@ -857,32 +878,57 @@ async def test_sandbox_cache_dir_is_created_and_granted_read_write(
     assert cache_dir in filesystem["allowWrite"]
 
 
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        "git status",
+        "env GIT_TERMINAL_PROMPT=0 git push origin main",
+        "env -i KEY=val /usr/bin/git status",
+        "FOO=1 env BAR=2 git fetch origin",
+    ],
+)
 @pytest.mark.asyncio
 async def test_sandbox_git_credential_env_overrides(
     tmp_path: Path,
     github_token: str,
     async_fs: type[AsyncFSHelper],
+    command_line: str,
 ) -> None:
-    """Verify git credential environment variables are passed to sandbox for git commands."""
+    """Verify git credential environment variables and allowGitConfig=True are passed for git commands."""
     workspace = str(tmp_path / "workspace")
     await async_fs.mkdir(workspace)
     settings_file = tmp_path / "settings.json"
-    settings_file.write_text('{"filesystem": {}}')
+    await async_fs.write_text(settings_file, '{"filesystem": {"allowGitConfig": false}}')
     run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file), github_token=github_token)
-    mock_process = AsyncMock()
-    mock_process.communicate.return_value = (b"", b"")
-    mock_process.returncode = 0
-    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
-        await run_command("git status")
-        mock_exec.assert_called_once()
-        kwargs = mock_exec.call_args.kwargs
-        env = kwargs.get("env", {})
-        assert env.get("GIT_CONFIG_COUNT") == "2"
-        assert env.get("GIT_CONFIG_KEY_0") == f"url.https://x-access-token:{github_token}@github.com/.insteadOf"
-        assert env.get("GIT_CONFIG_VALUE_0") == "https://github.com/"
-        assert env.get("GIT_CONFIG_KEY_1") == f"url.https://x-access-token:{github_token}@github.com/.insteadOf"
-        assert env.get("GIT_CONFIG_VALUE_1") == "git@github.com:"
-        assert env.get("GIT_TERMINAL_PROMPT") == "0"
+
+    captured_settings: dict[str, Any] = {}
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> Any:
+        settings_idx = list(args).index("--settings") + 1
+        cfg_path = args[settings_idx]
+        captured_settings.update(json.loads(await async_fs.read_text(cfg_path)))
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = 0
+        return mock_proc
+
+    try:
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec) as mock_exec:
+            await run_command(command_line)
+            mock_exec.assert_called_once()
+            kwargs = mock_exec.call_args.kwargs
+            env = kwargs.get("env", {})
+            assert env.get("GIT_CONFIG_COUNT") == "2"
+            assert env.get("GIT_CONFIG_KEY_0") == f"url.https://x-access-token:{github_token}@github.com/.insteadOf"
+            assert env.get("GIT_CONFIG_VALUE_0") == "https://github.com/"
+            assert env.get("GIT_CONFIG_KEY_1") == f"url.https://x-access-token:{github_token}@github.com/.insteadOf"
+            assert env.get("GIT_CONFIG_VALUE_1") == "git@github.com:"
+            assert env.get("GIT_TERMINAL_PROMPT") == "0"
+            assert captured_settings.get("filesystem", {}).get("allowGitConfig") is True
+    finally:
+        cleanup = getattr(run_command, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
 
 
 def test_sandbox_run_command_cleanup(tmp_path: Path) -> None:
@@ -1094,11 +1140,75 @@ def test_srt_settings_policy_assertions() -> None:
     deny_read = config.get("filesystem", {}).get("denyRead", [])
     assert "~" in deny_read, "filesystem.denyRead must include '~'"
 
+    # Blanket /tmp write access must NOT be in default srt-settings.json
+    allow_write = config.get("filesystem", {}).get("allowWrite", [])
+    assert "/tmp" not in allow_write, "filesystem.allowWrite must not grant blanket write access to /tmp"
+    assert "/private/tmp" not in allow_write, (
+        "filesystem.allowWrite must not grant blanket write access to /private/tmp"
+    )
+
     # Exfil webhook domains must be denied
     denied_domains = config.get("network", {}).get("deniedDomains", [])
     expected_exfil_patterns = ["*.ngrok.io", "*.pipedream.com", "*.webhook.site", "*.requestbin.com"]
     for pattern in expected_exfil_patterns:
         assert pattern in denied_domains, f"network.deniedDomains missing exfil pattern: {pattern}"
+
+
+@pytest.mark.parametrize(
+    ("command_line", "expected"),
+    [
+        ("git status", True),
+        ("/usr/bin/git status", True),
+        ("GIT_TERMINAL_PROMPT=0 git push", True),
+        ("env GIT_TERMINAL_PROMPT=0 git push", True),
+        ("env -i KEY=val /usr/bin/git status", True),
+        ("env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 git fetch origin", True),
+        ("env -- git status", True),
+        ("FOO=1 env BAR=2 git commit -m 'msg'", True),
+        ("env KEY=val pytest", False),
+        ("python3 -m pytest", False),
+        ("echo git", False),
+    ],
+)
+def test_is_git_command_argv_unwraps_env(command_line: str, *, expected: bool) -> None:
+    """Verify _is_git_command_argv detects git through env wrappers and KEY=val prefixes."""
+    assert _is_git_command_argv(shlex.split(command_line)) is expected
+
+
+@requires_srt
+@pytest.mark.asyncio
+async def test_sandbox_prevents_cross_workspace_and_root_tmp_writes(async_fs: type[AsyncFSHelper]) -> None:
+    """Verify a sandboxed command in workspace A cannot write to sibling workspace B or /tmp."""
+    root_tmp_target = "/tmp/depdirector_sandbox_escape_test.txt"
+    with tempfile.TemporaryDirectory() as td:
+        ws_a = Path(td) / "workspace_a"
+        ws_b = Path(td) / "workspace_b"
+        await async_fs.mkdir(str(ws_a))
+        await async_fs.mkdir(str(ws_b))
+        sibling_target = ws_b / "sibling_secret.txt"
+        await async_fs.write_text(str(sibling_target), "untouched")
+
+        run_a = create_run_command_tool(str(ws_a))
+        try:
+            out_sibling = await run_a(f"python3 -c \"open('{sibling_target}', 'w').write('pwned')\"")
+            assert any(
+                msg in out_sibling for msg in ("Operation not permitted", "Permission denied", "Read-only file system")
+            )
+            assert (await async_fs.read_text(str(sibling_target))).strip() == "untouched"
+
+            with contextlib.suppress(Exception):
+                await async_fs.unlink(root_tmp_target)
+            out_tmp = await run_a(f"python3 -c \"open('{root_tmp_target}', 'w').write('pwned')\"")
+            assert any(
+                msg in out_tmp for msg in ("Operation not permitted", "Permission denied", "Read-only file system")
+            )
+            assert not await async_fs.exists(root_tmp_target)
+        finally:
+            cleanup = getattr(run_a, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            with contextlib.suppress(Exception):
+                await async_fs.unlink(root_tmp_target)
 
 
 @pytest.mark.parametrize(
@@ -1439,3 +1549,27 @@ def test_command_output_caps_stdout_and_stderr_separately() -> None:
     assert "out0" in out
     assert "err0" in out
     assert "err999" in out
+
+
+@pytest.mark.parametrize(
+    "bad_json",
+    [
+        '{"filesystem": null}',
+        '{"filesystem": {"allowWrite": "not-a-list"}}',
+        '{"git": {"safeDirectories": "not-a-list"}}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_run_command_tool_rejects_malformed_srt_settings_schema(
+    tmp_path: Path,
+    async_fs: type[AsyncFSHelper],
+    bad_json: str,
+) -> None:
+    """Verify create_run_command_tool catches schema errors in srt-settings.json and surfaces init_error."""
+    workspace = str(tmp_path / "workspace")
+    await async_fs.mkdir(workspace)
+    settings_file = tmp_path / "bad-settings.json"
+    await async_fs.write_text(settings_file, bad_json)
+    run_command = create_run_command_tool(workspace, srt_settings_path=str(settings_file))
+    result = await run_command("echo hello")
+    assert result.startswith("Error: Sandbox settings file")

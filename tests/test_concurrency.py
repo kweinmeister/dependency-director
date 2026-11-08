@@ -93,11 +93,13 @@ async def test_get_repositories_pagination(github_token: str) -> None:
 
 
 @pytest.mark.asyncio
+@patch("dependency_director.main.is_srt_available", return_value=True)
 @patch("dependency_director.main.run_agent_for_repo", new_callable=AsyncMock)
 @patch("dependency_director.main.get_repositories", new_callable=AsyncMock)
 async def test_run_agent_concurrency(
     mock_get_repos: MagicMock,
     mock_run_agent_for_repo: MagicMock,
+    _mock_srt: MagicMock,
     github_token: str,
 ) -> None:
     """Verify that run_agent limits concurrent executions to the configured value."""

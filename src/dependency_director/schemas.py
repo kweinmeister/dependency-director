@@ -15,8 +15,6 @@ Raw diffs, file contents, and job logs are deliberately absent. They are
 strings with no schema, and validating them would be ceremony.
 """
 
-from __future__ import annotations
-
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -168,6 +166,92 @@ class WorkflowJobsResponse(_Inbound):
     """The job listing for a workflow run."""
 
     jobs: list[WorkflowJob] = Field(default_factory=list)
+
+
+class GitCommitAuthor(_Inbound):
+    """The Git-level author metadata inside a commit payload."""
+
+    name: str = ""
+    date: str = ""
+
+
+class GitCommitPayload(_Inbound):
+    """The nested ``commit`` object on a GitHub commit response."""
+
+    message: str = ""
+    author: GitCommitAuthor | None = None
+
+    @property
+    def author_name(self) -> str:
+        """Return the commit author's name, or empty string if null/absent."""
+        return self.author.name if self.author else ""
+
+    @property
+    def author_date(self) -> str:
+        """Return the commit author's date string, or empty string if null/absent."""
+        return self.author.date if self.author else ""
+
+
+def _empty_str_if_none(value: object) -> object:
+    """Coerce a null string field (such as a binary file's ``patch``) to ``""``."""
+    return "" if value is None else value
+
+
+class CommitFilePayload(_Inbound):
+    """One file entry inside a GitHub commit response."""
+
+    filename: str = ""
+    status: str = ""
+    patch: Annotated[str, BeforeValidator(_empty_str_if_none)] = ""
+
+
+class CommitResponse(_Inbound):
+    """One commit payload from ``/commits`` or ``/commits/{sha}``."""
+
+    sha: str = ""
+    commit: GitCommitPayload = Field(default_factory=GitCommitPayload)
+    files: list[CommitFilePayload] = Field(default_factory=list)
+
+
+class RepositoryPayload(_Inbound):
+    """One repository entry from ``/user/repos``, ``/users/{o}/repos``, or ``/orgs/{o}/repos``."""
+
+    name: str = ""
+    fork: bool = False
+    archived: bool = False
+    disabled: bool = False
+
+
+# --- Sandbox configuration boundary (srt-settings.json) ---
+
+
+class SrtFilesystemConfig(BaseModel):
+    """Filesystem section of an ``srt-settings.json`` configuration file."""
+
+    model_config = ConfigDict(extra="allow")
+
+    allowWrite: list[str] = Field(default_factory=list)
+    allowRead: list[str] = Field(default_factory=list)
+    denyWrite: list[str] = Field(default_factory=list)
+    denyRead: list[str] = Field(default_factory=list)
+    allowGitConfig: bool = False
+
+
+class SrtGitConfig(BaseModel):
+    """Git section of an ``srt-settings.json`` configuration file."""
+
+    model_config = ConfigDict(extra="allow")
+
+    safeDirectories: list[str] = Field(default_factory=list)
+
+
+class SrtSettings(BaseModel):
+    """Schema for ``srt-settings.json`` with pass-through for additional ``srt`` keys."""
+
+    model_config = ConfigDict(extra="allow")
+
+    filesystem: SrtFilesystemConfig = Field(default_factory=SrtFilesystemConfig)
+    git: SrtGitConfig = Field(default_factory=SrtGitConfig)
 
 
 # --- Outbound: the JSON the agent is instructed to read ---

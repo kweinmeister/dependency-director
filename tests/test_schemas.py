@@ -19,6 +19,7 @@ from dependency_director.schemas import (
     CheckRunsResponse,
     CheckSummary,
     CommitDetails,
+    CommitResponse,
     CommitStatusResponse,
     CommitSummary,
     FileContents,
@@ -26,6 +27,8 @@ from dependency_director.schemas import (
     PrStatus,
     PullRequest,
     PullRequestRef,
+    RepositoryPayload,
+    SrtSettings,
     WorkflowJobsResponse,
     WorkflowRunsResponse,
     summarize_checks,
@@ -272,3 +275,58 @@ def test_pull_request_ref_defaults_are_empty_strings() -> None:
     ref = PullRequestRef.model_validate({})
     assert ref.ref == ""
     assert ref.sha == ""
+
+
+def test_commit_response_tolerates_null_author_and_patch() -> None:
+    """Verify CommitResponse handles null commit.author and null file patches gracefully."""
+    parsed = CommitResponse.model_validate(
+        {
+            "sha": "abcdef1234567",
+            "commit": {"message": "fix: handle null author\n\ndetails", "author": None},
+            "files": [{"filename": "a.py", "status": "modified", "patch": None}],
+        },
+    )
+    assert parsed.sha == "abcdef1234567"
+    assert parsed.commit.message.startswith("fix: handle null author")
+    assert parsed.commit.author_name == ""
+    assert parsed.commit.author_date == ""
+    assert parsed.files[0].patch == ""
+
+
+def test_repository_payload_defaults_flags_to_false() -> None:
+    """Verify RepositoryPayload defaults fork, archived, and disabled flags to False."""
+    repo = RepositoryPayload.model_validate({"name": "my-repo", "extra_field": 123})
+    assert repo.name == "my-repo"
+    assert repo.fork is False
+    assert repo.archived is False
+    assert repo.disabled is False
+
+
+def test_srt_settings_preserves_extra_fields() -> None:
+    """Verify SrtSettings preserves pass-through srt fields and applies defaults."""
+    cfg = SrtSettings.model_validate(
+        {
+            "network": {"allowedDomains": ["pypi.org"]},
+            "filesystem": {"allowWrite": []},
+            "enableWeakerNetworkIsolation": False,
+        },
+    )
+    dumped = cfg.model_dump()
+    assert dumped["network"] == {"allowedDomains": ["pypi.org"]}
+    assert dumped["enableWeakerNetworkIsolation"] is False
+    assert cfg.filesystem.allowWrite == []
+    assert cfg.filesystem.allowGitConfig is False
+
+
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        {"filesystem": None},
+        {"filesystem": {"allowWrite": "not-a-list"}},
+        {"git": {"safeDirectories": "not-a-list"}},
+    ],
+)
+def test_srt_settings_rejects_malformed_fields(invalid_payload: dict[str, object]) -> None:
+    """Verify SrtSettings raises ValidationError when filesystem or git fields are malformed."""
+    with pytest.raises(ValidationError):
+        SrtSettings.model_validate(invalid_payload)

@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import copy
 import functools
 import json
 import os
@@ -16,8 +15,10 @@ from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import httpx
+from pydantic import ValidationError
 
 from dependency_director.argv import (
+    extract_git_config_arg,
     is_forced_git_push_argv,
     resolve_exe,
     split_compound_argv,
@@ -46,13 +47,17 @@ from dependency_director.schemas import (
     CheckRunsResponse,
     CheckSummary,
     CommitDetails,
+    CommitResponse,
     CommitStatusResponse,
     CommitSummary,
     FileContents,
+    GitHubUser,
     OpenPrSummary,
     PatchedFile,
     PrStatus,
     PullRequest,
+    RepositoryPayload,
+    SrtSettings,
     WorkflowJob,
     WorkflowJobsResponse,
     WorkflowRun,
@@ -617,15 +622,15 @@ class GitHubClient:
         if sha:
             params["sha"] = sha
         response = await self._get("commits", owner, repo, params=params)
-        data = response.json()
+        parsed = [CommitResponse.model_validate(item) for item in response.json()]
         return [
             CommitSummary(
-                sha=c["sha"][:7],
-                message=c.get("commit", {}).get("message", "").split("\n")[0],
-                author=c.get("commit", {}).get("author", {}).get("name", ""),
-                date=c.get("commit", {}).get("author", {}).get("date", ""),
+                sha=c.sha[:7],
+                message=c.commit.message.split("\n")[0],
+                author=c.commit.author_name,
+                date=c.commit.author_date,
             )
-            for c in data
+            for c in parsed
         ]
 
     async def get_commit(
@@ -636,19 +641,19 @@ class GitHubClient:
     ) -> CommitDetails:
         """Fetch details of a specific commit."""
         response = await self._get(f"commits/{sha}", owner, repo)
-        data = response.json()
+        parsed = CommitResponse.model_validate(response.json())
         return CommitDetails(
-            sha=data["sha"],
-            message=data.get("commit", {}).get("message", ""),
-            author=data.get("commit", {}).get("author", {}).get("name", ""),
-            date=data.get("commit", {}).get("author", {}).get("date", ""),
+            sha=parsed.sha,
+            message=parsed.commit.message,
+            author=parsed.commit.author_name,
+            date=parsed.commit.author_date,
             files=[
                 PatchedFile(
-                    filename=f["filename"],
-                    status=f.get("status", ""),
-                    patch=f.get("patch", ""),
+                    filename=f.filename,
+                    status=f.status,
+                    patch=f.patch,
                 )
-                for f in data.get("files", [])
+                for f in parsed.files
             ],
         )
 
@@ -680,7 +685,8 @@ class GitHubClient:
             response.raise_for_status()
             user_data = response.json()
             if isinstance(user_data, dict):
-                login = str(user_data.get("login") or "")
+                user = GitHubUser.model_validate(user_data)
+                login = user.login or ""
                 self._user_cache[token] = login
                 return login.lower() == owner.lower()
         except (GitHubAuthenticationError, GitHubRateLimitError):
@@ -688,7 +694,7 @@ class GitHubClient:
             # Swallowing it here would silently fall back to the public
             # endpoint and hide half the owner's repositories.
             raise
-        except (httpx.HTTPError, GitHubClientError):
+        except (httpx.HTTPError, GitHubClientError, ValidationError):
             pass
         return False
 
@@ -767,10 +773,11 @@ class GitHubClient:
             if not repos_data:
                 break
 
+            parsed_repos = [RepositoryPayload.model_validate(raw) for raw in repos_data]
             repos.extend(
-                f"{owner}/{repo['name']}"
-                for repo in repos_data
-                if not any(repo.get(flag, False) for flag in ("fork", "archived", "disabled"))
+                f"{owner}/{repo.name}"
+                for repo in parsed_repos
+                if repo.name and not (repo.fork or repo.archived or repo.disabled)
             )
             page += 1
 
@@ -1563,6 +1570,37 @@ def _validate_target_path(
     return None
 
 
+# git options that hand control of the transport or the repository location
+# to the caller. Matched against the token's pre-'=' half, so both the
+# '--opt=value' and '--opt value' spellings are covered.
+BLOCKED_GIT_OPTIONS = (
+    "--config-env",
+    "--git-dir",
+    "--receive-pack",
+    "--upload-pack",
+)
+
+# Configuration keys that turn a git invocation into arbitrary execution, a
+# credential leak, or a request to somewhere other than the intended remote.
+# Matched as prefixes, so 'url.' covers every 'url.<base>.insteadOf'.
+BLOCKED_GIT_CONFIG_PREFIXES = (
+    "core.fsmonitor",
+    "core.hookspath",
+    "core.sshcommand",
+    "credential.helper",
+    "http.proxy",
+    "https.proxy",
+    "protocol.ext.allow",
+    "remote.",
+    "url.",
+)
+
+# 'git config' flags that take a separate value, which must not be mistaken
+# for the key being set.
+_GIT_CONFIG_FLAGS_WITH_ARG = ("-f", "--file", "--blob", "-t", "--type", "--default", "--comment")
+_GIT_CONFIG_SUBCOMMANDS = frozenset({"set", "get", "unset"})
+
+
 def _check_env_var_token(token: str) -> str | None:
     if "=" in token and not token.startswith("-"):
         parts = token.split("=", 1)
@@ -1581,15 +1619,7 @@ def _check_env_var_token(token: str) -> str | None:
             return f"Security Error: Environment variable '{parts[0]}' is blocked."
 
         if "git_config" in env_key or env_key == "git_config_parameters":
-            blocked_config_prefixes = (
-                "credential.helper",
-                "core.hookspath",
-                "core.sshcommand",
-                "url.",
-                "http.proxy",
-                "https.proxy",
-            )
-            for prefix in blocked_config_prefixes:
+            for prefix in BLOCKED_GIT_CONFIG_PREFIXES:
                 if prefix in env_value:
                     return (
                         f"Security Error: Environment variable '{parts[0]}' "
@@ -1628,35 +1658,6 @@ def _check_rm_command(tokens: list[str], idx: int, workspace_dir: str) -> str | 
     return None
 
 
-# git options that hand control of the transport or the repository location
-# to the caller. Matched against the token's pre-'=' half, so both the
-# '--opt=value' and '--opt value' spellings are covered.
-BLOCKED_GIT_OPTIONS = (
-    "--config-env",
-    "--git-dir",
-    "--receive-pack",
-    "--upload-pack",
-)
-
-# Configuration keys that turn a git invocation into arbitrary execution, a
-# credential leak, or a request to somewhere other than the intended remote.
-# Matched as prefixes, so 'url.' covers every 'url.<base>.insteadOf'.
-BLOCKED_GIT_CONFIG_PREFIXES = (
-    "core.hookspath",
-    "core.sshcommand",
-    "credential.helper",
-    "http.proxy",
-    "https.proxy",
-    "protocol.ext.allow",
-    "remote.",
-    "url.",
-)
-
-# 'git config' flags that take a separate value, which must not be mistaken
-# for the key being set.
-_GIT_CONFIG_FLAGS_WITH_ARG = ("-f", "--file", "--blob", "--type", "--default")
-
-
 def _blocked_config_key(key: str) -> str | None:
     """Return the blocked prefix ``key`` falls under, or None if it is allowed."""
     normalized = key.split("=", 1)[0].strip().lower()
@@ -1677,6 +1678,8 @@ def _check_git_config_subcommand(tokens: list[str], idx: int) -> str | None:
             skip_next = True
             continue
         if config_token.startswith("-"):
+            continue
+        if config_token.lower() in _GIT_CONFIG_SUBCOMMANDS:
             continue
         prefix = _blocked_config_key(config_token)
         if prefix:
@@ -1699,8 +1702,9 @@ def _check_git_command(tokens: list[str], idx: int) -> str | None:
             return f"Security Error: Git option '{option}' is blocked."
 
     for j, tok in enumerate(tokens[idx + 1 :], start=idx + 1):
-        if tok in ("-c", "--config") and j + 1 < len(tokens):
-            prefix = _blocked_config_key(tokens[j + 1])
+        config_expr = extract_git_config_arg(tokens, j)
+        if config_expr is not None:
+            prefix = _blocked_config_key(config_expr)
             if prefix:
                 return f"Security Error: Git configuration key '{prefix}' is blocked."
         elif tok == "config":
@@ -1755,7 +1759,7 @@ def _resolve_exe(argv: list[str]) -> CheckedExe | str:
             if token in ("-S", "--split-string"):
                 return "Security Error: 'env -S/--split-string' is blocked."
 
-    return CheckedExe(idx=resolved.wrapper_idx, name=resolved.name)
+    return CheckedExe(idx=resolved.exe_idx, name=resolved.name)
 
 
 def _check_exec_pivots(exe_name: str, argv: list[str], exe_idx: int) -> str | None:
@@ -1942,6 +1946,13 @@ def _setup_cache_env(cache_dir: str, env: dict[str, str]) -> None:
     env["YARN_CACHE_FOLDER"] = str(cache_base / "yarn")
 
 
+def _ensure_workspace_tmp(workspace_dir: str) -> Path:
+    """Create and return the per-workspace `.tmp` directory."""
+    sandbox_tmp = Path(workspace_dir) / ".tmp"
+    sandbox_tmp.mkdir(parents=True, exist_ok=True)
+    return sandbox_tmp
+
+
 def _setup_tmp_env(workspace_dir: str, env: dict[str, str]) -> Path:
     """Configure temporary directory environment variables inside the workspace.
 
@@ -1957,8 +1968,7 @@ def _setup_tmp_env(workspace_dir: str, env: dict[str, str]) -> Path:
     limits (104 bytes on macOS/BSD, 108 bytes on Linux) when running inside
     deeply nested workspace paths.
     """
-    sandbox_tmp = Path(workspace_dir) / ".tmp"
-    sandbox_tmp.mkdir(parents=True, exist_ok=True)
+    sandbox_tmp = _ensure_workspace_tmp(workspace_dir)
     tmp_path_str = str(sandbox_tmp)
     env["CLAUDE_CODE_TMPDIR"] = tmp_path_str
     env["CLAUDE_TMPDIR"] = tmp_path_str
@@ -1974,21 +1984,9 @@ def _setup_tmp_env(workspace_dir: str, env: dict[str, str]) -> Path:
 
 
 def _is_git_command_argv(argv: list[str]) -> bool:
-    """Check if the first executable in an argv list is git."""
-    for token in argv:
-        if "=" in token and not token.startswith("-"):
-            continue  # skip env var assignments
-        return Path(token).name.lower() == "git"
-    return False
-
-
-def _is_git_command(command_line: str) -> bool:
-    """Check if a command string starts with git."""
-    try:
-        argv = shlex.split(command_line)
-    except ValueError:
-        return False
-    return _is_git_command_argv(argv)
+    """Check if the executable resolved from an argv list is git."""
+    resolved = resolve_exe(argv)
+    return resolved is not None and resolved.name == "git"
 
 
 class SandboxConfig(NamedTuple):
@@ -1996,7 +1994,7 @@ class SandboxConfig(NamedTuple):
 
     Attributes:
         workspace_dir: Root directory for sandboxed file operations.
-        srt_config: Parsed srt settings dict (filesystem, network rules).
+        srt_config: Parsed srt settings model (filesystem, network rules).
         github_token: Token for authenticated git operations.
         command_timeout: Max seconds per sandboxed command.
         output_limits: Caps on the output returned to the model.
@@ -2005,7 +2003,7 @@ class SandboxConfig(NamedTuple):
     """
 
     workspace_dir: str
-    srt_config: dict[str, Any]
+    srt_config: SrtSettings
     github_token: str | None = None
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT
     output_limits: OutputLimits = DEFAULT_OUTPUT_LIMITS
@@ -2126,8 +2124,8 @@ class SandboxedCommandRunner:
         git_config_temp_path = None
 
         if is_git_command:
-            git_config = copy.deepcopy(self.cfg.srt_config)
-            git_config["filesystem"]["allowGitConfig"] = True
+            git_config = self.cfg.srt_config.model_copy(deep=True)
+            git_config.filesystem.allowGitConfig = True
 
             try:
                 with tempfile.NamedTemporaryFile(
@@ -2135,7 +2133,7 @@ class SandboxedCommandRunner:
                     mode="w",
                     delete=False,
                 ) as temp_f:
-                    json.dump(git_config, temp_f)
+                    temp_f.write(git_config.model_dump_json())
                     git_config_temp_path = temp_f.name
                     active_config_path = git_config_temp_path
             except (OSError, TypeError, ValueError) as e:
@@ -2184,45 +2182,43 @@ def create_run_command_tool(
     """Create a sandboxed run_command tool bound to a workspace."""
     config_path = None
     init_error = None
-    srt_config = {}
+    srt_config = SrtSettings()
 
     # The cache outlives the workspace, so it may already exist from an earlier repo.
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    (Path(workspace_dir) / ".tmp").mkdir(parents=True, exist_ok=True)
+    _ensure_workspace_tmp(workspace_dir)
 
     base_path = srt_settings_path or DEFAULT_SRT_SETTINGS_PATH
     try:
         with Path(base_path).open() as f:
-            srt_config = json.load(f)
+            raw_srt_config = json.load(f)
 
-        fs_config = srt_config.setdefault("filesystem", {})
-        fs_config["allowGitConfig"] = False
+        srt_config = SrtSettings.model_validate(raw_srt_config)
+        srt_config.filesystem.allowGitConfig = False
 
-        allow_write = fs_config.setdefault("allowWrite", [])
-        allow_read = fs_config.setdefault("allowRead", [])
         for path in (workspace_dir, cache_dir):
-            if path not in allow_write:
-                allow_write.append(path)
-            if path not in allow_read:
-                allow_read.append(path)
+            if path not in srt_config.filesystem.allowWrite:
+                srt_config.filesystem.allowWrite.append(path)
+            if path not in srt_config.filesystem.allowRead:
+                srt_config.filesystem.allowRead.append(path)
 
-        git_config = srt_config.setdefault("git", {})
-        safe_dirs = git_config.setdefault("safeDirectories", [])
-        if workspace_dir not in safe_dirs:
-            safe_dirs.append(workspace_dir)
+        if workspace_dir not in srt_config.git.safeDirectories:
+            srt_config.git.safeDirectories.append(workspace_dir)
 
         with tempfile.NamedTemporaryFile(
             suffix=".json",
             mode="w",
             delete=False,
         ) as temp_f:
-            json.dump(srt_config, temp_f)
+            temp_f.write(srt_config.model_dump_json())
             config_path = temp_f.name
 
     except FileNotFoundError:
         init_error = f"Error: Sandbox settings file not found at {base_path}."
     except json.JSONDecodeError:
         init_error = f"Error: Sandbox settings file at {base_path} is not valid JSON."
+    except ValidationError as e:
+        init_error = f"Error: Sandbox settings file at {base_path} failed schema validation: {e}"
 
     runner = SandboxedCommandRunner(
         config=SandboxConfig(

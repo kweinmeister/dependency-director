@@ -141,6 +141,18 @@ def resolve_exe(argv: list[str]) -> ResolvedExe | None:
     return None
 
 
+def extract_git_config_arg(tokens: list[str], idx: int) -> str | None:
+    """Extract the config ``key=value`` expression from a ``-c`` or ``--config`` token at ``idx``."""
+    tok = tokens[idx]
+    if tok in ("-c", "--config") and idx + 1 < len(tokens):
+        return tokens[idx + 1]
+    if tok.startswith("-c") and not tok.startswith("--") and len(tok) > 2:
+        return tok[2:]
+    if tok.startswith("--config="):
+        return tok.split("=", 1)[1]
+    return None
+
+
 def git_subcommand(argv: list[str], start: int) -> str | None:
     """Return the git subcommand at or after ``start``, skipping global options.
 

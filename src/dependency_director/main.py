@@ -434,7 +434,13 @@ async def run_agent_for_repo(
             workspaces=_agent_workspaces(workspace_tmp),
             capabilities=types.CapabilitiesConfig(
                 enable_subagents=False,
-                disabled_tools=[types.BuiltinTools.RUN_COMMAND],
+                disabled_tools=[
+                    types.BuiltinTools.RUN_COMMAND,
+                    types.BuiltinTools.READ_URL_CONTENT,
+                    types.BuiltinTools.SEARCH_WEB,
+                    types.BuiltinTools.ASK_QUESTION,
+                    types.BuiltinTools.GENERATE_IMAGE,
+                ],
             ),
         )
 
