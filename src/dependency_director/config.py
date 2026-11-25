@@ -226,7 +226,7 @@ class Settings(BaseSettings):
         validation_alias="depdirector_command_timeout",
     )
     model: str = Field(
-        default="gemini-3.8-flash",
+        default="gemini-4-hydrogen",
         validation_alias="depdirector_model",
     )
     max_output_lines: int = Field(

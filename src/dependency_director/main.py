@@ -890,7 +890,7 @@ def _resolve_target(target: str | None, default_owner: str | None) -> tuple[str,
     "--model",
     type=str,
     default=None,
-    help="Gemini model identifier (defaults to gemini-3.8-flash).",
+    help="Gemini model identifier (defaults to gemini-4-hydrogen).",
 )
 def cli(
     target: str | None,
